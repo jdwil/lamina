@@ -1,0 +1,12 @@
+[package]
+name = "lamina-core"
+description = "The Lamina engine: parses Lamina IR and transpiles it to target languages via language definitions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

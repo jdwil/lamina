@@ -1,0 +1,16 @@
+[package]
+name = "lamina"
+description = "The Lamina command-line interface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lamina"
+path = "src/main.rs"
+
+[dependencies]
+lamina-core.workspace = true

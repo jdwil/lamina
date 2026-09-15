@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/lamina-core", "crates/lamina"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+authors = ["JD Williams <jd@unsung-operators.com>"]
+repository = "https://github.com/unsung-operators/lamina"
+rust-version = "1.90"
+
+[workspace.dependencies]
+thiserror = "2"
+lamina-core = { path = "crates/lamina-core" }

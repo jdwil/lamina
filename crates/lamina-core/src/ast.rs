@@ -1182,6 +1182,17 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // statement sequences (`then`, `body`, `default`) loop the `statement`
         // item slot recursively, while `cases` loops the `switch_case` item
         // slot.
+        //
+        // `init_clause` / `step_clause` are the *clause* (terminator-free) forms
+        // of a `for` statement's `init` / `step`, rendered through the target's
+        // `### stmt_clause` dispatch rather than `### statement`. A C-style
+        // `for (init; cond; step)` header composes clauses joined by the header
+        // syntax, so the init/step must NOT carry a statement terminator (the
+        // header supplies its own `;` separators). Targets that desugar the
+        // counted loop instead (e.g. Rust, which has no C-style `for`) use the
+        // full-statement `init` / `step` slots, where the trailing terminator is
+        // correct. All spelling stays in the definition; the engine only routes
+        // to the `### stmt_clause` slot and appends nothing.
         SlotScope::Statement => match name {
             "name" => Some(SlotShape::Scalar),
             "binding" => Some(SlotShape::Scalar),
@@ -1193,6 +1204,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "else" => Some(SlotShape::Scalar),
             "init" => Some(SlotShape::Scalar),
             "step" => Some(SlotShape::Scalar),
+            "init_clause" => Some(SlotShape::Scalar),
+            "step_clause" => Some(SlotShape::Scalar),
             "then" => Some(SlotShape::Sequence {
                 item_slot: "statement".to_string(),
                 item_scope: SlotScope::Statement,

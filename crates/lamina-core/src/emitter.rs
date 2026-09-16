@@ -595,6 +595,28 @@ fn emit_statement(
     resolver.render_named_slot("statement")
 }
 
+/// Renders one statement in *clause* (terminator-free) form via the target's
+/// `### stmt_clause` `When`-table, for use inside a C-style `for` header. Shares
+/// the same fact context as [`emit_statement`] (so `stmt is <kind>` and the
+/// `has …` flags select the right row), but dispatches to `stmt_clause` instead
+/// of `statement`. The definition's `### stmt_clause` rows omit the statement
+/// terminator; the engine appends nothing of its own.
+fn emit_statement_clause(
+    stmt: &Statement,
+    lang: &LanguageDef,
+    caller: Option<CallerKind>,
+) -> Result<Rendered, EmitError> {
+    let ctx = statement_context(stmt, caller, true, true);
+    let mut resolver = StmtResolver {
+        stmt,
+        lang,
+        caller,
+        ctx,
+        scope: StmtScope::Node,
+    };
+    resolver.render_named_slot("stmt_clause")
+}
+
 /// Renders a statement sequence (`then`/`body`/`default`, or a function body),
 /// looping the `item_slot` (`statement`) per element with `first`/`last` loop
 /// facts. Each element renders its own separator via those facts — there is no
@@ -697,6 +719,17 @@ impl<'a> StmtResolver<'a> {
         emit_statement(stmt, self.lang, self.caller, true, true)
     }
 
+    /// Renders a `for` init/step in *clause* (terminator-free) form through the
+    /// target's `### stmt_clause` dispatch. Used for a C-style `for
+    /// (init; cond; step)` header, where the header supplies the `;` separators
+    /// and the clauses must not carry their own statement terminator. A target
+    /// that has no `### stmt_clause` (because it desugars the counted loop
+    /// instead of emitting a C-style header) simply never references
+    /// `{init_clause}` / `{step_clause}`, so the slot is looked up lazily.
+    fn render_statement_clause(&self, stmt: &Statement) -> Result<Rendered, EmitError> {
+        emit_statement_clause(stmt, self.lang, self.caller)
+    }
+
     /// Produces the text of a scalar engine-bound statement sub-slot, resolved
     /// against the current statement variant.
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
@@ -732,6 +765,16 @@ impl<'a> StmtResolver<'a> {
             (Statement::If { else_block: Some(e), .. }, "else") => self.render_nested_statement(e),
             (Statement::For { init: Some(i), .. }, "init") => self.render_nested_statement(i),
             (Statement::For { step: Some(s), .. }, "step") => self.render_nested_statement(s),
+            // Clause (terminator-free) forms for a C-style `for` header, routed
+            // through the target's `### stmt_clause` dispatch. The engine
+            // appends nothing; the definition owns the (terminator-free)
+            // spelling.
+            (Statement::For { init: Some(i), .. }, "init_clause") => {
+                self.render_statement_clause(i)
+            }
+            (Statement::For { step: Some(s), .. }, "step_clause") => {
+                self.render_statement_clause(s)
+            }
             _ => self.unknown_slot(name),
         }
     }

@@ -200,15 +200,18 @@ impl Template {
     /// The resolver is where recursion happens: filling a slot typically renders
     /// a child construct (with its own context and possibly its own templates).
     ///
-    /// **Indentation is column-derived.** A slot's indent is the column at which
-    /// its `{slot}` appears — i.e. the width of the current output line since the
-    /// last newline. When the slot's rendered value spans multiple lines, that
-    /// indent is prepended to every line *after the first* (the first line's
-    /// indent is already present as the literal text preceding the slot). Blank
-    /// lines are left untouched (no trailing whitespace). This makes nested
-    /// indentation accumulate naturally through the recursion: templates are
-    /// authored at column 0 and inherit indentation purely from where they are
-    /// placed by their caller.
+    /// **Indentation is line-indent–derived.** A slot's indent is the
+    /// *indentation* (leading-whitespace width) of the line on which its
+    /// `{slot}` appears. When the slot's rendered value spans multiple lines,
+    /// that indent is prepended to every line *after the first* (the first
+    /// line's text is already positioned by the literal text preceding the
+    /// slot). Blank lines are left untouched (no trailing whitespace). This
+    /// makes nested indentation accumulate naturally through the recursion:
+    /// templates are authored at column 0 and inherit indentation purely from
+    /// where they are placed by their caller. Because it is the line's
+    /// *indentation* (not its full character column), a multi-line slot placed
+    /// after non-whitespace text on a line (e.g. an `else` arm) stays aligned to
+    /// that line's indent rather than being pushed out by the preceding text.
     ///
     /// # Errors
     ///
@@ -229,13 +232,23 @@ impl Template {
     }
 }
 
-/// The column of the current (last, incomplete) output line: the number of
-/// characters since the last `\n`.
+/// The **indentation** of the current (last, incomplete) output line: the width
+/// of its leading whitespace.
+///
+/// This is deliberately the leading-whitespace width, NOT the full character
+/// column, matching the language-definition format contract: continuation lines
+/// of a multi-line slot value inherit *the current line's indentation*, so a
+/// nested block placed after non-whitespace text (e.g. an `else` arm authored as
+/// `}} else {else}`) is left-aligned to that line's indent rather than pushed
+/// out by the width of the `}} else ` prefix. When the slot begins a line (only
+/// whitespace precedes it — the overwhelmingly common case), the leading-
+/// whitespace width equals the column, so this is a no-op there.
 fn current_column(text: &str) -> usize {
-    match text.rfind('\n') {
-        Some(idx) => text[idx + 1..].chars().count(),
-        None => text.chars().count(),
-    }
+    let line = match text.rfind('\n') {
+        Some(idx) => &text[idx + 1..],
+        None => text,
+    };
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
 }
 
 /// Prepends `indent` spaces to every line of `fragment` *after the first*,
@@ -418,6 +431,19 @@ mod tests {
         let mut r = resolver(&[("body", "return 1;\nreturn 2;")]);
         let out = t.render(&mut r).expect("render");
         assert_eq!(out.text, "fn a() {\n    return 1;\n    return 2;\n}");
+    }
+
+    #[test]
+    fn multiline_slot_after_nonwhitespace_uses_line_indent_not_column() {
+        // A multi-line slot placed AFTER non-whitespace text on a line (e.g. an
+        // `else` arm authored as `}} else {else}`) must indent its continuation
+        // lines by the LINE'S indentation (here 0), not the character column
+        // (here 7, after "} else "). This keeps the else block left-aligned to
+        // the `if`.
+        let t = Template::parse("if c {{\n    {then}\n}} else {else}").expect("parse");
+        let mut r = resolver(&[("then", "a;"), ("else", "{\n    b;\n}")]);
+        let out = t.render(&mut r).expect("render");
+        assert_eq!(out.text, "if c {\n    a;\n} else {\n    b;\n}");
     }
 
     #[test]

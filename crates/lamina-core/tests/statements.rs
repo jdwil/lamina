@@ -215,11 +215,22 @@ fn counted_for_renders() {
         }))),
         body: vec![Statement::Continue],
     }];
-    let ts_out = emit_body(body, &ts());
-    // `for (let i = 0; i < 10; i + 1;) { ... }` — init carries its own `;`.
-    assert!(ts_out.contains("for (let i = 0;"), "got: {ts_out}");
-    assert!(ts_out.contains("i < 10;"), "got: {ts_out}");
-    assert!(ts_out.contains("continue;"), "got: {ts_out}");
+    let ts_out = emit_body(body.clone(), &ts());
+    // C-style header, step carries NO trailing `;` (the header's own `;`
+    // separators are the only terminators).
+    assert_eq!(
+        ts_out,
+        "function f(): number {\n    for (let i = 0; i < 10; i + 1) {\n        continue;\n    }\n}",
+        "got: {ts_out}"
+    );
+    // Rust has no C-style for; it desugars to a block-scoped while whose step
+    // runs at the end of the body.
+    let rust_out = emit_body(body, &rust());
+    assert_eq!(
+        rust_out,
+        "fn f() -> i32 {\n    {\n        let i = 0;\n        while i < 10 {\n            continue;\n            i + 1;\n        }\n    }\n}",
+        "got: {rust_out}"
+    );
 }
 
 // ---- foreach ------------------------------------------------------------

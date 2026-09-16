@@ -199,9 +199,28 @@ no raw pointers).
 Templates are written at column 0. When a slot appears indented within a
 template, the renderer prepends that indentation to **every line after the
 first** of the slot's rendered value (the first line's indent is the literal
-text preceding the slot). Blank lines get no trailing whitespace. Because this
-threads through the recursive renderer, nested indentation accumulates
-naturally — a template never hard-codes the indentation of its container.
+text preceding the slot). The prepended amount is the **indentation of the
+current line** — the width of its leading whitespace — not the full character
+column, so a multi-line slot placed *after* non-whitespace text on a line stays
+aligned to that line's indent rather than being pushed out by the preceding
+text. This is what lets a brace-language `else` arm authored as
+`}} else {else}` render its block left-aligned to the `if`. Blank lines get no
+trailing whitespace. Because this threads through the recursive renderer, nested
+indentation accumulates naturally — a template never hard-codes the indentation
+of its container.
+
+### Statement clauses (`init_clause` / `step_clause`)
+
+A C-style counted `for (init; cond; step)` header composes an initializer and a
+step as **clauses**, not statements: the header's own `;` separators are the
+only terminators, so the init/step MUST NOT carry a statement terminator of
+their own. A target that emits such a header therefore renders `for`'s init/step
+through the `{init_clause}` / `{step_clause}` sub-slots, which dispatch to a
+`### stmt_clause` `When` table (the terminator-free sibling of `### statement`,
+sharing the same `stmt is <kind>` dispatch). A target that instead desugars the
+counted loop (e.g. Rust, which has no C-style `for`) uses the full-statement
+`{init}` / `{step}` sub-slots, where the trailing terminator is correct. Only
+the `let` and `expr` clause kinds are reachable from a `for` header.
 
 ## Prose
 

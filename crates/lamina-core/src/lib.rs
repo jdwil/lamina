@@ -26,12 +26,14 @@ pub mod lang;
 pub mod lang_doc;
 pub mod lexer;
 pub mod parser;
+pub mod predicate;
+pub mod render;
 
 use std::path::Path;
 
 use thiserror::Error;
 
-pub use error::{EmitError, LangDocError, ParseError};
+pub use error::{EmitError, LangDocError, ParseError, PredicateError};
 
 /// An error from loading a language-definition document from disk.
 #[derive(Debug, Error)]

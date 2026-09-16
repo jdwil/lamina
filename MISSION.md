@@ -2,6 +2,8 @@
 
 Lamina is an intermediate representation language and runtime whose purpose is to provide flexible and configurable grammars that lower to native source code and raise to English description, executable examples, and visual projections a human can review and sign off.
 
+Lamina describes **projects, not just programs**. A project is the union of imperative source code (backend and frontend logic), declarative documents (markup and styles), structured configuration (JSON, YAML, TOML, framework manifests, tailwind configs, and the like), and the file-tree layout that arranges them. A single Lamina project may therefore lower to a whole framework's worth of artifacts, not one file.
+
 Licensed **AGPL-3.0-only** (JD Williams, jd@unsung-operators.com). Hosted
 ProductHost and commercial licenses: same address.
 
@@ -9,17 +11,50 @@ ProductHost and commercial licenses: same address.
 
 The engine has a finite set of primitives and keywords it understands. In order for the engine to produce raw code during transpilation, it must be provided a language file. Each language file provides a capability matrix, which lets the engine know which of its primitives and keywords the target language supports. Layers may only lower to Lamina code utilizing constructs that are supported by the capability matrix of the given language file. This means a given Lamina project may transpile to multiple languages, but not all languages. Here is a list of keywords and primitives that are supported.
 
+### Two Kernel Cores
+
+The kernel spans two small, orthogonal paradigms. Most languages use one; some use both.
+
+- **Imperative core** — statements, expressions, and functions. Describes *behavior*. This is the `fn`/`if`/`while`/`return` world and the numeric/scalar primitives below. Targets: Rust, TypeScript, Swift, Kotlin, Python, etc.
+- **Declarative tree core** — named tree nodes with attributes and text. Describes *structure*. This is the substrate shared by **all** document and structured-data formats: an HTML element, a CSS rule, a Markdown block, a JSON object, a YAML/TOML table are all "a named node with attributes and children." Targets: HTML, CSS, Markdown, XML, JSON, YAML, TOML, config formats.
+
+Both cores stay deliberately tiny and frozen. Concrete vocabularies — every HTML tag, every CSS property, a specific config schema, a framework component model — are NOT kernel; they are language-definition detail or, better, **layers** built over the two cores. (The exact tree-core keyword set is intentionally left unpinned until the tree-core slice is built and can be pressure-tested against real HTML/CSS/JSON examples.)
+
+A project also has a dimension neither core alone captures: the **file tree** itself — which files exist, their paths, and their formats. A directory tree is itself a named tree (a directory is a node; a file is a leaf whose content is imperative source or a tree document), so it fits the tree-core concept, but it introduces a new output model: the engine emits a *filesystem layout of many artifacts*, not a single string. This is where `lamina.toml` and composite/meta language files live.
+
 ### Primitives
 
 i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize, f16, bf16, f32, f64, f128, bool, void, never, byte, bytes, char, str, ptr, fnptr
 
 ### Keywords
 
-file, use, fn, struct, enum, typedef, const, if, else, switch, case, default, while, for, return, break, continue, true, false, null
+Keywords fall into two classes.
+
+**Structural keywords** are kernel syntax that every target must be able to express. They are never gated by the capability matrix and may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block):
+
+file, use, fn, struct, enum, typedef, let, if, else, switch, case, default, while, for, foreach, return, break, continue, true, false, null
+
+(`let` is the local-binding statement; `foreach` is the iterator loop, distinct from the C-style counted `for` — see the imperative-core statement set.)
+
+**Capability keywords** are effects/attributes that not every target supports. They ARE gated by the capability matrix (a language file may forbid them; forbidding one means a unit that uses it cannot target that language). See *Callable Modifiers* below:
+
+const, async, unsafe, throws, extern, inline, generator
+
+### Callable Modifiers
+
+The kernel reserves the **superset** of modifiers that can be applied to a callable in *any* target language. The kernel is permissive; each language file is the filter — it declares how to spell each modifier or forbids the ones its target lacks. The engine is dumb about them: it reads which modifiers a callable carries, asks the language file for each one's spelling (or errors if forbidden), and places the text via a template slot. All *behavior* (e.g. how async actually works, error propagation for throws) lives in layers or the target's own runtime, never the engine.
+
+A modifier is **semantic metadata first, emitted text second.** Some modifiers usually produce declaration text (`async`, `const`); some may emit nothing in a given target (e.g. `generator` in Python, where the sequence nature is expressed by `yield` in the body) yet still remain attached to the IR node as metadata that informs the *raise* direction, examples, layers, and analysis. The language file's slot may therefore be an empty string; the modifier is not thereby lost.
+
+**On/off modifiers** (a callable either has each or not): `const`, `async`, `unsafe`, `throws`, `extern`, `inline`, `generator`. Each is a forbiddable capability keyword with a language-file slot for its spelling and a position in the `decl` template (Rust prefix `async `, Kotlin `suspend `, Swift postfix ` async` — spelling from the matrix, position from the template).
+
+**Visibility** is not on/off but a choice among three kernel levels: `public`, `protected`, `private`. Each language file maps each kernel level to its target spelling or forbids it (Rust `pub` / `pub(crate)` / none; Swift `public` / `internal` / `private`; TypeScript may forbid `protected` for free functions). For free functions in kernel v0 there is no inheritance, so `protected` reads as the middle tier (more than private, less than public) and maps to a target's module/package visibility. (When an OOP layer later introduces classes, an OOP-level `protected` with true subclass semantics will be reconciled against this kernel module-tier meaning.)
+
+Modifiers that apply only to a *method on a type* (static, override, virtual, abstract, final, mutating, class-vs-instance) are NOT kernel callable modifiers — methods and receivers are layer concepts, so those belong to an OOP layer, not the kernel.
 
 ### Capability Matrix
 
-Capability matrices apply primarily to language primitives/types. Keywords are kernel syntax. Control-flow keywords may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block). Eg, a language file does not get to forbid switch. It may only forbid primitives, and null follows ptr.
+Capability matrices apply to language primitives/types and to capability keywords (the callable modifiers above). Structural keywords are kernel syntax and are never gated — a language file does not get to forbid `switch` (it desugars). It may forbid primitives and capability keywords, and `null` follows `ptr`. Control-flow keywords may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block).
 
 Each kernel primitive maps to exactly one of five **actions**. The target type is required for every action except `forbid`. These five are the whole vocabulary — there is no `narrow` or `reinterpret`; a conversion that changes meaning is a cast written in Lamina, not something the matrix does on the way out.
 

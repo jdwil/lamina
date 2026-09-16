@@ -1,70 +1,154 @@
-//! Parser for rigid `.mdl` language-definition documents.
+//! Parser for rigid `.mdl` language-definition documents (template model).
 //!
-//! A language definition is authored as a markdown-*compatible* document, but
-//! the format is **strictly validated** - it is not free-form markdown. The
-//! parser enforces a fixed shape and fails loudly on anything malformed:
+//! A language definition is a markdown-*compatible* document, strictly
+//! validated (not free-form markdown). Shape:
 //!
 //! ~~~text
 //! # Lamina Language Definition: <name>
 //!
-//! <free prose, ignored by the parser>
+//! <free prose, ignored>
 //!
 //! ## Function
-//! ```lang-function
-//! keyword = "<kw>"
-//! return_type_sep = "<sep>"
-//! emit_return_type = true|false
-//! ```
+//!
+//! ### decl
+//! | When | Template |
+//! |------|----------|
+//! | else | "{vis}{async}fn {name}({params}){ret} {{\n{body}\n}}" |
+//!
+//! ### ret
+//! | When         | Template |
+//! | ret is void  | "" |
+//! | else         | " -> {ret_type}" |
+//! ...
 //!
 //! ## Capabilities
-//! ```lang-capabilities
-//! <primitive> <action> [target-type]
-//! ...
-//! ```
+//! | Primitive | Action   | Target |
+//! | i32       | identity | i32    |
 //! ~~~
 //!
-//! Prose between sections is documentation (and future raise-input); it is not
-//! validated. Only the title line and the typed fenced blocks are load-bearing.
+//! Each `### <name>` under `## Function` is a `When` table: a markdown pipe
+//! table whose first column is a [`Predicate`](crate::predicate) and second is
+//! a double-quoted [`Template`]. Rows are evaluated first-match-wins and the
+//! table must end in an `else` row. Prose between sections is ignored.
 //!
-//! The engine ships with NO built-in language definitions - a definition is
-//! always loaded from a document like this. That is what keeps the engine
-//! "dumb": no target is hardcoded in core.
+//! The engine ships NO built-in definitions — a definition is always loaded
+//! from a document like this, keeping the engine "dumb."
 
 use std::collections::HashMap;
 
-use crate::ast::Primitive;
+use crate::ast::{slot_binding, BinaryOp, ItemKind, Primitive, SlotScope, SlotShape, UnaryOp};
 use crate::error::LangDocError;
-use crate::lang::{Capability, FunctionSyntax, LanguageDef};
+use crate::lang::{
+    Capability, FunctionDef, ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef, WhenRow,
+    WhenTable,
+};
+use crate::predicate::parse_predicate;
+use crate::render::Template;
 
 const TITLE_PREFIX: &str = "# Lamina Language Definition:";
 const FUNCTION_HEADING: &str = "## Function";
 const CAPABILITIES_HEADING: &str = "## Capabilities";
-const FUNCTION_BLOCK_TAG: &str = "lang-function";
-const CAPABILITIES_BLOCK_TAG: &str = "lang-capabilities";
+const OPERATORS_HEADING: &str = "## Operators";
 
-/// Parses a rigid `.mdl` language-definition document into a [`LanguageDef`].
+/// Parses a rigid template-model `.mdl` language-definition document into a
+/// [`LanguageDef`].
+///
+/// Shape: `## Function` contains exactly one ```` ```template ```` block (the
+/// entry template) followed by `### <slot>` subsections (each a `template`
+/// block or a `When` table). Every referenced slot must resolve to a subsection
+/// or a terminal slot; this is validated at load time.
 ///
 /// # Errors
 ///
-/// Returns a [`LangDocError`] if the document is missing a required element or
-/// any block is malformed.
+/// Returns a [`LangDocError`] if the document is missing a required element, any
+/// table/template/predicate is malformed, or a referenced slot is unresolved.
 pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
     let name = parse_title(src)?;
 
     require_heading(src, FUNCTION_HEADING)?;
     require_heading(src, CAPABILITIES_HEADING)?;
 
-    let function_lines = extract_block(src, FUNCTION_BLOCK_TAG)?;
-    let function_syntax = parse_function_block(&function_lines)?;
+    // The `## Function` section is required and always present; it also hosts
+    // the SHARED deep-helper slots (`### expr`, `### statement`, `### pointer`,
+    // …) that the expression/type/statement resolvers reach regardless of which
+    // top-level item is being rendered.
+    let function_src = section_body(src, FUNCTION_HEADING);
+    let (entry, slots) = parse_entry_and_slots(&function_src, SlotScope::Function)?;
+    let function = FunctionDef { entry, slots };
 
-    let capability_lines = extract_block(src, CAPABILITIES_BLOCK_TAG)?;
-    let capabilities = parse_capabilities_block(&capability_lines)?;
+    // Each non-function item kind gets its OWN `## <Item>` section (a sibling of
+    // `## Function`). These sections are OPTIONAL: a definition that omits one
+    // simply cannot emit that item kind (using it becomes an emit-time
+    // `UnknownItem` error). When present, each is parsed exactly like the
+    // function section but validated in its own slot scope.
+    let mut items = HashMap::new();
+    for kind in ItemKind::all() {
+        if kind == ItemKind::Function {
+            continue;
+        }
+        let heading = format!("## {}", kind.heading());
+        if !src.lines().any(|l| l.trim_end() == heading) {
+            continue;
+        }
+        let item_src = section_body(src, &heading);
+        let (entry, slots) = parse_entry_and_slots(&item_src, kind.scope())?;
+        items.insert(kind, ItemDef { entry, slots });
+    }
+
+    let capability_src = section_body(src, CAPABILITIES_HEADING);
+    let capabilities = parse_capability_table(&capability_src)?;
+
+    // Enforce completeness: every kernel primitive MUST have a matrix row.
+    let missing: Vec<&str> = Primitive::all()
+        .iter()
+        .filter(|p| !capabilities.contains_key(p))
+        .map(|p| p.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(LangDocError::IncompleteCapabilityMatrix {
+            missing: missing.join(", "),
+        });
+    }
+
+    // The `## Operators` section is OPTIONAL: an absent section means every
+    // operator emits its canonical spelling. When present, it lists only the
+    // exceptions (spelling overrides and forbids).
+    let operators = if src.lines().any(|l| l.trim_end() == OPERATORS_HEADING) {
+        let operator_src = section_body(src, OPERATORS_HEADING);
+        parse_operator_table(&operator_src)?
+    } else {
+        HashMap::new()
+    };
 
     Ok(LanguageDef {
         name,
         capabilities,
-        function_syntax,
+        function,
+        items,
+        operators,
     })
+}
+
+/// Parses one item/function section body into its entry template and slot map,
+/// then validates the slot graph starting in `scope`.
+///
+/// The shape is identical for every `## <Item>` section (including
+/// `## Function`): a single `template` block (the entry) followed by
+/// `### <slot>` subsections. Validation is scope-aware so `{name}` binds to the
+/// right thing at each level (a struct's name at struct scope, a field's name
+/// within a `### field` item slot, …).
+fn parse_entry_and_slots(
+    section_src: &str,
+    scope: SlotScope,
+) -> Result<(Template, HashMap<String, SlotDef>), LangDocError> {
+    let entry_str = extract_entry_template(section_src)?;
+    let entry = Template::parse(&entry_str).map_err(|e| LangDocError::BadTemplate {
+        table: "<entry>".to_string(),
+        detail: e.to_string(),
+    })?;
+    let slots = parse_slot_subsections(section_src)?;
+    validate_slot_graph(&entry, &slots, scope)?;
+    Ok((entry, slots))
 }
 
 /// Parses the required title line and returns the captured target name.
@@ -101,140 +185,392 @@ fn require_heading(src: &str, heading: &str) -> Result<(), LangDocError> {
     }
 }
 
-/// Extracts the body lines of the fenced block opened by ```` ```<tag> ````.
-///
-/// Returns the lines between the opening and closing fences. Errors if the
-/// block is absent or unterminated.
-fn extract_block(src: &str, tag: &str) -> Result<Vec<String>, LangDocError> {
-    let opening = format!("```{tag}");
-    let mut lines = src.lines();
-    let mut found_open = false;
-
-    // Find the opening fence. The fence's info string must equal the tag
-    // exactly (after the backticks) so `lang-capabilities` does not match a
-    // hypothetical `lang-capabilities-extra`.
-    for line in lines.by_ref() {
-        if line.trim_end() == opening {
-            found_open = true;
-            break;
-        }
-    }
-    if !found_open {
-        return Err(LangDocError::MissingBlock {
-            tag: tag.to_string(),
-        });
-    }
-
-    let mut body = Vec::new();
-    for line in lines.by_ref() {
-        if line.trim_end() == "```" {
-            return Ok(body);
-        }
-        body.push(line.to_string());
-    }
-
-    Err(LangDocError::UnterminatedBlock {
-        tag: tag.to_string(),
-    })
-}
-
-/// Parses the `lang-function` block into a [`FunctionSyntax`].
-fn parse_function_block(lines: &[String]) -> Result<FunctionSyntax, LangDocError> {
-    let mut map: HashMap<String, String> = HashMap::new();
-
-    for raw in lines {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+/// Returns the lines of a `##` section: everything after the heading up to the
+/// next `## ` heading (or end of document).
+fn section_body(src: &str, heading: &str) -> String {
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in src.lines() {
+        if line.trim_end() == heading {
+            in_section = true;
             continue;
         }
-        let (key, value) = line.split_once('=').ok_or_else(|| LangDocError::MalformedLine {
-            tag: FUNCTION_BLOCK_TAG.to_string(),
-            line: raw.clone(),
-        })?;
-        map.insert(key.trim().to_string(), value.trim().to_string());
+        if in_section {
+            // A new top-level `## ` heading ends this section (but `### ` sub
+            // headings stay within it).
+            if line.trim_start().starts_with("## ") && !line.trim_start().starts_with("###") {
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
     }
-
-    let keyword = take_string(&map, "keyword", FUNCTION_BLOCK_TAG)?;
-    let return_type_sep = take_string(&map, "return_type_sep", FUNCTION_BLOCK_TAG)?;
-    let emit_return_type = take_bool(&map, "emit_return_type")?;
-
-    Ok(FunctionSyntax {
-        keyword,
-        return_type_sep,
-        emit_return_type,
-    })
+    out
 }
 
-/// Reads a required double-quoted string value from a parsed key/value map.
-fn take_string(
-    map: &HashMap<String, String>,
-    key: &str,
-    tag: &str,
-) -> Result<String, LangDocError> {
-    let value = map.get(key).ok_or_else(|| LangDocError::MissingKey {
-        key: key.to_string(),
-        tag: tag.to_string(),
-    })?;
-    unquote(key, value)
-}
-
-/// Reads a required boolean value (`true`/`false`) from a parsed key/value map.
-fn take_bool(map: &HashMap<String, String>, key: &str) -> Result<bool, LangDocError> {
-    let value = map.get(key).ok_or_else(|| LangDocError::MissingKey {
-        key: key.to_string(),
-        tag: FUNCTION_BLOCK_TAG.to_string(),
-    })?;
-    match value.as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(LangDocError::InvalidBool {
-            key: key.to_string(),
-            value: value.clone(),
+/// Extracts the single entry ```` ```template ```` block that appears in the
+/// Function section before any `### ` subsection.
+fn extract_entry_template(function_src: &str) -> Result<String, LangDocError> {
+    // Only look at lines before the first `### ` subsection.
+    let mut head = String::new();
+    for line in function_src.lines() {
+        if line.trim_start().starts_with("### ") {
+            break;
+        }
+        head.push_str(line);
+        head.push('\n');
+    }
+    match extract_template_block(&head)? {
+        Some(body) => Ok(body),
+        None => Err(LangDocError::MissingTable {
+            name: "<entry template>".to_string(),
         }),
     }
 }
 
-/// Strips the surrounding double quotes from a string value, preserving any
-/// interior whitespace. Errors if the value is not properly quoted.
-fn unquote(key: &str, value: &str) -> Result<String, LangDocError> {
+/// Extracts the body of the first ```` ```template ```` fenced block in `src`,
+/// or `None` if there is none. The body is returned verbatim (templates are
+/// authored at column 0), with exactly one trailing newline trimmed (the fence
+/// sits on its own line).
+fn extract_template_block(src: &str) -> Result<Option<String>, LangDocError> {
+    let mut lines = src.lines();
+    let mut found = false;
+    for line in lines.by_ref() {
+        if line.trim_end() == "```template" {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    for line in lines.by_ref() {
+        if line.trim_end() == "```" {
+            // Trim exactly one trailing newline (the closing fence's own line).
+            if body.ends_with('\n') {
+                body.pop();
+            }
+            return Ok(Some(body));
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Err(LangDocError::BadTemplate {
+        table: "<template block>".to_string(),
+        detail: "unterminated ```template``` block".to_string(),
+    })
+}
+
+/// Parses all `### <name>` slot subsections in the Function section. Each is a
+/// [`SlotDef`]: a `template` block or a `When` table.
+fn parse_slot_subsections(function_src: &str) -> Result<HashMap<String, SlotDef>, LangDocError> {
+    let mut slots = HashMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_body = String::new();
+
+    fn flush(
+        slots: &mut HashMap<String, SlotDef>,
+        name: &Option<String>,
+        body: &mut String,
+    ) -> Result<(), LangDocError> {
+        if let Some(name) = name {
+            let def = parse_slot_body(name, body)?;
+            slots.insert(name.clone(), def);
+        }
+        body.clear();
+        Ok(())
+    }
+
+    for line in function_src.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            flush(&mut slots, &current_name, &mut current_body)?;
+            current_name = Some(rest.trim().to_string());
+        } else if current_name.is_some() {
+            current_body.push_str(line);
+            current_body.push('\n');
+        }
+        // Lines before the first `### ` (the entry template) are handled
+        // separately by `extract_entry_template`.
+    }
+    flush(&mut slots, &current_name, &mut current_body)?;
+
+    Ok(slots)
+}
+
+/// Parses one slot subsection body into a [`SlotDef`]: a `template` block if one
+/// is present (a fixed render outcome), otherwise a `When` table.
+fn parse_slot_body(name: &str, body: &str) -> Result<SlotDef, LangDocError> {
+    if let Some(template_str) = extract_template_block(body)? {
+        let template = Template::parse(&template_str).map_err(|e| LangDocError::BadTemplate {
+            table: name.to_string(),
+            detail: e.to_string(),
+        })?;
+        return Ok(SlotDef::Fixed(Outcome::Render(template)));
+    }
+    let rows: Vec<String> = body
+        .lines()
+        .filter(|l| l.trim_start().starts_with('|'))
+        .map(|l| l.to_string())
+        .collect();
+    if rows.is_empty() {
+        return Err(LangDocError::MissingTable {
+            name: name.to_string(),
+        });
+    }
+    let table = build_table(name, &rows)?;
+    Ok(SlotDef::Table(table))
+}
+
+/// Validates that every slot referenced anywhere resolves — either to an
+/// engine-bound slot (in the scope it is referenced in) or to a `### <slot>`
+/// subsection — and that any sequence-shaped slot has its item subsection.
+///
+/// This is fully shape-driven: cardinality (scalar vs sequence) and the item
+/// slot come from [`slot_binding`], not any hardcoded list. Scope matters —
+/// `{name}` in the entry (function scope) binds to the function name, while
+/// `{name}` inside a `param` item slot binds to the parameter name.
+fn validate_slot_graph(
+    entry: &Template,
+    slots: &HashMap<String, SlotDef>,
+    scope: SlotScope,
+) -> Result<(), LangDocError> {
+    let mut visited: Vec<(String, SlotScope)> = Vec::new();
+    // Seed with the entry template's referenced slots, in the section's scope.
+    let mut work: Vec<(String, SlotScope)> = entry
+        .slot_names()
+        .iter()
+        .map(|s| (s.to_string(), scope))
+        .collect();
+
+    while let Some((name, scope)) = work.pop() {
+        if visited.contains(&(name.clone(), scope)) {
+            continue;
+        }
+        visited.push((name.clone(), scope));
+
+        match slot_binding(&name, scope) {
+            Some(SlotShape::Scalar) => {
+                // Resolves directly; references nothing further.
+            }
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                // The item slot subsection must exist, and its referenced slots
+                // are validated in the element scope.
+                let def = slots.get(&item_slot).ok_or_else(|| LangDocError::MissingItemSlot {
+                    collection: name.clone(),
+                    item: item_slot.clone(),
+                })?;
+                for r in referenced_by(def) {
+                    work.push((r, item_scope));
+                }
+            }
+            None => {
+                // Must be satisfied by a subsection; its references stay in the
+                // same scope (function-level helper slots like `ret`, `vis`).
+                let def = slots.get(&name).ok_or_else(|| LangDocError::UnknownSlotReference {
+                    slot: name.clone(),
+                })?;
+                for r in referenced_by(def) {
+                    work.push((r, scope));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The slot names referenced by a slot definition's template(s).
+fn referenced_by(def: &SlotDef) -> Vec<String> {
+    let mut out = Vec::new();
+    let add = |outcome: &Outcome, out: &mut Vec<String>| {
+        if let Outcome::Render(t) = outcome {
+            out.extend(t.slot_names().iter().map(|s| s.to_string()));
+        }
+    };
+    match def {
+        SlotDef::Fixed(outcome) => add(outcome, &mut out),
+        SlotDef::Table(table) => {
+            for row in &table.rows {
+                add(&row.outcome, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Builds a [`WhenTable`] from the raw pipe rows of one `### <name>` table.
+///
+/// Skips the header row (`| When | Template |`) and the separator row; parses
+/// each remaining row into a predicate + template; requires a final `else` row.
+fn build_table(name: &str, rows: &[String]) -> Result<WhenTable, LangDocError> {
+    let mut parsed = Vec::new();
+
+    for raw in rows {
+        let cells = split_row(raw);
+        if cells.len() < 2 {
+            // Could be a separator row like `|----|----|`.
+            if is_separator_row(&cells) {
+                continue;
+            }
+            return Err(LangDocError::MalformedRow {
+                table: name.to_string(),
+                line: raw.clone(),
+            });
+        }
+        if is_separator_row(&cells) {
+            continue;
+        }
+        // Skip the header row.
+        if cells[0].eq_ignore_ascii_case("when") {
+            continue;
+        }
+
+        let predicate_src = cells[0].trim();
+        let outcome_cell = cells[1].trim();
+
+        let predicate = parse_predicate(predicate_src).map_err(|e| LangDocError::BadPredicate {
+            table: name.to_string(),
+            detail: e.to_string(),
+        })?;
+        let outcome = parse_outcome_cell(name, outcome_cell)?;
+
+        parsed.push(WhenRow { predicate, outcome });
+    }
+
+    // Require a final `else` row (the catch-all).
+    match parsed.last() {
+        Some(row) if row.predicate == crate::predicate::Predicate::Else => {}
+        _ => {
+            return Err(LangDocError::MissingElseRow {
+                table: name.to_string(),
+            })
+        }
+    }
+
+    Ok(WhenTable { rows: parsed })
+}
+
+/// Parses a Template-column cell into an [`Outcome`].
+///
+/// A cell is either a double-quoted string (→ a template to render) or the
+/// unquoted bareword `forbid` (→ [`Outcome::Forbid`]). Any other unquoted text
+/// is a [`LangDocError::UnquotedTemplate`] — the strictness is preserved; only
+/// the single `forbid` directive is allowed unquoted.
+fn parse_outcome_cell(table: &str, cell: &str) -> Result<Outcome, LangDocError> {
+    if cell == "forbid" {
+        return Ok(Outcome::Forbid);
+    }
+    let template_str = unquote_template(table, cell)?;
+    let template = Template::parse(&template_str).map_err(|e| LangDocError::BadTemplate {
+        table: table.to_string(),
+        detail: e.to_string(),
+    })?;
+    Ok(Outcome::Render(template))
+}
+
+/// Splits a markdown pipe row into trimmed cells (dropping leading/trailing
+/// pipes).
+fn split_row(raw: &str) -> Vec<String> {
+    raw.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+/// Returns `true` if all cells consist only of dashes/colons/spaces (a markdown
+/// table separator row).
+fn is_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// Strips the surrounding double quotes from a template cell and unescapes
+/// `\n` and `\t` so multi-line templates can be written on one row.
+fn unquote_template(table: &str, value: &str) -> Result<String, LangDocError> {
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        Ok(value[1..value.len() - 1].to_string())
+        let inner = &value[1..value.len() - 1];
+        Ok(unescape(inner))
     } else {
-        Err(LangDocError::UnquotedString {
-            key: key.to_string(),
+        Err(LangDocError::UnquotedTemplate {
+            table: table.to_string(),
             value: value.to_string(),
         })
     }
 }
 
-/// Parses the `lang-capabilities` block into a capability matrix.
-fn parse_capabilities_block(
-    lines: &[String],
+/// Unescapes the small set of escapes allowed in a template cell: `\n`, `\t`,
+/// `\\`, and `\"`.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parses a capability matrix authored as a markdown pipe table.
+///
+/// Columns: `Primitive | Action | Target [| Notes]`. Header and separator rows
+/// are skipped; the Notes column (if any) is ignored. `forbid` rows omit the
+/// target.
+///
+/// # Errors
+///
+/// Returns a [`LangDocError`] on a malformed row, unknown primitive/action, or
+/// a missing required target.
+pub fn parse_capability_table(
+    table: &str,
 ) -> Result<HashMap<Primitive, Capability>, LangDocError> {
     let mut capabilities = HashMap::new();
 
-    for raw in lines {
+    for raw in table.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if !line.starts_with('|') {
             continue;
         }
+        let cells = split_row(raw);
+        if is_separator_row(&cells) {
+            continue;
+        }
+        if cells.first().map(|c| c.eq_ignore_ascii_case("primitive")) == Some(true) {
+            continue;
+        }
+        if cells.len() < 2 {
+            return Err(LangDocError::MalformedCapabilityRow {
+                line: raw.to_string(),
+            });
+        }
 
-        let mut parts = line.split_whitespace();
-        let primitive_name = parts.next().ok_or_else(|| LangDocError::MalformedLine {
-            tag: CAPABILITIES_BLOCK_TAG.to_string(),
-            line: raw.clone(),
-        })?;
-        let action = parts.next().ok_or_else(|| LangDocError::MalformedLine {
-            tag: CAPABILITIES_BLOCK_TAG.to_string(),
-            line: raw.clone(),
-        })?;
-        let target = parts.next();
+        let primitive_name = cells[0].as_str();
+        let action = cells[1].as_str();
+        let target = cells.get(2).map(|s| s.as_str()).filter(|t| !t.is_empty());
 
         let primitive =
             Primitive::from_name(primitive_name).ok_or_else(|| LangDocError::UnknownPrimitive {
                 name: primitive_name.to_string(),
             })?;
-
         let capability = build_capability(action, target, primitive_name)?;
         capabilities.insert(primitive, capability);
     }
@@ -269,102 +605,163 @@ fn build_capability(
     }
 }
 
-/// Parses a capability matrix authored as a markdown pipe table.
+/// Parses an optional operator table authored as a markdown pipe table.
 ///
-/// This is the locked capability-matrix format: a table with a header row and a
-/// separator row, then one data row per primitive:
+/// Columns: `Operator | Action | Target [| Notes]`. The operator name is a
+/// stable machine name (e.g. `ushr`, `floordiv`; see [`UnaryOp::name`] /
+/// [`BinaryOp::name`]). Actions:
+/// - `spell` — override the emitted text with the `Target` cell, and
+/// - `forbid` — mark the operator inexpressible (no target required).
 ///
-/// ~~~text
-/// | Primitive | Action   | Target | Notes |
-/// |-----------|----------|--------|-------|
-/// | i32       | identity | i32    | |
-/// | str       | wrap     | String | optional prose |
-/// ~~~
-///
-/// The `Notes` column is free prose and is ignored. Rows for `forbid` omit the
-/// target. Header and separator rows are skipped.
+/// Header/separator rows are skipped and the `Notes` column (if any) is
+/// ignored. This is the MINIMAL viable operator-capability format: operators
+/// absent from the table keep their canonical spelling, so only exceptions are
+/// listed. A richer format (precedence, placement, call-style lowering) is
+/// deferred and escalated.
 ///
 /// # Errors
 ///
-/// Returns a [`LangDocError`] if a row is malformed, names an unknown primitive
-/// or action, or omits a required target.
-pub fn parse_capability_table(
+/// Returns a [`LangDocError`] on a malformed row, an unknown operator name, an
+/// unknown action, or a `spell` action missing its target.
+pub fn parse_operator_table(
     table: &str,
-) -> Result<HashMap<Primitive, Capability>, LangDocError> {
-    let mut capabilities = HashMap::new();
+) -> Result<HashMap<String, OperatorSpelling>, LangDocError> {
+    let mut operators = HashMap::new();
 
     for raw in table.lines() {
         let line = raw.trim();
-        // Only consider pipe-table rows.
         if !line.starts_with('|') {
             continue;
         }
-        // Skip the separator row (cells made only of dashes/colons/spaces).
-        let cells: Vec<&str> = line
-            .trim_matches('|')
-            .split('|')
-            .map(|c| c.trim())
-            .collect();
-        if cells
-            .iter()
-            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
-        {
+        let cells = split_row(raw);
+        if is_separator_row(&cells) {
             continue;
         }
-        // Skip the header row (identified by the literal column name).
-        if cells.first().map(|c| c.eq_ignore_ascii_case("primitive")) == Some(true) {
+        if cells.first().map(|c| c.eq_ignore_ascii_case("operator")) == Some(true) {
             continue;
         }
-
         if cells.len() < 2 {
-            return Err(LangDocError::MalformedLine {
-                tag: "capabilities-table".to_string(),
+            return Err(LangDocError::MalformedOperatorRow {
                 line: raw.to_string(),
             });
         }
 
-        let primitive_name = cells[0];
-        let action = cells[1];
-        let target = cells.get(2).copied().filter(|t| !t.is_empty());
+        let op_name = cells[0].as_str();
+        let action = cells[1].as_str();
+        let target = cells.get(2).map(|s| s.as_str()).filter(|t| !t.is_empty());
 
-        let primitive =
-            Primitive::from_name(primitive_name).ok_or_else(|| LangDocError::UnknownPrimitive {
-                name: primitive_name.to_string(),
-            })?;
-        let capability = build_capability(action, target, primitive_name)?;
-        capabilities.insert(primitive, capability);
+        // The operator must be a known kernel operator (unary or binary).
+        if UnaryOp::from_name(op_name).is_none() && BinaryOp::from_name(op_name).is_none() {
+            return Err(LangDocError::UnknownOperator {
+                name: op_name.to_string(),
+            });
+        }
+
+        let spelling = match action {
+            "spell" => {
+                let target = target.ok_or_else(|| LangDocError::MissingOperatorTarget {
+                    operator: op_name.to_string(),
+                })?;
+                OperatorSpelling::Spell(target.to_string())
+            }
+            "forbid" => OperatorSpelling::Forbid,
+            _ => {
+                return Err(LangDocError::UnknownOperatorAction {
+                    action: action.to_string(),
+                })
+            }
+        };
+        operators.insert(op_name.to_string(), spelling);
     }
 
-    Ok(capabilities)
+    Ok(operators)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::{Outcome, SlotDef};
+    use crate::predicate::{RenderContext, RetKind, VisKind};
 
-    const RUST_DOC: &str = "# Lamina Language Definition: rust\n\
-        \n\
-        Some prose describing the target.\n\
-        \n\
-        ## Function\n\
-        ```lang-function\n\
-        keyword = \"fn\"\n\
-        return_type_sep = \" -> \"\n\
-        emit_return_type = true\n\
+    /// A complete 26-primitive capability table (every kernel primitive gets a
+    /// row), so load-time completeness enforcement passes. Mappings here are
+    /// only for test purposes.
+    const FULL_CAPS: &str = "## Capabilities\n\
+        | Primitive | Action   | Target |\n\
+        |-----------|----------|--------|\n\
+        | i8    | identity | i8    |\n\
+        | i16   | identity | i16   |\n\
+        | i32   | identity | i32   |\n\
+        | i64   | identity | i64   |\n\
+        | i128  | identity | i128  |\n\
+        | u8    | identity | u8    |\n\
+        | u16   | identity | u16   |\n\
+        | u32   | identity | u32   |\n\
+        | u64   | identity | u64   |\n\
+        | u128  | identity | u128  |\n\
+        | isize | identity | isize |\n\
+        | usize | identity | usize |\n\
+        | f16   | identity | f16   |\n\
+        | bf16  | identity | bf16  |\n\
+        | f32   | identity | f32   |\n\
+        | f64   | identity | f64   |\n\
+        | f128  | identity | f128  |\n\
+        | bool  | identity | bool  |\n\
+        | void  | alias    | ()    |\n\
+        | never | alias    | !     |\n\
+        | byte  | alias    | u8    |\n\
+        | bytes | wrap     | Vec   |\n\
+        | char  | identity | char  |\n\
+        | str   | wrap     | String |\n\
+        | ptr   | wrap     | Ptr   |\n\
+        | fnptr | wrap     | Fn    |\n";
+
+    /// Builds a full document from a `## Function` section body, appending a
+    /// complete capability matrix so completeness enforcement passes.
+    fn mk(function_section: &str) -> String {
+        format!(
+            "# Lamina Language Definition: rust\n\n## Function\n\n{function_section}\n{FULL_CAPS}"
+        )
+    }
+
+    /// The standard function section used by several tests.
+    const FN_SECTION: &str = "```template\n\
+        {vis}fn {name}({params}){ret} {{\n\
+        {body}\n\
+        }}\n\
         ```\n\
         \n\
-        ## Capabilities\n\
-        ```lang-capabilities\n\
-        i32 identity i32\n\
-        ```\n";
+        ### ret\n\
+        | When         | Template |\n\
+        |--------------|----------|\n\
+        | ret is void  | \"\" |\n\
+        | else         | \" -> {ret_type}\" |\n\
+        \n\
+        ### vis\n\
+        | When           | Template |\n\
+        |----------------|----------|\n\
+        | vis is public  | \"pub \" |\n\
+        | else           | \"\" |\n\
+        \n\
+        ### param\n\
+        | When  | Template |\n\
+        |-------|----------|\n\
+        | first | \"{name}: {type}\" |\n\
+        | else  | \", {name}: {type}\" |\n\
+        \n\
+        ### statement\n\
+        ```template\n\
+        return {value};\n\
+        ```";
 
     #[test]
-    fn parses_a_well_formed_document() {
-        let def = parse_language_def(RUST_DOC).expect("should parse");
+    fn parses_full_document() {
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
         assert_eq!(def.name, "rust");
-        assert_eq!(def.function_syntax.keyword, "fn");
-        assert_eq!(def.function_syntax.return_type_sep, " -> ");
-        assert!(def.function_syntax.emit_return_type);
+        assert!(def.function.entry.slot_names().contains(&"vis"));
+        assert!(def.function.entry.slot_names().contains(&"body"));
+        assert!(def.function.slots.contains_key("ret"));
+        assert!(def.function.slots.contains_key("vis"));
         assert_eq!(
             def.capability(Primitive::I32),
             Some(&Capability::Identity("i32".to_string()))
@@ -372,200 +769,354 @@ mod tests {
     }
 
     #[test]
-    fn preserves_significant_whitespace_in_quoted_values() {
-        let def = parse_language_def(RUST_DOC).expect("parse");
-        // The separator must retain its leading and trailing spaces.
-        assert_eq!(def.function_syntax.return_type_sep, " -> ");
+    fn ret_slot_is_a_table_that_branches() {
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
+        match def.function.slots.get("ret").expect("ret slot") {
+            SlotDef::Table(table) => {
+                let void_ctx = RenderContext {
+                    ret: Some(RetKind::Void),
+                    ..Default::default()
+                };
+                match table.select(&void_ctx).expect("void row") {
+                    Outcome::Render(t) => assert!(t.slot_names().is_empty()),
+                    Outcome::Forbid => panic!("void row should render"),
+                }
+                let type_ctx = RenderContext {
+                    ret: Some(RetKind::Type),
+                    ..Default::default()
+                };
+                match table.select(&type_ctx).expect("else row") {
+                    Outcome::Render(t) => assert!(t.slot_names().contains(&"ret_type")),
+                    Outcome::Forbid => panic!("else row should render"),
+                }
+            }
+            SlotDef::Fixed(_) => panic!("ret should be a table"),
+        }
+    }
+
+    #[test]
+    fn a_fixed_slot_can_be_a_template_block() {
+        // A custom (non-iterable) slot `{prefix}` resolved by a fixed template
+        // block; `name`/`body` are terminal/iterable and provided.
+        let doc = mk("```template\n{prefix}fn {name}() {{ {body} }}\n```\n\n\
+            ### prefix\n\
+            ```template\nunsafe \n```\n\n\
+            ### statement\n\
+            ```template\nreturn {value};\n```");
+        let def = parse_language_def(&doc).expect("parses");
+        match def.function.slots.get("prefix").expect("prefix slot") {
+            SlotDef::Fixed(Outcome::Render(_)) => {}
+            _ => panic!("prefix should be a fixed template"),
+        }
+    }
+
+    #[test]
+    fn vis_else_row_is_forbid_directive() {
+        let doc = mk("```template\n{vis}fn {name}() {{ {body} }}\n```\n\n\
+            ### vis\n| When | Template |\n|------|----------|\n| vis is public | \"pub \" |\n| else | forbid |\n\n\
+            ### statement\n```template\nreturn {value};\n```");
+        let def = parse_language_def(&doc).expect("parses");
+        match def.function.slots.get("vis").expect("vis slot") {
+            SlotDef::Table(table) => {
+                let priv_ctx = RenderContext {
+                    vis: Some(VisKind::Private),
+                    ..Default::default()
+                };
+                assert_eq!(table.select(&priv_ctx), Some(&Outcome::Forbid));
+            }
+            SlotDef::Fixed(_) => panic!("vis should be a table"),
+        }
+    }
+
+    #[test]
+    fn vis_public_row_present() {
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
+        match def.function.slots.get("vis").expect("vis slot") {
+            SlotDef::Table(table) => {
+                let pub_ctx = RenderContext {
+                    vis: Some(VisKind::Public),
+                    ..Default::default()
+                };
+                assert!(table.select(&pub_ctx).is_some());
+            }
+            SlotDef::Fixed(_) => panic!("vis should be a table"),
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_capability_matrix() {
+        // Only i32 present -> 25 missing. Entry uses only scalar terminals so
+        // slot-graph validation passes and the completeness check is reached.
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
+            ```template\nfn {name}()\n```\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        match parse_language_def(doc) {
+            Err(LangDocError::IncompleteCapabilityMatrix { missing }) => {
+                assert!(missing.contains("i8"));
+                assert!(missing.contains("fnptr"));
+                assert!(missing.contains("str"));
+                assert!(!missing.contains("i32"));
+            }
+            other => panic!("expected IncompleteCapabilityMatrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_matrix_passes_enforcement() {
+        // The FULL_CAPS table covers all 26 primitives.
+        let def = parse_language_def(&mk(FN_SECTION)).expect("complete matrix should pass");
+        assert_eq!(def.capabilities.len(), 26);
     }
 
     #[test]
     fn rejects_missing_title() {
-        let doc = "## Function\n```lang-function\nkeyword = \"fn\"\n```\n";
-        let err = parse_language_def(doc).expect_err("no title");
-        assert!(matches!(err, LangDocError::MissingTitle { .. }));
+        let doc = "## Function\n\n```template\n{name}\n```\n## Capabilities\n| i32 | identity | i32 |\n";
+        assert!(matches!(
+            parse_language_def(doc),
+            Err(LangDocError::MissingTitle { .. })
+        ));
     }
 
     #[test]
-    fn rejects_wrong_title() {
-        let doc = "# Some Other Title\n\n## Function\n";
-        let err = parse_language_def(doc).expect_err("wrong title");
-        assert!(matches!(err, LangDocError::MissingTitle { .. }));
+    fn rejects_missing_entry_template() {
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n### ret\n| When | Template |\n| else | \"\" |\n\n## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        assert!(matches!(
+            parse_language_def(doc),
+            Err(LangDocError::MissingTable { .. })
+        ));
     }
 
     #[test]
-    fn rejects_missing_function_section() {
-        let doc = "# Lamina Language Definition: x\n\n## Capabilities\n```lang-capabilities\ni32 identity i32\n```\n";
-        let err = parse_language_def(doc).expect_err("no function section");
+    fn rejects_dangling_slot_reference() {
+        // Entry references {ret} but there is no ### ret subsection and `ret`
+        // is not a terminal slot.
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
+            ```template\nfn {name}(){ret}\n```\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
         assert_eq!(
-            err,
-            LangDocError::MissingSection {
-                heading: "## Function".to_string()
-            }
+            parse_language_def(doc),
+            Err(LangDocError::UnknownSlotReference {
+                slot: "ret".to_string()
+            })
         );
     }
 
     #[test]
-    fn rejects_missing_function_block() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n## Capabilities\n```lang-capabilities\ni32 identity i32\n```\n";
-        let err = parse_language_def(doc).expect_err("no function block");
+    fn terminal_slots_need_no_subsection() {
+        // Entry references only scalar terminal slots (name, ret_type) — no
+        // subsections needed, must validate (with a complete matrix).
+        let doc = mk("```template\nfn {name}() -> {ret_type}\n```");
+        assert!(parse_language_def(&doc).is_ok());
+    }
+
+    #[test]
+    fn iterable_slot_requires_item_subsection() {
+        // Referencing {params} without a ### param subsection is a load-time
+        // error.
+        let doc = mk("```template\nfn {name}({params})\n```");
         assert_eq!(
-            err,
-            LangDocError::MissingBlock {
-                tag: "lang-function".to_string()
-            }
+            parse_language_def(&doc),
+            Err(LangDocError::MissingItemSlot {
+                collection: "params".to_string(),
+                item: "param".to_string(),
+            })
         );
     }
 
     #[test]
-    fn rejects_unterminated_block() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\n\n## Capabilities\n";
-        let err = parse_language_def(doc).expect_err("unterminated");
+    fn body_requires_statement_item_subsection() {
+        let doc = mk("```template\nfn {name}() {{ {body} }}\n```");
         assert_eq!(
-            err,
-            LangDocError::UnterminatedBlock {
-                tag: "lang-function".to_string()
-            }
+            parse_language_def(&doc),
+            Err(LangDocError::MissingItemSlot {
+                collection: "body".to_string(),
+                item: "statement".to_string(),
+            })
         );
     }
 
     #[test]
-    fn rejects_unquoted_string_value() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = fn\nreturn_type_sep = \" -> \"\nemit_return_type = true\n```\n\n## Capabilities\n```lang-capabilities\ni32 identity i32\n```\n";
-        let err = parse_language_def(doc).expect_err("unquoted");
-        assert!(matches!(err, LangDocError::UnquotedString { .. }));
-    }
-
-    #[test]
-    fn rejects_invalid_bool() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\nreturn_type_sep = \" -> \"\nemit_return_type = yes\n```\n\n## Capabilities\n```lang-capabilities\ni32 identity i32\n```\n";
-        let err = parse_language_def(doc).expect_err("bad bool");
-        assert!(matches!(err, LangDocError::InvalidBool { .. }));
-    }
-
-    #[test]
-    fn rejects_unknown_primitive() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\nreturn_type_sep = \" -> \"\nemit_return_type = true\n```\n\n## Capabilities\n```lang-capabilities\nq99 identity q99\n```\n";
-        let err = parse_language_def(doc).expect_err("unknown primitive");
+    fn rejects_table_without_else() {
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
+            ```template\nfn {name}(){ret}\n```\n\n\
+            ### ret\n| When | Template |\n|------|----------|\n| ret is void | \"\" |\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
         assert_eq!(
-            err,
-            LangDocError::UnknownPrimitive {
-                name: "q99".to_string()
-            }
+            parse_language_def(doc),
+            Err(LangDocError::MissingElseRow {
+                table: "ret".to_string()
+            })
         );
     }
 
     #[test]
-    fn rejects_unknown_action() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\nreturn_type_sep = \" -> \"\nemit_return_type = true\n```\n\n## Capabilities\n```lang-capabilities\ni32 transmute i32\n```\n";
-        let err = parse_language_def(doc).expect_err("unknown action");
-        assert_eq!(
-            err,
-            LangDocError::UnknownAction {
-                action: "transmute".to_string()
-            }
-        );
+    fn rejects_unquoted_template_in_table() {
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
+            ```template\nfn {name}(){ret}\n```\n\n\
+            ### ret\n| When | Template |\n|------|----------|\n| else | bare |\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        assert!(matches!(
+            parse_language_def(doc),
+            Err(LangDocError::UnquotedTemplate { .. })
+        ));
     }
 
     #[test]
-    fn rejects_missing_capability_target() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\nreturn_type_sep = \" -> \"\nemit_return_type = true\n```\n\n## Capabilities\n```lang-capabilities\ni32 identity\n```\n";
-        let err = parse_language_def(doc).expect_err("missing target");
-        assert_eq!(
-            err,
-            LangDocError::MissingCapabilityTarget {
-                action: "identity".to_string(),
-                primitive: "i32".to_string(),
-            }
-        );
+    fn rejects_bad_predicate() {
+        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
+            ```template\nfn {name}(){ret}\n```\n\n\
+            ### ret\n| When | Template |\n|------|----------|\n| frobnicate | \"x\" |\n| else | \"y\" |\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        assert!(matches!(
+            parse_language_def(doc),
+            Err(LangDocError::BadPredicate { .. })
+        ));
     }
 
     #[test]
-    fn forbid_needs_no_target() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n```lang-function\nkeyword = \"fn\"\nreturn_type_sep = \" -> \"\nemit_return_type = true\n```\n\n## Capabilities\n```lang-capabilities\ni32 forbid\n```\n";
-        let def = parse_language_def(doc).expect("forbid parses");
-        assert_eq!(def.capability(Primitive::I32), Some(&Capability::Forbid));
-    }
-
-    // --- Markdown-table capability matrix (the locked format) ---
-
-    #[test]
-    fn table_parses_header_separator_and_rows() {
-        let table = "\
-| Primitive | Action   | Target | Notes |\n\
-|-----------|----------|--------|-------|\n\
-| i32       | identity | i32    | |\n";
-        let caps = parse_capability_table(table).expect("table parses");
-        assert_eq!(
-            caps.get(&Primitive::I32),
-            Some(&Capability::Identity("i32".to_string()))
-        );
-        // Header and separator rows must not produce entries.
-        assert_eq!(caps.len(), 1);
-    }
-
-    #[test]
-    fn table_parses_wrap_action_with_target() {
-        // `str` is not a known primitive in this slice, so use i32 to exercise
-        // the `wrap` action wiring itself.
+    fn capability_wrap_and_forbid() {
         let table = "| i32 | wrap | Boxed |\n";
-        let caps = parse_capability_table(table).expect("wrap parses");
+        let caps = parse_capability_table(table).expect("wrap");
         assert_eq!(
             caps.get(&Primitive::I32),
             Some(&Capability::Wrap("Boxed".to_string()))
         );
-    }
 
-    #[test]
-    fn table_forbid_row_omits_target() {
-        let table = "| i32 | forbid | |\n";
-        let caps = parse_capability_table(table).expect("forbid parses");
+        let forbid = "| i32 | forbid | |\n";
+        let caps = parse_capability_table(forbid).expect("forbid");
         assert_eq!(caps.get(&Primitive::I32), Some(&Capability::Forbid));
     }
 
     #[test]
-    fn table_notes_column_is_ignored() {
-        let table = "| i32 | identity | i32 | some human prose here |\n";
-        let caps = parse_capability_table(table).expect("parses with notes");
+    fn operator_table_parses_spell_and_forbid() {
+        let table = "| Operator | Action | Target |\n\
+            |----------|--------|--------|\n\
+            | pow  | spell  | .pow |\n\
+            | ushr | forbid |      |\n";
+        let ops = parse_operator_table(table).expect("operators");
         assert_eq!(
-            caps.get(&Primitive::I32),
-            Some(&Capability::Identity("i32".to_string()))
+            ops.get("pow"),
+            Some(&OperatorSpelling::Spell(".pow".to_string()))
+        );
+        assert_eq!(ops.get("ushr"), Some(&OperatorSpelling::Forbid));
+        // Operators absent from the table keep their canonical spelling.
+        assert_eq!(ops.get("add"), None);
+    }
+
+    #[test]
+    fn operator_table_rejects_unknown_operator() {
+        let table = "| matmul | spell | @ |\n";
+        assert!(matches!(
+            parse_operator_table(table),
+            Err(LangDocError::UnknownOperator { .. })
+        ));
+    }
+
+    #[test]
+    fn operator_table_rejects_unknown_action() {
+        let table = "| add | frobnicate | + |\n";
+        assert!(matches!(
+            parse_operator_table(table),
+            Err(LangDocError::UnknownOperatorAction { .. })
+        ));
+    }
+
+    #[test]
+    fn operator_table_spell_requires_target() {
+        let table = "| add | spell | |\n";
+        assert!(matches!(
+            parse_operator_table(table),
+            Err(LangDocError::MissingOperatorTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn optional_operators_section_is_parsed_into_def() {
+        // A full document WITH an `## Operators` section populates `operators`.
+        let doc = format!(
+            "{}\n## Operators\n\
+             | Operator | Action | Target |\n\
+             |----------|--------|--------|\n\
+             | ushr | forbid | |\n",
+            mk(FN_SECTION)
+        );
+        let def = parse_language_def(&doc).expect("parses with operators");
+        assert_eq!(def.operator("ushr"), Some(&OperatorSpelling::Forbid));
+        assert_eq!(def.operator("add"), None);
+    }
+
+    #[test]
+    fn absent_operators_section_yields_empty_map() {
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
+        assert!(def.operators.is_empty());
+    }
+
+    #[test]
+    fn item_sections_parse_into_items_map() {
+        use crate::ast::ItemKind;
+        // A document with a `## Struct` and a `## Use` section (siblings of
+        // `## Function`) parses each into its own ItemDef; absent item sections
+        // (Enum/TypeDef/Const here) simply do not appear in the map.
+        let doc = format!(
+            "{}\n\
+             ## Struct\n\n\
+             ```template\n{{name}} {{{{ {{fields}} }}}}\n```\n\n\
+             ### field\n\
+             | When  | Template |\n\
+             |-------|----------|\n\
+             | first | \"{{name}}: {{type}}\" |\n\
+             | else  | \", {{name}}: {{type}}\" |\n\n\
+             ## Use\n\n\
+             ```template\nuse {{path}};\n```\n",
+            mk(FN_SECTION)
+        );
+        let def = parse_language_def(&doc).expect("parses with item sections");
+        assert!(def.item_def(ItemKind::Struct).is_some());
+        assert!(def.item_def(ItemKind::Use).is_some());
+        // Item sections are optional: an omitted one is absent from the map.
+        assert!(def.item_def(ItemKind::Enum).is_none());
+        assert!(def.item_def(ItemKind::Const).is_none());
+        // The struct's `field` item slot lives in its own section's slots.
+        let struct_def = def.item_def(ItemKind::Struct).expect("struct def");
+        assert!(struct_def.slots.contains_key("field"));
+        // The shared `statement`/`param` helpers stay under `## Function`.
+        assert!(def.function.slots.contains_key("statement"));
+    }
+
+    #[test]
+    fn item_section_dangling_slot_is_a_load_error() {
+        // A `## Struct` entry references `{vis}` with no `### vis` subsection
+        // and `vis` is not engine-bound at struct scope -> load-time error.
+        let doc = format!(
+            "{}\n\
+             ## Struct\n\n\
+             ```template\n{{vis}}struct {{name}} {{{{ }}}}\n```\n",
+            mk(FN_SECTION)
+        );
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::UnknownSlotReference {
+                slot: "vis".to_string()
+            })
         );
     }
 
     #[test]
-    fn table_rejects_unknown_action() {
-        let table = "| i32 | transmute | i32 |\n";
-        let err = parse_capability_table(table).expect_err("unknown action");
-        assert_eq!(
-            err,
-            LangDocError::UnknownAction {
-                action: "transmute".to_string()
-            }
+    fn item_section_missing_field_item_slot_errors() {
+        // Referencing `{fields}` without a `### field` subsection is a
+        // load-time MissingItemSlot error (shape-driven, from slot_binding).
+        let doc = format!(
+            "{}\n\
+             ## Struct\n\n\
+             ```template\nstruct {{name}} {{{{ {{fields}} }}}}\n```\n",
+            mk(FN_SECTION)
         );
-    }
-
-    #[test]
-    fn table_rejects_missing_target_for_nonforbid() {
-        let table = "| i32 | identity | |\n";
-        let err = parse_capability_table(table).expect_err("missing target");
         assert_eq!(
-            err,
-            LangDocError::MissingCapabilityTarget {
-                action: "identity".to_string(),
-                primitive: "i32".to_string(),
-            }
+            parse_language_def(&doc),
+            Err(LangDocError::MissingItemSlot {
+                collection: "fields".to_string(),
+                item: "field".to_string(),
+            })
         );
-    }
-
-    #[test]
-    fn table_ignores_non_table_prose() {
-        let table = "\
-Some prose before the table.\n\
-\n\
-| i32 | identity | i32 |\n\
-\n\
-More prose after.\n";
-        let caps = parse_capability_table(table).expect("parses around prose");
-        assert_eq!(caps.len(), 1);
     }
 }

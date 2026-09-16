@@ -20,7 +20,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast::Primitive;
+use crate::ast::{ItemKind, Primitive};
+use crate::predicate::{Predicate, RenderContext};
+use crate::render::Template;
 
 /// How a target language realizes a given Lamina primitive.
 ///
@@ -66,20 +68,123 @@ impl Capability {
     }
 }
 
-/// Surface-syntax parameters for emitting a function in a target language.
+/// The outcome selected by a slot or a `When` row: render a template, or
+/// declare the construct forbidden in this target.
 ///
-/// Kept as data (not code) so that adding or tweaking a target does not require
-/// engine changes. This is minimal for the first slice and will grow.
+/// `Forbid` is a first-class, parse-time directive (the unquoted bareword
+/// `forbid` in a `.mdl`), not a magic string compared after rendering. A slot
+/// or row that resolves to `Forbid` makes emission fail with a
+/// forbidden-construct error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionSyntax {
-    /// Keyword introducing a function definition (e.g. `fn`, `function`).
-    pub keyword: String,
-    /// Rendered between the parameter list and the return type (e.g. `" -> "`
-    /// for Rust, `": "` for TypeScript).
-    pub return_type_sep: String,
-    /// Whether the return type annotation is emitted at all. Some targets
-    /// (dynamically typed) may omit it.
-    pub emit_return_type: bool,
+pub enum Outcome {
+    /// Render this template.
+    Render(Template),
+    /// The construct is not expressible in this target.
+    Forbid,
+}
+
+/// A `When` logic table: ordered predicate/outcome rows, evaluated top-to-bottom
+/// with first-match-wins (`else` is the catch-all).
+///
+/// This is the sole branching primitive in a language definition. A branching
+/// slot (`ret`, `vis`, `async`, …) is a `WhenTable`, selected against a
+/// [`RenderContext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenTable {
+    /// The rows, in evaluation order.
+    pub rows: Vec<WhenRow>,
+}
+
+/// One row of a [`WhenTable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenRow {
+    /// The predicate guarding this row.
+    pub predicate: Predicate,
+    /// The outcome selected when the predicate holds.
+    pub outcome: Outcome,
+}
+
+impl WhenTable {
+    /// Selects the first row whose predicate holds against `ctx`. Returns the
+    /// row's outcome, or `None` if no row matched (a well-formed table ends in
+    /// an `else` row, so `None` indicates a definition bug).
+    pub fn select(&self, ctx: &RenderContext) -> Option<&Outcome> {
+        self.rows
+            .iter()
+            .find(|row| ctx.eval(&row.predicate))
+            .map(|row| &row.outcome)
+    }
+}
+
+/// How a slot is resolved: a fixed outcome (no branching) or a `When` decision
+/// table (branching). This is the uniform slot form — a `### <slot>` subsection
+/// is one or the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotDef {
+    /// A single fixed outcome (a template, or `forbid`).
+    Fixed(Outcome),
+    /// A branching decision table.
+    Table(WhenTable),
+}
+
+/// How a target renders a function.
+///
+/// `entry` is the single top-level template (authored as one `template` block
+/// under `## Function`). Its `{slots}` — and any slots nested within slot
+/// templates — resolve to same-named entries in `slots`, one heading level
+/// deeper, unless they are engine-provided terminal slots (`name`, `params`,
+/// `body`, `ret_type`). Placement of modifiers/visibility is fully data-driven
+/// by where each slot appears in a template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDef {
+    /// The single entry template.
+    pub entry: Template,
+    /// Named slot definitions (each a fixed template or a decision table).
+    pub slots: HashMap<String, SlotDef>,
+}
+
+/// How a target renders a non-function top-level item (`struct`, `enum`,
+/// `typedef`, `const`, `use`).
+///
+/// Each such item kind gets its OWN `## <Item>` section in a language
+/// definition — a sibling of `## Function` — with its own entry template and
+/// `### <slot>` subsections. This mirrors [`FunctionDef`] exactly: `entry` is
+/// the section's single `template` block and `slots` are its `### <slot>`
+/// subsections.
+///
+/// Shared deep helpers (the `### expr` dispatch table used to render a
+/// `const`'s value, the compound-type `### pointer`/`### fnptr` slots used to
+/// render a field's type, …) live once under `## Function` and are reached by
+/// the shared expression/type resolvers; an item section only declares the
+/// slots unique to it (e.g. a struct's `### field` item slot, a `### vis`
+/// spelling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDef {
+    /// The single entry template for this item kind.
+    pub entry: Template,
+    /// Named slot definitions for this item kind (each a fixed template or a
+    /// decision table).
+    pub slots: HashMap<String, SlotDef>,
+}
+
+/// How a target realizes a kernel operator.
+///
+/// This is the MINIMAL viable operator-capability model (see the crate's spec
+/// escalation): by default an operator emits its canonical Lamina spelling, so
+/// a definition need only list the exceptions —
+/// - a [`OperatorSpelling::Spell`] overrides the emitted text (e.g. a target
+///   that spells floor-division as a function call), and
+/// - [`OperatorSpelling::Forbid`] marks the operator inexpressible, making its
+///   use a hard [`crate::error::EmitError::ForbiddenConstruct`].
+///
+/// A richer per-operator format (parenthesization / precedence, prefix vs infix
+/// placement, call-style lowering) is deliberately deferred and escalated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorSpelling {
+    /// Emit this exact text in place of the operator's canonical spelling.
+    Spell(String),
+    /// The operator is not expressible in this target; using it is an error.
+    Forbid,
 }
 
 /// A complete language definition for one target.
@@ -89,8 +194,19 @@ pub struct LanguageDef {
     pub name: String,
     /// The capability matrix: one entry per supported primitive.
     pub capabilities: HashMap<Primitive, Capability>,
-    /// Function surface-syntax parameters.
-    pub function_syntax: FunctionSyntax,
+    /// How this target renders a function.
+    pub function: FunctionDef,
+    /// How this target renders each non-function top-level item kind
+    /// (`struct`, `enum`, `typedef`, `const`, `use`), keyed by [`ItemKind`].
+    /// Each entry is parsed from that kind's own `## <Item>` section. Functions
+    /// are rendered via [`LanguageDef::function`] rather than this map.
+    pub items: HashMap<ItemKind, ItemDef>,
+    /// Per-operator spelling overrides and forbids, keyed by the operator's
+    /// stable machine name (see [`crate::ast::UnaryOp::name`] /
+    /// [`crate::ast::BinaryOp::name`]). An operator absent from this map emits
+    /// its canonical spelling — this is the common case, so most definitions
+    /// leave the map empty or list only their exceptions.
+    pub operators: HashMap<String, OperatorSpelling>,
 }
 
 impl LanguageDef {
@@ -100,5 +216,19 @@ impl LanguageDef {
     /// (treated as unsupported, same as [`Capability::Forbid`]).
     pub fn capability(&self, primitive: Primitive) -> Option<&Capability> {
         self.capabilities.get(&primitive)
+    }
+
+    /// Looks up any per-operator spelling override or forbid for the operator
+    /// with machine name `op_name`. Returns `None` when the target uses the
+    /// operator's canonical spelling (the default).
+    pub fn operator(&self, op_name: &str) -> Option<&OperatorSpelling> {
+        self.operators.get(op_name)
+    }
+
+    /// Looks up how this target renders the non-function item kind `kind`.
+    /// Returns `None` when the definition has no `## <Item>` section for that
+    /// kind (using such an item is then an emit-time error).
+    pub fn item_def(&self, kind: ItemKind) -> Option<&ItemDef> {
+        self.items.get(&kind)
     }
 }

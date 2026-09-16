@@ -52,9 +52,23 @@ A modifier is **semantic metadata first, emitted text second.** Some modifiers u
 
 Modifiers that apply only to a *method on a type* (static, override, virtual, abstract, final, mutating, class-vs-instance) are NOT kernel callable modifiers — methods and receivers are layer concepts, so those belong to an OOP layer, not the kernel.
 
+### Operators
+
+The kernel reserves a **finite, closed superset** of semantically-distinct primitive operators. Like primitives and callable modifiers, operators are gated per target: a language file may `forbid` an operator its target lacks, or map its spelling. Truly exotic or sugar operators (matrix-multiply `@`, ranges `..`/`...`, try `?`, optional-chaining `?.`, the comma operator) are **NOT kernel operators** — they are layer concerns built over the primitives below.
+
+**Unary:** `-` (negate), `!` (logical not), `~` (bitwise not), `+` (unary plus).
+
+**Binary:**
+- Arithmetic: `+` `-` `*` `/` `%` (remainder), `**` (power), `//` (floor-div).
+- Comparison: `==` `!=` `<` `<=` `>` `>=`.
+- Logical: `&&` `||`.
+- Bitwise: `&` `|` `^` `<<` `>>` `>>>` (unsigned/logical right shift).
+
+A target that lacks an operator (e.g. no `>>>`, no `**`) `forbid`s it or the language file maps it to a call/library form (which, if it is really a library function, is a layer concern rather than an operator mapping). Operator precedence and associativity are a *parsing* concern (the AST is already a tree); the emitter parenthesizes to preserve grouping.
+
 ### Capability Matrix
 
-Capability matrices apply to language primitives/types and to capability keywords (the callable modifiers above). Structural keywords are kernel syntax and are never gated — a language file does not get to forbid `switch` (it desugars). It may forbid primitives and capability keywords, and `null` follows `ptr`. Control-flow keywords may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block).
+Capability matrices apply to language primitives/types, to capability keywords (the callable modifiers above), and to operators (see *Operators*). Structural keywords are kernel syntax and are never gated — a language file does not get to forbid `switch` (it desugars). It may forbid primitives, capability keywords, and operators, and `null` follows `ptr`. Control-flow keywords may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block).
 
 Each kernel primitive maps to exactly one of five **actions**. The target type is required for every action except `forbid`. These five are the whole vocabulary — there is no `narrow` or `reinterpret`; a conversion that changes meaning is a cast written in Lamina, not something the matrix does on the way out.
 

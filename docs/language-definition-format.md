@@ -148,6 +148,45 @@ Any *other* unquoted text is an error (the strictness is otherwise preserved).
 `forbid` here is the same lowercase `forbid` used as a capability action, so the
 concept is spelled identically everywhere.
 
+### Block-Slot References in Cells
+
+A quoted Template cell is itself a template, so it may consist of nothing but a
+single slot reference — `"{slot}"` — which resolves like any other slot: to an
+engine terminal or to a same-named `### slot` subsection one heading level
+deeper. That referenced subsection may be a full multi-line ```` ```template ````
+block. So a `When` cell has three possible forms:
+
+- an **inline quoted template** (`"return {value};"`),
+- the bareword **`forbid`** directive, or
+- a **reference** `"{slot}"` to another slot — possibly a multi-line block.
+
+Because a cramped, `\n`-escaped multi-line cell and a reference to a clean
+multi-line block slot render to the *same* string, prefer the reference form for
+any branch whose output spans multiple lines. It keeps the `When` table a
+scannable decision matrix (one readable row per case) while the multi-line body
+lives in a named ```` ```template ```` block below, authored with real newlines
+instead of `\n` escapes. A cell placed at the start of its template introduces
+no indentation of its own, so the block renders byte-identically to the inline
+form it replaces. One-liner arms (`"break;"`, `"return;"`, a bare `"{value}"`)
+stay inline — the reference form earns its keep only for multi-line output.
+
+For example, a statement-dispatch `while` arm reads as a one-line row:
+
+```text
+### stmt
+| When         | Template |
+|--------------|----------|
+| stmt is while | "{while_stmt}" |
+| else          | forbid |
+
+### while_stmt
+​```template
+while {cond} {{
+    {body}
+}}
+​```
+```
+
 ## When Predicates
 
 The `When` column is a small, **closed** predicate language — not a scripting

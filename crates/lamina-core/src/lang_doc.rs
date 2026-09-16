@@ -456,13 +456,40 @@ fn build_table(name: &str, rows: &[String]) -> Result<WhenTable, LangDocError> {
 
 /// Parses a Template-column cell into an [`Outcome`].
 ///
-/// A cell is either a double-quoted string (→ a template to render) or the
-/// unquoted bareword `forbid` (→ [`Outcome::Forbid`]). Any other unquoted text
-/// is a [`LangDocError::UnquotedTemplate`] — the strictness is preserved; only
-/// the single `forbid` directive is allowed unquoted.
+/// A cell is one of:
+/// - the unquoted bareword `forbid` (→ [`Outcome::Forbid`]);
+/// - an unquoted section reference `@name` (→ render the `### name` section
+///   slot — equivalent to a template of just `{name}`, but quote-free since a
+///   bare reference has no significant whitespace to preserve);
+/// - a double-quoted string (→ a literal template to render).
+///
+/// Any other unquoted text is a [`LangDocError::UnquotedTemplate`]; only
+/// `forbid` and `@name` references are permitted unquoted.
 fn parse_outcome_cell(table: &str, cell: &str) -> Result<Outcome, LangDocError> {
     if cell == "forbid" {
         return Ok(Outcome::Forbid);
+    }
+    // A bare `@name` cell references the same-named `### name` section slot. It
+    // is exactly equivalent to a template of `{name}`, reusing the normal
+    // slot-resolution + load-time validation path.
+    if let Some(name) = cell.strip_prefix('@') {
+        let is_ident = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_ident {
+            let template = Template::parse(&format!("{{{name}}}")).map_err(|e| {
+                LangDocError::BadTemplate {
+                    table: table.to_string(),
+                    detail: e.to_string(),
+                }
+            })?;
+            return Ok(Outcome::Render(template));
+        }
+        return Err(LangDocError::UnquotedTemplate {
+            table: table.to_string(),
+            value: cell.to_string(),
+        });
     }
     let template_str = unquote_template(table, cell)?;
     let template = Template::parse(&template_str).map_err(|e| LangDocError::BadTemplate {
@@ -826,6 +853,30 @@ mod tests {
             }
             SlotDef::Fixed(_) => panic!("vis should be a table"),
         }
+    }
+
+    #[test]
+    fn bare_at_reference_cell_resolves_to_section_slot() {
+        // A table cell `@if_stmt` (no quotes) references the `### if_stmt`
+        // section, equivalent to a template of `{if_stmt}`. A dangling
+        // `@missing` would fail slot-graph validation, so a resolvable one must
+        // parse and a missing one must error.
+        let ok = mk("```template\n{vis}fn {name}() {{ {body} }}\n```\n\n\
+            ### vis\n```template\npub \n```\n\n\
+            ### statement\n| When | Template |\n|------|----------|\n| stmt is return | @ret_stmt |\n| else | forbid |\n\n\
+            ### ret_stmt\n```template\nreturn {value};\n```");
+        assert!(parse_language_def(&ok).is_ok(), "resolvable @ref should parse");
+
+        let dangling = mk("```template\n{vis}fn {name}() {{ {body} }}\n```\n\n\
+            ### vis\n```template\npub \n```\n\n\
+            ### statement\n| When | Template |\n|------|----------|\n| stmt is return | @missing_section |\n| else | forbid |");
+        assert!(
+            matches!(
+                parse_language_def(&dangling),
+                Err(LangDocError::UnknownSlotReference { .. })
+            ),
+            "dangling @ref must fail slot-graph validation"
+        );
     }
 
     #[test]

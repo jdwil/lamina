@@ -150,25 +150,35 @@ concept is spelled identically everywhere.
 
 ### Block-Slot References in Cells
 
-A quoted Template cell is itself a template, so it may consist of nothing but a
-single slot reference — `"{slot}"` — which resolves like any other slot: to an
-engine terminal or to a same-named `### slot` subsection one heading level
-deeper. That referenced subsection may be a full multi-line ```` ```template ````
-block. So a `When` cell has three possible forms:
+A `When`-table Template cell has three possible forms:
 
-- an **inline quoted template** (`"return {value};"`),
-- the bareword **`forbid`** directive, or
-- a **reference** `"{slot}"` to another slot — possibly a multi-line block.
+- an **inline quoted template** (`"return {value};"`) — double quotes make
+  significant whitespace explicit;
+- the bareword **`forbid`** directive; or
+- a bareword **section reference** `@name` — no quotes — which resolves to the
+  same-named `### name` subsection one heading level deeper. That subsection may
+  be a full multi-line ```` ```template ```` block.
+
+A reference is written `@name` (not `"{name}"`): because a bare reference is just
+a section name with no significant whitespace, it needs no quotes, and the `@`
+distinguishes "go render this author-defined section" from an inline literal.
+`@name` is exactly equivalent to a template of `{name}` — it reuses the same
+slot-resolution and load-time validation (a dangling `@missing` is a load-time
+error).
 
 Because a cramped, `\n`-escaped multi-line cell and a reference to a clean
-multi-line block slot render to the *same* string, prefer the reference form for
-any branch whose output spans multiple lines. It keeps the `When` table a
-scannable decision matrix (one readable row per case) while the multi-line body
+multi-line block slot render to the *same* string, prefer the `@name` reference
+form for any branch whose output spans multiple lines. It keeps the `When` table
+a scannable decision matrix (one readable row per case) while the multi-line body
 lives in a named ```` ```template ```` block below, authored with real newlines
-instead of `\n` escapes. A cell placed at the start of its template introduces
-no indentation of its own, so the block renders byte-identically to the inline
-form it replaces. One-liner arms (`"break;"`, `"return;"`, a bare `"{value}"`)
-stay inline — the reference form earns its keep only for multi-line output.
+instead of `\n` escapes. One-liner arms (`"break;"`, `"return;"`, a bare
+`"{value}"`) stay inline as quoted templates — the reference form earns its keep
+only for multi-line output.
+
+Note the distinction: `@name` references an **author-defined `###` section**;
+`{name}` inside a template references a slot value (an engine-bound AST value, or
+another slot). Only *cell-level* references use `@`; slots inside template bodies
+always use `{}`.
 
 For example, a statement-dispatch `while` arm reads as a one-line row:
 
@@ -176,7 +186,7 @@ For example, a statement-dispatch `while` arm reads as a one-line row:
 ### stmt
 | When         | Template |
 |--------------|----------|
-| stmt is while | "{while_stmt}" |
+| stmt is while | @while_stmt |
 | else          | forbid |
 
 ### while_stmt

@@ -22,6 +22,7 @@
 pub mod ast;
 pub mod emitter;
 pub mod error;
+pub mod index;
 pub mod lang;
 pub mod lang_doc;
 pub mod lexer;

@@ -393,12 +393,18 @@ mod tests {
     #[test]
     fn slot_names_listed() {
         let t = Template::parse("{export}fn {name}({params}){ret} {body}").expect("parse");
-        assert_eq!(t.slot_names(), vec!["export", "name", "params", "ret", "body"]);
+        assert_eq!(
+            t.slot_names(),
+            vec!["export", "name", "params", "ret", "body"]
+        );
     }
 
     #[test]
     fn rejects_unclosed_slot() {
-        assert_eq!(Template::parse("fn {name"), Err(TemplateError::UnclosedSlot));
+        assert_eq!(
+            Template::parse("fn {name"),
+            Err(TemplateError::UnclosedSlot)
+        );
     }
 
     #[test]

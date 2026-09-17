@@ -164,6 +164,12 @@ mod tests {
     #[test]
     fn rejects_unexpected_char() {
         let err = lex("fn a() -> i32 { return @; }").expect_err("should reject @");
-        assert_eq!(err, ParseError::UnexpectedChar { ch: '@', offset: 23 });
+        assert_eq!(
+            err,
+            ParseError::UnexpectedChar {
+                ch: '@',
+                offset: 23
+            }
+        );
     }
 }

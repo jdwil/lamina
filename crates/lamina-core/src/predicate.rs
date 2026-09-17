@@ -56,21 +56,34 @@ pub enum PredExpr {
     Or(Box<PredExpr>, Box<PredExpr>),
 }
 
-/// A single fact: a boolean flag, an enum query (`key is value`), or a
-/// one-level structural-equality query (`key eq other`).
+/// A single fact: a boolean flag, an enum query (`key is value`), a
+/// one-level structural-equality query (`key eq other`), or the metadata
+/// membership query `has_meta(<key>)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
-    /// The fact key (e.g. `export`, `ret`, `vis`, `caller`, or a one-level
-    /// sub-part path like `value` / `value.op` / `target`).
+    /// The fact key (e.g. `export`, `ret`, `vis`, `caller`, a one-level
+    /// sub-part path like `value` / `value.op` / `target`, or a `meta.<key>`
+    /// metadata path).
     pub key: String,
     /// For an enum query (`key is value`), the value being tested (e.g. `void`
     /// in `ret is void`, `binary` in `value is binary`, `add` in `value.op is
-    /// add`). `None` for a boolean flag or an equality query.
+    /// add`, `anon_fn` in `meta.origin is anon_fn`). `None` for a boolean flag
+    /// or an equality query.
     pub value: Option<String>,
     /// For a one-level structural-equality query (`key eq other`), the
     /// right-hand sub-part path being compared (e.g. `value.lhs` in `target eq
     /// value.lhs`). `None` for a boolean flag or an enum query.
     pub eq: Option<String>,
+    /// For the metadata membership query `has_meta(<key>)`, the metadata key
+    /// whose presence is tested. `Some` only for the `has_meta` form; `None`
+    /// otherwise. When set, `value`/`eq` are `None` and `key` is the literal
+    /// `has_meta`.
+    pub meta_key: Option<String>,
+    /// For a predicate-side render-helper call with an argument
+    /// (`fnptr_ref_count(<arg>) is <n>`, `type_of(<arg>) is <type>`,
+    /// `resolve(<arg>) is <kind>`), the argument sub-slot name. `key` holds the
+    /// helper name and `value` the tested result. `None` for non-call facts.
+    pub call_arg: Option<String>,
 }
 
 /// The set of facts the engine can answer about the thing being rendered.
@@ -153,6 +166,30 @@ pub struct RenderContext {
     /// `PartialEq` on `Expr`. `false` when either sub-part is absent or `value`
     /// is not a binary.
     pub target_eq_value_lhs: bool,
+    /// The current node's engine-transparent metadata (Part 1), answering the
+    /// `has_meta(<key>)` and `meta.<key> is <value>` facts.
+    ///
+    /// The engine is *transparent* to metadata: it defines no keys and has no
+    /// opinion about any key's meaning. Keys are an open contract between a
+    /// layer and a language definition. This field simply carries the node's
+    /// [`Meta`](crate::ast::Meta) so those two facts can be answered; it is
+    /// empty for a node a layer never tagged, so it never perturbs existing
+    /// output.
+    pub meta: crate::ast::Meta,
+    /// Pre-computed answers for the predicate-side render helpers (Part 2),
+    /// keyed by `(helper, argument)`. The engine computes these once (using the
+    /// per-unit index) when building a node's context, so predicate evaluation
+    /// stays pure and node-free. Present only for the argument sub-slots the
+    /// current node exposes.
+    ///
+    /// Answered facts:
+    /// - `fnptr_ref_count(<arg>) is <n>` — key `("fnptr_ref_count", <arg>)`,
+    ///   value the decimal count.
+    /// - `type_of(<arg>) is <type>` — key `("type_of", <arg>)`, value the
+    ///   resolved type name.
+    /// - `resolve(<arg>) is <kind>` — key `("resolve", <arg>)`, value the
+    ///   resolved item-kind spelling.
+    pub helper_facts: std::collections::BTreeMap<(String, String), String>,
 }
 
 /// The return-shape a node has, for `ret is ...` queries.
@@ -389,36 +426,60 @@ impl RenderContext {
             // Expression dispatch: `expr is <kind>`. The value must be a known
             // kind spelling and match the expression currently being rendered.
             ("expr", Some(kind)) => {
-                self.expr.map(|k| k.as_str() == kind).unwrap_or(false)
-                    && expr_kind_is_known(kind)
+                self.expr.map(|k| k.as_str() == kind).unwrap_or(false) && expr_kind_is_known(kind)
             }
             // Statement dispatch: `stmt is <kind>`. The value must be a known
             // kind spelling and match the statement currently being rendered.
             ("stmt", Some(kind)) => {
-                self.stmt.map(|k| k.as_str() == kind).unwrap_or(false)
-                    && stmt_kind_is_known(kind)
+                self.stmt.map(|k| k.as_str() == kind).unwrap_or(false) && stmt_kind_is_known(kind)
             }
             // Item dispatch: `item is <kind>`. The value must be a known kind
             // spelling and match the item currently being rendered.
             ("item", Some(kind)) => {
-                self.item.map(|k| k.as_str() == kind).unwrap_or(false)
-                    && item_kind_is_known(kind)
+                self.item.map(|k| k.as_str() == kind).unwrap_or(false) && item_kind_is_known(kind)
             }
             // One-level structural sub-part kind query: `value is <kind>` — the
             // dispatch kind of the current node's direct `value` sub-part.
             ("value", Some(kind)) if fact.eq.is_none() => {
-                self.sub_value_kind.map(|k| k.as_str() == kind).unwrap_or(false)
+                self.sub_value_kind
+                    .map(|k| k.as_str() == kind)
+                    .unwrap_or(false)
                     && expr_kind_is_known(kind)
             }
             // One-level structural sub-part operator query: `value.op is <op>` —
             // the binary operator (machine name) of the current node's `value`
             // sub-part, when it is a binary.
-            ("value.op", Some(op)) => {
-                self.sub_value_op.as_deref() == Some(op)
-            }
+            ("value.op", Some(op)) => self.sub_value_op.as_deref() == Some(op),
             // One-level structural equality: `target eq value.lhs`.
-            ("target", None) if fact.eq.as_deref() == Some("value.lhs") => {
-                self.target_eq_value_lhs
+            ("target", None) if fact.eq.as_deref() == Some("value.lhs") => self.target_eq_value_lhs,
+            // Metadata membership: `has_meta(<key>)` — true if the current node
+            // carries metadata key `<key>`. The key is open (a layer/def
+            // contract); the engine only checks presence.
+            ("has_meta", None) => match &fact.meta_key {
+                Some(key) => self.meta.has(key),
+                None => false,
+            },
+            // Metadata value query: `meta.<key> is <value>` — true if the
+            // current node's metadata `<key>` equals `<value>`. Keys and values
+            // are open; the engine only compares.
+            (key, Some(want)) if key.starts_with("meta.") && fact.eq.is_none() => {
+                let meta_key = &key["meta.".len()..];
+                self.meta.get(meta_key) == Some(want)
+            }
+            // Predicate-side render-helper calls with an argument (Part 2):
+            // `fnptr_ref_count(<arg>) is <n>`, `type_of(<arg>) is <type>`,
+            // `resolve(<arg>) is <kind>`. The engine pre-computed the answer for
+            // this node/argument into `helper_facts`; a matching stored value
+            // makes the fact hold.
+            (helper, Some(want))
+                if fact.call_arg.is_some()
+                    && matches!(helper, "fnptr_ref_count" | "type_of" | "resolve") =>
+            {
+                let arg = fact.call_arg.clone().unwrap_or_default();
+                self.helper_facts
+                    .get(&(helper.to_string(), arg))
+                    .map(|v| v == want)
+                    .unwrap_or(false)
             }
             _ => false,
         }
@@ -431,7 +492,8 @@ impl RenderContext {
 fn expr_kind_is_known(kind: &str) -> bool {
     matches!(
         kind,
-        "int" | "float"
+        "int"
+            | "float"
             | "bool"
             | "string"
             | "char"
@@ -518,11 +580,14 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("caller", Some("sync"))
     );
     // `expr is <kind>` is validated against the closed kind vocabulary.
-    let known = known || matches!((fact.key.as_str(), fact.value.as_deref()), ("expr", Some(k)) if expr_kind_is_known(k));
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("expr", Some(k)) if expr_kind_is_known(k));
     // `stmt is <kind>` is validated against the closed statement vocabulary.
-    let known = known || matches!((fact.key.as_str(), fact.value.as_deref()), ("stmt", Some(k)) if stmt_kind_is_known(k));
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("stmt", Some(k)) if stmt_kind_is_known(k));
     // `item is <kind>` is validated against the closed item vocabulary.
-    let known = known || matches!((fact.key.as_str(), fact.value.as_deref()), ("item", Some(k)) if item_kind_is_known(k));
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("item", Some(k)) if item_kind_is_known(k));
     // `value is <kind>` — one-level sub-part kind query — is validated against
     // the closed expression-kind vocabulary (and must not be an `eq` query).
     let known = known
@@ -535,7 +600,37 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // `target eq value.lhs` — the one closed one-level structural-equality
     // query. Only this exact pairing is answerable.
     let known = known
-        || (fact.key == "target" && fact.value.is_none() && fact.eq.as_deref() == Some("value.lhs"));
+        || (fact.key == "target"
+            && fact.value.is_none()
+            && fact.eq.as_deref() == Some("value.lhs"));
+    // `has_meta(<key>)` — metadata membership. The MECHANISM is closed (only
+    // `has_meta`), the KEY is open (any non-empty identifier a layer and a def
+    // agreed on). The engine validates the shape, never the key's meaning.
+    let known = known
+        || (fact.key == "has_meta"
+            && fact.value.is_none()
+            && fact.eq.is_none()
+            && fact.meta_key.as_deref().is_some_and(|k| !k.is_empty()));
+    // `meta.<key> is <value>` — metadata value query. The MECHANISM is closed
+    // (a `meta.` prefix with an `is`), the KEY and VALUE are open. Reject a
+    // bare `meta.` with no key.
+    let known = known
+        || (fact.key.starts_with("meta.")
+            && fact.key.len() > "meta.".len()
+            && fact.value.is_some()
+            && fact.eq.is_none()
+            && fact.meta_key.is_none());
+    // Predicate-side render-helper calls: `fnptr_ref_count(<arg>) is <n>`,
+    // `type_of(<arg>) is <type>`, `resolve(<arg>) is <kind>`. The helper SET is
+    // closed (only these three names); the argument and tested value are open
+    // (the argument is a sub-slot name, the value a count/type/kind the engine
+    // resolves at build time).
+    let known = known
+        || (matches!(fact.key.as_str(), "fnptr_ref_count" | "type_of" | "resolve")
+            && fact.call_arg.as_deref().is_some_and(|a| !a.is_empty())
+            && fact.value.is_some()
+            && fact.eq.is_none()
+            && fact.meta_key.is_none());
     if known {
         Ok(())
     } else {
@@ -613,6 +708,16 @@ fn lex_predicate(src: &str) -> Result<Vec<PTok>, PredicateError> {
             '|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
                 tokens.push(PTok::Or);
                 i += 2;
+            }
+            // A bare number is a value token (an `Ident`) — used as the RHS of a
+            // count fact like `fnptr_ref_count(x) is 1`. Digits never start a
+            // fact key, so treating a numeric run as an ident is unambiguous.
+            _ if c.is_ascii_digit() => {
+                let start = i;
+                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                    i += 1;
+                }
+                tokens.push(PTok::Ident(src[start..i].to_string()));
             }
             _ if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
@@ -710,6 +815,71 @@ impl PredParser {
             }
             Some(PTok::Ident(key)) => {
                 self.pos += 1;
+                // Call-form facts: an identifier immediately followed by
+                // `(<ident>)`. `has_meta(<key>)` is a bare boolean membership
+                // fact; the predicate-side render helpers `fnptr_ref_count`,
+                // `type_of`, and `resolve` take an argument AND a trailing
+                // `is <value>`. The helper set is closed; the argument is open.
+                if self.peek() == Some(&PTok::LParen) {
+                    self.pos += 1;
+                    let arg = match self.peek().cloned() {
+                        Some(PTok::Ident(k)) => {
+                            self.pos += 1;
+                            k
+                        }
+                        _ => {
+                            return Err(PredicateError::Syntax {
+                                detail: format!("expected an argument inside `{key}(...)`"),
+                            })
+                        }
+                    };
+                    if self.peek() != Some(&PTok::RParen) {
+                        return Err(PredicateError::Syntax {
+                            detail: format!("expected `)` to close `{key}(...)`"),
+                        });
+                    }
+                    self.pos += 1;
+                    // `has_meta(<key>)` is a boolean membership fact (no `is`).
+                    if key == "has_meta" {
+                        let fact = Fact {
+                            key,
+                            value: None,
+                            eq: None,
+                            meta_key: Some(arg),
+                            call_arg: None,
+                        };
+                        validate_fact(&fact)?;
+                        return Ok(PredExpr::Fact(fact));
+                    }
+                    // Otherwise it is a predicate helper call requiring
+                    // `is <value>`.
+                    if self.peek() != Some(&PTok::Is) {
+                        return Err(PredicateError::Syntax {
+                            detail: format!("expected `is <value>` after `{key}(...)`"),
+                        });
+                    }
+                    self.pos += 1;
+                    let value = match self.peek().cloned() {
+                        Some(PTok::Ident(v)) => {
+                            self.pos += 1;
+                            v
+                        }
+                        _ => {
+                            return Err(PredicateError::Syntax {
+                                detail: format!("expected a value after `{key}(...) is`"),
+                            })
+                        }
+                    };
+                    let fact = Fact {
+                        key,
+                        value: Some(value),
+                        eq: None,
+                        meta_key: None,
+                        call_arg: Some(arg),
+                    };
+                    validate_fact(&fact)?;
+                    return Ok(PredExpr::Fact(fact));
+                }
                 // Optional relation: `is IDENT` (enum/kind query) or `eq PATH`
                 // (one-level structural equality). At most one applies.
                 let (value, eq) = match self.peek() {
@@ -743,7 +913,13 @@ impl PredParser {
                     }
                     _ => (None, None),
                 };
-                let fact = Fact { key, value, eq };
+                let fact = Fact {
+                    key,
+                    value,
+                    eq,
+                    meta_key: None,
+                    call_arg: None,
+                };
                 validate_fact(&fact)?;
                 Ok(PredExpr::Fact(fact))
             }
@@ -1133,5 +1309,106 @@ mod tests {
             parse_predicate("value.lhs.rhs is int"),
             Err(PredicateError::Syntax { .. })
         ));
+    }
+
+    // ---- Metadata facts (Part 1) ---------------------------------------
+
+    #[test]
+    fn has_meta_fact_parses_and_evaluates() {
+        let p = parse_predicate("has_meta(origin)").expect("parse");
+        let with = RenderContext {
+            meta: crate::ast::Meta::new().with("origin", "anon_fn"),
+            ..Default::default()
+        };
+        assert!(with.eval(&p));
+        // Absent key -> false; empty metadata -> false.
+        let other = RenderContext {
+            meta: crate::ast::Meta::new().with("unrelated", "x"),
+            ..Default::default()
+        };
+        assert!(!other.eval(&p));
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn meta_value_fact_parses_and_evaluates() {
+        let p = parse_predicate("meta.origin is anon_class").expect("parse");
+        let matching = RenderContext {
+            meta: crate::ast::Meta::new().with("origin", "anon_class"),
+            ..Default::default()
+        };
+        assert!(matching.eval(&p));
+        // Different value -> false.
+        let different = RenderContext {
+            meta: crate::ast::Meta::new().with("origin", "anon_fn"),
+            ..Default::default()
+        };
+        assert!(!different.eval(&p));
+        // Absent key -> false.
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn metadata_facts_keys_and_values_are_open() {
+        // The MECHANISM is closed (only `has_meta` / `meta.<k> is`), but keys
+        // and values are open — any identifier parses and validates.
+        for src in [
+            "has_meta(whatever_key)",
+            "meta.some_key is some_value",
+            "has_meta(x) && meta.y is z",
+        ] {
+            parse_predicate(src).unwrap_or_else(|e| panic!("`{src}` should parse: {e:?}"));
+        }
+        // A bare `meta.` with no key, or `has_meta` with no parens, is rejected.
+        assert!(parse_predicate("meta. is x").is_err());
+        assert!(parse_predicate("has_meta").is_err());
+    }
+
+    // ---- Predicate helper facts (Part 2) --------------------------------
+
+    #[test]
+    fn helper_facts_parse_and_evaluate_via_precomputed_map() {
+        // `fnptr_ref_count(value) is 1`, `type_of(self) is Widget`,
+        // `resolve(value) is function` all read the engine-precomputed
+        // `helper_facts` map keyed by (helper, arg).
+        let mut facts = std::collections::BTreeMap::new();
+        facts.insert(("fnptr_ref_count".to_string(), "value".to_string()), "1".to_string());
+        facts.insert(("type_of".to_string(), "self".to_string()), "Widget".to_string());
+        facts.insert(("resolve".to_string(), "value".to_string()), "function".to_string());
+        let c = RenderContext {
+            helper_facts: facts,
+            ..Default::default()
+        };
+        assert!(c.eval(&parse_predicate("fnptr_ref_count(value) is 1").expect("parse")));
+        assert!(c.eval(&parse_predicate("type_of(self) is Widget").expect("parse")));
+        assert!(c.eval(&parse_predicate("resolve(value) is function").expect("parse")));
+        // A count that doesn't match, and an unset helper/arg, are false.
+        assert!(!c.eval(&parse_predicate("fnptr_ref_count(value) is 2").expect("parse")));
+        assert!(!c.eval(&parse_predicate("resolve(other) is function").expect("parse")));
+        assert!(!ctx().eval(&parse_predicate("type_of(self) is Widget").expect("parse")));
+    }
+
+    #[test]
+    fn helper_facts_compose_with_boolean_operators() {
+        let mut facts = std::collections::BTreeMap::new();
+        facts.insert(("resolve".to_string(), "value".to_string()), "function".to_string());
+        facts.insert(("fnptr_ref_count".to_string(), "value".to_string()), "1".to_string());
+        let c = RenderContext {
+            helper_facts: facts,
+            ..Default::default()
+        };
+        // The canonical single-use-inline guard composes two helper facts.
+        let p = parse_predicate("resolve(value) is function && fnptr_ref_count(value) is 1")
+            .expect("parse");
+        assert!(c.eval(&p));
+    }
+
+    #[test]
+    fn helper_facts_require_argument_and_value() {
+        // A helper name without an argument, or without `is <value>`, is a
+        // syntax error (helpers are fixed-arity, not bare flags).
+        assert!(parse_predicate("fnptr_ref_count").is_err());
+        assert!(parse_predicate("resolve(value)").is_err());
+        assert!(parse_predicate("type_of() is x").is_err());
     }
 }

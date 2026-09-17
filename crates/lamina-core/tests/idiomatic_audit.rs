@@ -61,6 +61,7 @@ fn func_with_body(body: Vec<Statement>) -> Item {
         params: vec![],
         return_type: Type::Primitive(Primitive::I32),
         body,
+        meta: lamina_core::ast::Meta::new(),
     })
 }
 
@@ -77,6 +78,7 @@ fn func_returning(ret: Type) -> Item {
         params: vec![],
         return_type: ret,
         body: vec![Statement::Return(Some(int("0")))],
+        meta: lamina_core::ast::Meta::new(),
     })
 }
 
@@ -124,7 +126,10 @@ fn rust_pointer_type_renders() {
         func_returning(Type::Pointer(Box::new(Type::Primitive(Primitive::I32)))),
         &rust(),
     );
-    assert_eq!(out, "fn f() -> *const i32 {\n    return 0;\n}", "got: {out}");
+    assert_eq!(
+        out, "fn f() -> *const i32 {\n    return 0;\n}",
+        "got: {out}"
+    );
 }
 
 #[test]
@@ -132,8 +137,7 @@ fn rust_nested_pointer_type_renders() {
     let inner = Type::Pointer(Box::new(Type::Primitive(Primitive::U8)));
     let out = emit_one(func_returning(Type::Pointer(Box::new(inner))), &rust());
     assert_eq!(
-        out,
-        "fn f() -> *const *const u8 {\n    return 0;\n}",
+        out, "fn f() -> *const *const u8 {\n    return 0;\n}",
         "got: {out}"
     );
 }
@@ -149,8 +153,7 @@ fn rust_fnptr_type_renders() {
     };
     let out = emit_one(func_returning(ty), &rust());
     assert_eq!(
-        out,
-        "fn f() -> fn(i32, bool) -> i64 {\n    return 0;\n}",
+        out, "fn f() -> fn(i32, bool) -> i64 {\n    return 0;\n}",
         "got: {out}"
     );
 }
@@ -163,8 +166,7 @@ fn rust_fnptr_type_no_params_renders() {
     };
     let out = emit_one(func_returning(ty), &rust());
     assert_eq!(
-        out,
-        "fn f() -> fn() -> () {\n    return 0;\n}",
+        out, "fn f() -> fn() -> () {\n    return 0;\n}",
         "got: {out}"
     );
 }
@@ -239,7 +241,10 @@ fn let_bare() {
         ty: None,
         value: None,
     };
-    assert_eq!(stmt_text(s.clone(), &rust()), "fn f() -> i32 {\n    let x;\n}");
+    assert_eq!(
+        stmt_text(s.clone(), &rust()),
+        "fn f() -> i32 {\n    let x;\n}"
+    );
     assert_eq!(stmt_text(s, &ts()), "function f(): number {\n    let x;\n}");
 }
 
@@ -345,7 +350,11 @@ fn counted_for_ts_is_c_style_without_trailing_semicolon() {
             value: Some(int("0")),
         })),
         cond: Some(bin(BinaryOp::Lt, r("i"), int("10"))),
-        step: Some(Box::new(Statement::Expr(bin(BinaryOp::Add, r("i"), int("1"))))),
+        step: Some(Box::new(Statement::Expr(bin(
+            BinaryOp::Add,
+            r("i"),
+            int("1"),
+        )))),
         body: vec![Statement::Continue],
     };
     let out = stmt_text(s, &ts());
@@ -402,8 +411,7 @@ fn counted_for_rust_no_cond_is_loop() {
     };
     let out = stmt_text(s, &rust());
     assert_eq!(
-        out,
-        "fn f() -> i32 {\n    {\n        loop {\n            break;\n        }\n    }\n}",
+        out, "fn f() -> i32 {\n    {\n        loop {\n            break;\n        }\n    }\n}",
         "got: {out}"
     );
 }
@@ -436,10 +444,12 @@ fn switch_with_default() {
             SwitchCase {
                 value: int("1"),
                 body: vec![Statement::Return(Some(int("10")))],
+                meta: lamina_core::ast::Meta::new(),
             },
             SwitchCase {
                 value: int("2"),
                 body: vec![Statement::Return(Some(int("20")))],
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
         default: Some(vec![Statement::Return(Some(int("0")))]),
@@ -478,6 +488,7 @@ fn switch_without_default() {
         cases: vec![SwitchCase {
             value: int("1"),
             body: vec![Statement::Break],
+            meta: lamina_core::ast::Meta::new(),
         }],
         default: None,
     };
@@ -526,16 +537,16 @@ fn literals_render_idiomatically() {
         (Expr::IntLiteral("7".to_string()), "7", "7"),
         (Expr::FloatLiteral("1.5".to_string()), "1.5", "1.5"),
         (Expr::BoolLiteral(true), "true", "true"),
-        (
-            Expr::StringLiteral("hi".to_string()),
-            "\"hi\"",
-            "\"hi\"",
-        ),
+        (Expr::StringLiteral("hi".to_string()), "\"hi\"", "\"hi\""),
         (Expr::CharLiteral("c".to_string()), "'c'", "\"c\""),
     ];
     for (expr, rust_lit, ts_lit) in cases {
         let rust_out = emit_body(vec![Statement::Return(Some(expr.clone()))], &rust());
-        assert_eq!(rust_out, format!("fn f() -> i32 {{\n    return {rust_lit};\n}}"), "rust: {expr:?}");
+        assert_eq!(
+            rust_out,
+            format!("fn f() -> i32 {{\n    return {rust_lit};\n}}"),
+            "rust: {expr:?}"
+        );
         let ts_out = emit_body(vec![Statement::Return(Some(expr.clone()))], &ts());
         assert_eq!(
             ts_out,
@@ -550,13 +561,12 @@ fn null_literal_rust_only() {
     // Rust spells kernel null as a null raw pointer; TS forbids ptr so null is
     // forbidden too (null follows ptr).
     let rust_out = emit_body(vec![Statement::Return(Some(Expr::NullLiteral))], &rust());
-    assert_eq!(
-        rust_out,
-        "fn f() -> i32 {\n    return std::ptr::null();\n}"
-    );
+    assert_eq!(rust_out, "fn f() -> i32 {\n    return std::ptr::null();\n}");
     let err = emit(
         &File {
-            items: vec![func_with_body(vec![Statement::Return(Some(Expr::NullLiteral))])],
+            items: vec![func_with_body(vec![Statement::Return(Some(
+                Expr::NullLiteral,
+            ))])],
         },
         &ts(),
     )
@@ -635,7 +645,10 @@ fn all_unary_operators() {
             operand: Box::new(r("a")),
         };
         // Rust: forbidden operator error.
-        let err = emit_err(func_with_body(vec![Statement::Return(Some(e.clone()))]), &rust());
+        let err = emit_err(
+            func_with_body(vec![Statement::Return(Some(e.clone()))]),
+            &rust(),
+        );
         assert!(
             matches!(err, lamina_core::EmitError::ForbiddenOperator { .. }),
             "rust {op:?} should be ForbiddenOperator, got {err:?}"
@@ -679,7 +692,11 @@ fn all_binary_operators_rust() {
     for (op, expected) in ops {
         let e = bin(op, r("a"), r("b"));
         let out = emit_body(vec![Statement::Return(Some(e))], &rust());
-        assert_eq!(out, format!("fn f() -> i32 {{\n    return {expected};\n}}"), "rust {op:?}");
+        assert_eq!(
+            out,
+            format!("fn f() -> i32 {{\n    return {expected};\n}}"),
+            "rust {op:?}"
+        );
     }
 }
 
@@ -719,7 +736,11 @@ fn ts_binary_operators_and_forbidden_floordiv() {
     for (op, expected) in ok {
         let e = bin(op, r("a"), r("b"));
         let out = emit_body(vec![Statement::Return(Some(e))], &ts());
-        assert_eq!(out, format!("function f(): number {{\n    return {expected};\n}}"), "ts {op:?}");
+        assert_eq!(
+            out,
+            format!("function f(): number {{\n    return {expected};\n}}"),
+            "ts {op:?}"
+        );
     }
     let floordiv = bin(BinaryOp::FloorDiv, r("a"), r("b"));
     let err = emit(
@@ -771,14 +792,17 @@ fn function_with_params_modifiers_visibility() {
             lamina_core::ast::Param {
                 name: "a".to_string(),
                 ty: Type::Primitive(Primitive::I32),
+                meta: lamina_core::ast::Meta::new(),
             },
             lamina_core::ast::Param {
                 name: "b".to_string(),
                 ty: Type::Primitive(Primitive::I32),
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
         return_type: Type::Primitive(Primitive::I32),
         body: vec![Statement::Return(Some(bin(BinaryOp::Add, r("a"), r("b"))))],
+        meta: lamina_core::ast::Meta::new(),
     });
     // Rust: `pub async const fn add(a: i32, b: i32) -> i32`.
     assert_eq!(
@@ -802,6 +826,7 @@ fn void_and_never_returns() {
         params: vec![],
         return_type: Type::Primitive(Primitive::Void),
         body: vec![Statement::Return(None)],
+        meta: lamina_core::ast::Meta::new(),
     });
     assert_eq!(
         emit_one(void_fn.clone(), &rust()),
@@ -818,6 +843,7 @@ fn void_and_never_returns() {
         params: vec![],
         return_type: Type::Primitive(Primitive::Never),
         body: vec![Statement::Return(None)],
+        meta: lamina_core::ast::Meta::new(),
     });
     assert_eq!(
         emit_one(never_fn.clone(), &rust()),
@@ -840,13 +866,16 @@ fn struct_item() {
                 name: "x".to_string(),
                 ty: Type::Primitive(Primitive::I32),
                 visibility: Visibility::Public,
+                meta: lamina_core::ast::Meta::new(),
             },
             Field {
                 name: "y".to_string(),
                 ty: Type::Primitive(Primitive::I32),
                 visibility: Visibility::Private,
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(
         emit_one(item.clone(), &rust()),
@@ -866,11 +895,14 @@ fn enum_item() {
         variants: vec![
             Variant {
                 name: "Red".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Green".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(
         emit_one(item.clone(), &rust()),
@@ -887,6 +919,7 @@ fn typedef_const_use_items() {
     let td = Item::TypeDef {
         name: "Id".to_string(),
         target: Type::Primitive(Primitive::I32),
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_one(td.clone(), &rust()), "type Id = i32;");
     assert_eq!(emit_one(td, &ts()), "type Id = number;");
@@ -896,6 +929,7 @@ fn typedef_const_use_items() {
         ty: Type::Primitive(Primitive::I32),
         value: int("100"),
         visibility: Visibility::Public,
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_one(c.clone(), &rust()), "pub const MAX: i32 = 100;");
     assert_eq!(emit_one(c, &ts()), "export const MAX: number = 100;");
@@ -903,7 +937,8 @@ fn typedef_const_use_items() {
     assert_eq!(
         emit_one(
             Item::Use {
-                path: "std::io".to_string()
+                path: "std::io".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
             &rust()
         ),
@@ -912,7 +947,8 @@ fn typedef_const_use_items() {
     assert_eq!(
         emit_one(
             Item::Use {
-                path: "\"fs\"".to_string()
+                path: "\"fs\"".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
             &ts()
         ),
@@ -929,16 +965,24 @@ fn mixed_file_renders_in_order_both_targets() {
     let items = vec![
         Item::Use {
             path: "std::io".to_string(),
+            meta: lamina_core::ast::Meta::new(),
         },
         Item::Const {
             name: "N".to_string(),
             ty: Type::Primitive(Primitive::I32),
             value: int("3"),
             visibility: Visibility::Private,
+            meta: lamina_core::ast::Meta::new(),
         },
         func_with_body(vec![Statement::Return(Some(int("1")))]),
     ];
-    let rust_out = emit(&File { items: items.clone() }, &rust()).expect("rust emit");
+    let rust_out = emit(
+        &File {
+            items: items.clone(),
+        },
+        &rust(),
+    )
+    .expect("rust emit");
     assert_eq!(
         rust_out,
         "use std::io;\n\nconst N: i32 = 3;\n\nfn f() -> i32 {\n    return 1;\n}"

@@ -6,6 +6,97 @@
 //! and *target-agnostic* — it carries no knowledge of any target language. All
 //! target-specific decisions live in a [`crate::lang`] language definition.
 
+/// An open, engine-transparent key/value channel a layer attaches to a
+/// construct to communicate *intent* to a language definition.
+///
+/// # The engine is transparent to metadata
+///
+/// The engine defines **no** keys, validates nothing, standardizes nothing, and
+/// has no opinion about any key's meaning. There is **no** blessed metadata
+/// vocabulary — keys are entirely open and are a contract between a *layer* and
+/// a *language definition*, documented by their authors, never by the engine.
+/// The engine only carries metadata through the IR, exposes it to the language
+/// definition for lookup (the `has_meta(<key>)` / `meta.<key> is <value>` facts
+/// and the `{meta.<key>}` slot), and otherwise ignores it.
+///
+/// # Determinism
+///
+/// Backed by a [`BTreeMap`](std::collections::BTreeMap) so iteration order is
+/// stable (sorted by key), keeping any metadata-derived output deterministic.
+///
+/// # Structural equality ignores metadata
+///
+/// [`Meta`] deliberately does **not** participate in structural equality of the
+/// nodes that carry it: two constructs are structurally equal iff their
+/// *structure* matches, regardless of metadata. The AST nodes hand-implement
+/// [`PartialEq`] to skip their `meta` field (see e.g. [`Expr`]), so metadata can
+/// never perturb the `eq` structural predicate or idiom matching.
+///
+/// A node with empty metadata renders byte-identically to one built before
+/// metadata existed — [`Meta::default`] is empty and adds nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// The entries, keyed by an open string key, stored sorted for determinism.
+    entries: std::collections::BTreeMap<String, String>,
+}
+
+impl Meta {
+    /// An empty metadata map (the default for every construct).
+    pub fn new() -> Self {
+        Meta::default()
+    }
+
+    /// Builds a metadata map from key/value pairs. Convenience for layers (and
+    /// tests) that tag a construct at construction time.
+    pub fn from_pairs<K, V, I>(pairs: I) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        Meta {
+            entries: pairs
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        }
+    }
+
+    /// Sets a key/value pair, returning `self` for chaining.
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.entries.insert(key.into(), value.into());
+        self
+    }
+
+    /// Inserts a key/value pair in place.
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.entries.insert(key.into(), value.into());
+    }
+
+    /// Returns `true` if the map has an entry for `key` (answers the
+    /// `has_meta(<key>)` fact).
+    pub fn has(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Returns the value for `key`, if present (answers `meta.<key> is <value>`
+    /// and the `{meta.<key>}` slot).
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    /// Returns `true` if there is no metadata.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterates the entries in deterministic (sorted-by-key) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
 /// A parsed Lamina source unit (the contents of one `lamina` code block).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
@@ -33,9 +124,10 @@ pub struct File {
 /// - **Structured `use` lists.** [`Item::Use`] carries a single `path` string;
 ///   grouped/aliased import lists (`use a::{b, c as d}`) are a later
 ///   refinement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Item {
-    /// A function definition (see [`Function`]).
+    /// A function definition (see [`Function`]). The function's own metadata
+    /// lives on the [`Function`] struct.
     Function(Function),
     /// A `struct`: a named aggregate of typed fields.
     Struct {
@@ -45,6 +137,8 @@ pub enum Item {
         visibility: Visibility,
         /// The fields, in declaration order (possibly empty).
         fields: Vec<Field>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
     },
     /// An `enum`: a named set of variants. Variants carry only a name for now
     /// (payloads are deferred — see [`Item`]).
@@ -55,6 +149,8 @@ pub enum Item {
         visibility: Visibility,
         /// The variants, in declaration order (possibly empty).
         variants: Vec<Variant>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
     },
     /// A type alias (`typedef`): a name bound to a target [`Type`].
     TypeDef {
@@ -62,6 +158,8 @@ pub enum Item {
         name: String,
         /// The aliased type.
         target: Type,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
     },
     /// An item-level constant (`const name: ty = value;`).
     Const {
@@ -73,12 +171,16 @@ pub enum Item {
         value: Expr,
         /// The constant's visibility.
         visibility: Visibility,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
     },
     /// An import (`use path;`). The `path` is a single string for now
     /// (structured import lists are deferred — see [`Item`]).
     Use {
         /// The imported path, verbatim.
         path: String,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
     },
 }
 
@@ -95,10 +197,96 @@ impl Item {
             Item::Use { .. } => ItemKind::Use,
         }
     }
+
+    /// This item's engine-transparent [`Meta`]. For [`Item::Function`] the
+    /// metadata is carried on the [`Function`] struct; every other variant
+    /// carries it inline.
+    pub fn meta(&self) -> &Meta {
+        match self {
+            Item::Function(f) => &f.meta,
+            Item::Struct { meta, .. }
+            | Item::Enum { meta, .. }
+            | Item::TypeDef { meta, .. }
+            | Item::Const { meta, .. }
+            | Item::Use { meta, .. } => meta,
+        }
+    }
 }
 
+/// Structural equality of items **ignores metadata** (see [`Meta`]): two items
+/// are equal iff their structure matches, regardless of what a layer tagged.
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Item::Function(a), Item::Function(b)) => a == b,
+            (
+                Item::Struct {
+                    name: an,
+                    visibility: av,
+                    fields: af,
+                    ..
+                },
+                Item::Struct {
+                    name: bn,
+                    visibility: bv,
+                    fields: bf,
+                    ..
+                },
+            ) => an == bn && av == bv && af == bf,
+            (
+                Item::Enum {
+                    name: an,
+                    visibility: av,
+                    variants: avr,
+                    ..
+                },
+                Item::Enum {
+                    name: bn,
+                    visibility: bv,
+                    variants: bvr,
+                    ..
+                },
+            ) => an == bn && av == bv && avr == bvr,
+            (
+                Item::TypeDef {
+                    name: an,
+                    target: at,
+                    ..
+                },
+                Item::TypeDef {
+                    name: bn,
+                    target: bt,
+                    ..
+                },
+            ) => an == bn && at == bt,
+            (
+                Item::Const {
+                    name: an,
+                    ty: at,
+                    value: aval,
+                    visibility: av,
+                    ..
+                },
+                Item::Const {
+                    name: bn,
+                    ty: bt,
+                    value: bval,
+                    visibility: bv,
+                    ..
+                },
+            ) => an == bn && at == bt && aval == bval && av == bv,
+            (Item::Use { path: a, .. }, Item::Use { path: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Item {}
+
 /// A `struct` field: a name, a type, and a visibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct Field {
     /// The field's identifier.
     pub name: String,
@@ -106,15 +294,39 @@ pub struct Field {
     pub ty: Type,
     /// The field's visibility.
     pub visibility: Visibility,
+    /// Engine-transparent metadata (see [`Meta`]); default empty. A closure's
+    /// capture-environment field may be tagged (e.g. `capture=true`), or an
+    /// anonymous class's method field tagged (e.g. `member=method`).
+    pub meta: Meta,
 }
+
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.ty == other.ty && self.visibility == other.visibility
+    }
+}
+
+impl Eq for Field {}
 
 /// An `enum` variant. Carries only a name for now; associated data / payloads
 /// are deferred (see [`Item`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct Variant {
     /// The variant's identifier.
     pub name: String,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
 }
+
+impl PartialEq for Variant {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Variant {}
 
 /// The dispatch kind of an [`Item`], answering the `item is <kind>` fact.
 ///
@@ -197,7 +409,9 @@ impl ItemKind {
 ///
 /// The minimal slice supports a name, no parameters, a single return type, and
 /// a body. Parameters and richer bodies are added in later slices.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct Function {
     /// The function's identifier.
     pub name: String,
@@ -220,16 +434,46 @@ pub struct Function {
     pub return_type: Type,
     /// The statements forming the function body (possibly empty).
     pub body: Vec<Statement>,
+    /// Engine-transparent metadata (see [`Meta`]); default empty. A layer that
+    /// lowers an anonymous function/closure to a hoisted `fn` tags it here
+    /// (e.g. `origin=anon_fn` or `origin=lambda`) so a language definition can
+    /// reconstruct the idiomatic inline form.
+    pub meta: Meta,
 }
 
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.visibility == other.visibility
+            && self.modifiers == other.modifiers
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.body == other.body
+    }
+}
+
+impl Eq for Function {}
+
 /// A function parameter: a name and a type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct Param {
     /// The parameter's identifier.
     pub name: String,
     /// The parameter's declared type.
     pub ty: Type,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
 }
+
+impl PartialEq for Param {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.ty == other.ty
+    }
+}
+
+impl Eq for Param {}
 
 impl Function {
     /// Returns `true` if this function carries the given modifier.
@@ -381,6 +625,23 @@ pub enum Type {
     },
 }
 
+impl Type {
+    /// This type's engine-transparent [`Meta`] (see [`Meta`]).
+    ///
+    /// Metadata is exposed uniformly for every construct so the `has_meta` /
+    /// `meta.<key>` facts and the `{meta.<key>}` slot are answerable in type
+    /// scope. No layer in the current kernel tags a bare [`Type`] node (Part 3
+    /// anonymous forms tag functions, fields, structs, and expressions, not
+    /// types), so this is always the empty map today; it exists so the channel
+    /// is present at every scope and a future layer that tags a type has a
+    /// place to read it without a breaking change.
+    pub fn meta(&self) -> &Meta {
+        // A shared empty map: types carry no metadata in the current kernel.
+        static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(Meta::new)
+    }
+}
+
 /// The Lamina kernel primitive types.
 ///
 /// This is the **frozen** set the engine understands — the complete kernel
@@ -479,9 +740,7 @@ impl Primitive {
     /// Resolves a Lamina primitive from its canonical spelling. Returns `None`
     /// if `name` is not a kernel primitive.
     pub fn from_name(name: &str) -> Option<Primitive> {
-        Primitive::all()
-            .into_iter()
-            .find(|p| p.as_str() == name)
+        Primitive::all().into_iter().find(|p| p.as_str() == name)
     }
 
     /// The complete frozen kernel primitive set, in canonical order.
@@ -628,10 +887,7 @@ pub enum Statement {
 /// a call, an operator expression, a cast, a struct literal) denotes a value,
 /// not a place, so it cannot be assigned to.
 pub fn is_lvalue(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Ref(_) | Expr::Field { .. } | Expr::Index { .. }
-    )
+    matches!(expr, Expr::Ref(_) | Expr::Field { .. } | Expr::Index { .. })
 }
 
 impl Statement {
@@ -665,12 +921,41 @@ pub enum AstError {
 }
 
 /// One `case` of a [`Statement::Switch`]: a matched value and its body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct SwitchCase {
     /// The value this case matches against the scrutinee.
     pub value: Expr,
     /// The statements run when the case matches.
     pub body: Vec<Statement>,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
+}
+
+impl PartialEq for SwitchCase {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.body == other.body
+    }
+}
+
+impl Eq for SwitchCase {}
+
+impl Statement {
+    /// This statement's engine-transparent [`Meta`] (see [`Meta`]).
+    ///
+    /// Metadata is exposed uniformly so the `has_meta` / `meta.<key>` facts and
+    /// the `{meta.<key>}` slot are answerable in statement scope. No layer in
+    /// the current kernel tags a bare [`Statement`] node — the Part 3 anonymous
+    /// forms tag functions, fields, structs, and expressions (see
+    /// [`Function::meta`], [`Field::meta`], [`Item::meta`], and [`Expr::meta`]),
+    /// not statements — so this is always the empty map today. It exists so the
+    /// channel is present at every scope; a future layer that tags a statement
+    /// has a place to read it without a breaking change.
+    pub fn meta(&self) -> &Meta {
+        static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(Meta::new)
+    }
 }
 
 impl Statement {
@@ -777,7 +1062,10 @@ impl StatementKind {
 /// float, string, char) are preserved *textually*: the engine never commits to
 /// a numeric width or a quoting/escaping scheme — those are the language
 /// definition's decisions, made in the relevant slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** any metadata a variant carries (see
+/// [`Meta`]); it is hand-implemented to compare structure only.
+#[derive(Debug, Clone)]
 pub enum Expr {
     /// An integer literal, preserved as its textual form to avoid premature
     /// width/precision decisions (those belong to the target).
@@ -868,19 +1156,130 @@ pub enum Expr {
         type_name: String,
         /// The field initializers, in order (possibly empty).
         fields: Vec<FieldInit>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. A layer
+        /// that lowers an anonymous class (or a closure's capture environment)
+        /// tags the construction site here (e.g. `origin=anon_class` or
+        /// `role=closure_env`) so a language definition can reconstruct the
+        /// idiomatic inline object/closure form.
+        meta: Meta,
     },
 }
 
 /// One field initializer of a [`Expr::StructLit`]: a field name and its value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
 pub struct FieldInit {
     /// The field's name.
     pub name: String,
     /// The value assigned to the field.
     pub value: Expr,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
 }
 
+impl PartialEq for FieldInit {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.value == other.value
+    }
+}
+
+impl Eq for FieldInit {}
+
+/// Structural equality of expressions **ignores metadata** (see [`Meta`]): two
+/// expressions are equal iff their structure matches. This preserves the `eq`
+/// structural predicate (e.g. `target eq value.lhs` for the compound-assign
+/// idiom) regardless of what a layer tagged.
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Expr::IntLiteral(a), Expr::IntLiteral(b))
+            | (Expr::FloatLiteral(a), Expr::FloatLiteral(b))
+            | (Expr::StringLiteral(a), Expr::StringLiteral(b))
+            | (Expr::CharLiteral(a), Expr::CharLiteral(b))
+            | (Expr::Ref(a), Expr::Ref(b)) => a == b,
+            (Expr::BoolLiteral(a), Expr::BoolLiteral(b)) => a == b,
+            (Expr::NullLiteral, Expr::NullLiteral) => true,
+            (Expr::Field { obj: ao, field: af }, Expr::Field { obj: bo, field: bf }) => {
+                ao == bo && af == bf
+            }
+            (Expr::Index { obj: ao, index: ai }, Expr::Index { obj: bo, index: bi }) => {
+                ao == bo && ai == bi
+            }
+            (
+                Expr::Call {
+                    callee: ac,
+                    args: aa,
+                },
+                Expr::Call {
+                    callee: bc,
+                    args: ba,
+                },
+            ) => ac == bc && aa == ba,
+            (
+                Expr::Unary {
+                    op: aop,
+                    operand: ao,
+                },
+                Expr::Unary {
+                    op: bop,
+                    operand: bo,
+                },
+            ) => aop == bop && ao == bo,
+            (
+                Expr::Binary {
+                    op: aop,
+                    lhs: al,
+                    rhs: ar,
+                },
+                Expr::Binary {
+                    op: bop,
+                    lhs: bl,
+                    rhs: br,
+                },
+            ) => aop == bop && al == bl && ar == br,
+            (Expr::Cast { value: av, ty: at }, Expr::Cast { value: bv, ty: bt }) => {
+                av == bv && at == bt
+            }
+            (
+                Expr::StructLit {
+                    type_name: at,
+                    fields: af,
+                    ..
+                },
+                Expr::StructLit {
+                    type_name: bt,
+                    fields: bf,
+                    ..
+                },
+            ) => at == bt && af == bf,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Expr {}
+
 impl Expr {
+    /// This expression's engine-transparent [`Meta`] (see [`Meta`]).
+    ///
+    /// Only [`Expr::StructLit`] carries inline metadata today (the Part 3
+    /// anonymous-class / closure-environment use site); every other expression
+    /// kind reads its intent off the *resolved* definition it references — e.g.
+    /// a `fnptr` [`Expr::Ref`] resolves to a hoisted [`Function`] and reads
+    /// [`Function::meta`]. Those kinds therefore expose the empty map here so
+    /// the `has_meta` / `meta.<key>` facts and `{meta.<key>}` slot are
+    /// answerable uniformly in expression scope.
+    pub fn meta(&self) -> &Meta {
+        match self {
+            Expr::StructLit { meta, .. } => meta,
+            _ => {
+                static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(Meta::new)
+            }
+        }
+    }
+
     /// The dispatch kind of this expression, used to select the target's
     /// `### expr` `When`-table row (via the `expr is <kind>` fact).
     pub fn kind(&self) -> ExprKind {
@@ -1588,13 +1987,22 @@ mod tests {
     #[test]
     fn expr_scope_binds_sub_slots() {
         assert_eq!(slot_binding("op", SlotScope::Expr), Some(SlotShape::Scalar));
-        assert_eq!(slot_binding("lhs", SlotScope::Expr), Some(SlotShape::Scalar));
-        assert_eq!(slot_binding("rhs", SlotScope::Expr), Some(SlotShape::Scalar));
+        assert_eq!(
+            slot_binding("lhs", SlotScope::Expr),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(
+            slot_binding("rhs", SlotScope::Expr),
+            Some(SlotShape::Scalar)
+        );
         assert_eq!(
             slot_binding("operand", SlotScope::Expr),
             Some(SlotShape::Scalar)
         );
-        assert_eq!(slot_binding("obj", SlotScope::Expr), Some(SlotShape::Scalar));
+        assert_eq!(
+            slot_binding("obj", SlotScope::Expr),
+            Some(SlotShape::Scalar)
+        );
         assert_eq!(
             slot_binding("callee", SlotScope::Expr),
             Some(SlotShape::Scalar)
@@ -1698,8 +2106,16 @@ mod tests {
     fn statement_scope_binds_sub_slots() {
         // Scalar sub-slots.
         for name in [
-            "name", "binding", "let_type", "value", "cond", "iterable", "scrutinee", "else",
-            "init", "step",
+            "name",
+            "binding",
+            "let_type",
+            "value",
+            "cond",
+            "iterable",
+            "scrutinee",
+            "else",
+            "init",
+            "step",
         ] {
             assert_eq!(
                 slot_binding(name, SlotScope::Statement),
@@ -1763,6 +2179,7 @@ mod tests {
                 params: vec![],
                 return_type: Type::Primitive(Primitive::Void),
                 body: vec![],
+                meta: crate::ast::Meta::new(),
             })
             .kind(),
             ItemKind::Function
@@ -1772,6 +2189,7 @@ mod tests {
                 name: "S".into(),
                 visibility: Visibility::Public,
                 fields: vec![],
+                meta: crate::ast::Meta::new(),
             }
             .kind(),
             ItemKind::Struct
@@ -1781,6 +2199,7 @@ mod tests {
                 name: "E".into(),
                 visibility: Visibility::Public,
                 variants: vec![],
+                meta: crate::ast::Meta::new(),
             }
             .kind(),
             ItemKind::Enum
@@ -1789,6 +2208,7 @@ mod tests {
             Item::TypeDef {
                 name: "T".into(),
                 target: Type::Primitive(Primitive::I32),
+                meta: crate::ast::Meta::new(),
             }
             .kind(),
             ItemKind::TypeDef
@@ -1799,13 +2219,15 @@ mod tests {
                 ty: Type::Primitive(Primitive::I32),
                 value: Expr::IntLiteral("1".into()),
                 visibility: Visibility::Public,
+                meta: crate::ast::Meta::new(),
             }
             .kind(),
             ItemKind::Const
         );
         assert_eq!(
             Item::Use {
-                path: "std::io".into()
+                path: "std::io".into(),
+                meta: crate::ast::Meta::new(),
             }
             .kind(),
             ItemKind::Use
@@ -1995,7 +2417,9 @@ mod tests {
             fields: vec![FieldInit {
                 name: "balance".into(),
                 value: Expr::IntLiteral("0".into()),
+                meta: crate::ast::Meta::new(),
             }],
+            meta: crate::ast::Meta::new(),
         };
         assert_eq!(s.kind(), ExprKind::StructLit);
         assert_eq!(ExprKind::StructLit.as_str(), "struct_lit");

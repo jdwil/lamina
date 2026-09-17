@@ -239,6 +239,11 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
+| `has_meta(<key>)` | bool | (metadata) the current node carries metadata key `<key>` — keys are open (a layer↔def contract), the *mechanism* is closed |
+| `meta.<key> is <value>` | enum | (metadata) the current node's metadata `<key>` equals `<value>` — keys and values are open |
+| `fnptr_ref_count(<arg>) is <n>` | enum | (helper) the function the `<arg>` sub-slot's fnptr value refers to is used as a value exactly `<n>` times in the unit |
+| `type_of(<arg>) is <type>` | enum | (helper) the resolved type of the `<arg>` sub-slot's expression is `<type>` (a locally-nameable type) |
+| `resolve(<arg>) is <kind>` | enum | (helper) the `<arg>` sub-slot's name resolves to a top-level item of that kind (`function` `struct` `enum` `typedef` `const`) |
 
 ### One-Level Structural Predicates (Idiom Recognition)
 
@@ -295,6 +300,112 @@ increment (`i = i + 1` → `i++`).
   `fnptr`-typed field is gated *transitively* by that field's declared `fnptr`
   type: a target whose capability matrix forbids `fnptr` cannot declare the
   field, so it cannot construct the aggregate either.
+
+## Construct Metadata
+
+Every kernel construct carries an open, engine-**transparent** metadata channel:
+an ordered key→value map (empty by default). It is how a *layer* communicates
+intent about a construct to a *language definition* — e.g. "this hoisted `fn` is
+a synthesized lambda" (`origin=anon_fn`), "this struct field is a captured
+variable" (`capture=true`), "this struct-literal is a synthesized anonymous
+class" (`origin=anon_class`).
+
+The engine defines **no** keys, validates nothing, and has no opinion about any
+key's meaning. There is **no** blessed metadata vocabulary — keys and values are
+entirely a contract between a layer and a definition, documented by their
+authors, never by the engine. (Blessing a key would make it a de-facto kernel
+keyword, which the kernel refuses.) The engine only carries metadata through the
+IR and answers two facts and one slot over it:
+
+- **Facts** (`When` column): `has_meta(<key>)` (the node has that key) and
+  `meta.<key> is <value>` (the node's `<key>` equals `<value>`). The *mechanism*
+  is closed (only these two forms); the *keys and values* are open.
+- **Slot** (template): `{meta.<key>}` renders the metadata value for `<key>`, or
+  the empty string when absent (the forgiving contract).
+
+Metadata **never participates in structural equality**: two constructs are
+structurally equal iff their *structure* matches, regardless of metadata. The
+`eq` predicate and all idiom matching ignore it, and a node with empty metadata
+renders **byte-identically** to one built before metadata existed.
+
+## Resolution / Render Helpers
+
+A **closed** set of read-only, engine-provided helper functions lets a definition
+cross the otherwise-local render boundary on demand — the rare cross-item need
+(inline an anonymous function, count how often a function is used as a value,
+resolve a field's type). Helpers are **pure** (never mutate the AST) and
+**fixed**: a definition may only *call* the named helpers, never define new ones.
+This is a controlled escape hatch, not a general query/scripting language — every
+helper is a named, fixed-arity function over a per-unit symbol index the engine
+builds once.
+
+**Template-side** (produce rendered output, usable in templates/slots):
+
+- `{resolve_fnptr(<arg>)}` — resolve the function the `<arg>` sub-slot's fnptr
+  value refers to and render it **inline** as the target's anonymous-function
+  spelling. If the definition provides a `### anon_fn` slot, the resolved
+  function renders through it (giving the def control of the closure/arrow form,
+  with access to the function's `{params}`/`{body}`/`{ret_type}`); otherwise the
+  full `## Function` declaration is inlined.
+- `{escape(<arg>, <style>)}` — escape the `<arg>` sub-slot's string/char literal
+  contents for the target. `<style>` is a closed set: `c` (C-family: `\n \t \\ \"
+  \' \r`), `json` (no `\'`), or `raw` (verbatim). The template supplies the
+  surrounding quotes; the helper escapes the (unescaped) stored contents.
+- `{field_type(<struct>, <field>)}` — render the declared type of `<field>` on
+  the struct named `<struct>` (literal names), through the target's type
+  machinery. For annotating/casting reconstructed field bindings.
+
+**Predicate-side** (produce facts, usable in `When`):
+
+- `fnptr_ref_count(<arg>) is <n>` — how many times the referenced function is
+  used as a *value* in the unit (a fnptr reference, not a direct call). Drives an
+  inlining policy: inline when `1`.
+- `type_of(<arg>) is <type>` — the resolved type of the `<arg>` expression, where
+  it is locally nameable (a struct-literal's aggregate type, a const's declared
+  type). Used to identify e.g. that a struct-literal's type is a layer-synthesized
+  anonymous class.
+- `resolve(<arg>) is <kind>` — resolve a name to its top-level item kind
+  (`function`/`struct`/…). Used with the resolved node's metadata to reconstruct
+  higher-level forms.
+
+An `<arg>` is an engine sub-slot of the current node (e.g. `value` in a
+`### field_init` row, or `self` for the node itself). An unknown escape `<style>`,
+a non-string `escape` argument, or a `resolve_fnptr` argument that is not a
+resolvable function reference is a loud error, never silent wrong output.
+
+## Anonymous-Form Reconstruction
+
+Anonymous functions, closures, and anonymous classes are **not** kernel
+constructs — the kernel stays `struct` + `fn` + `fnptr` + struct-literal, exactly
+as with OOP. A *layer* lowers each form into that minimal shape and attaches
+metadata; the *language definition* reconstructs the idiomatic form from the
+shape + metadata + helpers. A target with no inline form (e.g. C) simply omits
+the reconstruction rows and emits the lowered shape directly — correct
+degradation.
+
+- **Anonymous function** — a hoisted `fn` (tagged e.g. `origin=anon_fn`) plus a
+  fnptr reference at the use-site. The def, where the fnptr value appears (a
+  struct-literal field, a call argument), branches on
+  `resolve(value) is function && fnptr_ref_count(value) is 1` and inlines it with
+  `{resolve_fnptr(value)}` — rendered through `### anon_fn` as a closure
+  (`|x| …`) or arrow (`x => …`).
+- **Closure** — a capture-environment `struct` (fields tagged e.g. `capture=true`,
+  the struct tagged e.g. `role=closure_env`) plus a hoisted `fn` taking the
+  environment (tagged e.g. `origin=lambda`) plus a struct-literal constructing the
+  environment. The def reads the **metadata** — not any structural convention —
+  to emit a native closure capturing exactly the tagged fields.
+- **Anonymous class** — an (anonymous) `struct` with `fnptr` method fields plus
+  hoisted method `fn`s plus a struct-literal instantiating it (tagged e.g.
+  `origin=anon_class`, method fields tagged e.g. `member=method`). The def
+  recognizes the tagged struct-literal (`meta.origin is anon_class`), renders it as
+  the target's object/anonymous-class expression, and inlines each method via
+  `{resolve_fnptr(value)}`. A target with no object expression (Rust) keeps the
+  named struct-literal.
+
+The shipped `rust.mdl` reconstructs the anonymous *function* as a closure (and
+keeps a named aggregate for the anonymous class, Rust having no object
+expression); `typescript.mdl` reconstructs the anonymous function as an arrow and
+the anonymous class as an object literal with inlined methods.
 
 ## Capabilities
 

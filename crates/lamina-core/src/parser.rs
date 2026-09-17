@@ -150,6 +150,7 @@ impl Parser {
             params: Vec::new(),
             return_type,
             body,
+            meta: crate::ast::Meta::new(),
         })
     }
 
@@ -215,6 +216,7 @@ mod tests {
                     params: vec![],
                     return_type: Type::Primitive(Primitive::I32),
                     body: vec![Statement::Return(Some(Expr::IntLiteral("42".to_string())))],
+                    meta: crate::ast::Meta::new(),
                 })],
             }
         );

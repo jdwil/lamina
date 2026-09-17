@@ -14,6 +14,7 @@ use crate::ast::{
     UnaryOp, Variant, Visibility,
 };
 use crate::error::EmitError;
+use crate::index::{EscapeStyle, UnitIndex};
 use crate::lang::{ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef};
 use crate::predicate::{
     CallerKind, ExprKind as PredExprKind, ItemKind as PredItemKind, RenderContext, RetKind,
@@ -30,12 +31,17 @@ use crate::render::{Rendered, SlotResolver};
 /// a `When` table with no matching row, or a template referencing an unknown
 /// slot).
 pub fn emit(file: &File, lang: &LanguageDef) -> Result<String, EmitError> {
+    // Build the per-unit symbol + reference index once; every resolver borrows
+    // it so the closed cross-item helpers (`resolve_fnptr`, `fnptr_ref_count`,
+    // `type_of`, `resolve`, `field_type`) can answer without the renderer
+    // losing its local character.
+    let index = UnitIndex::build(file);
     let mut out = String::new();
-    for (index, item) in file.items.iter().enumerate() {
-        if index > 0 {
+    for (i, item) in file.items.iter().enumerate() {
+        if i > 0 {
             out.push_str("\n\n");
         }
-        let rendered = emit_item(item, lang)?;
+        let rendered = emit_item(item, lang, &index)?;
         out.push_str(&rendered.text);
     }
     Ok(out)
@@ -48,9 +54,9 @@ pub fn emit(file: &File, lang: &LanguageDef) -> Result<String, EmitError> {
 /// `## <Item>` section ([`LanguageDef::item_def`]). A definition that omits the
 /// section for an item kind cannot express that item — using it is an
 /// [`EmitError::UnknownItem`].
-fn emit_item(item: &Item, lang: &LanguageDef) -> Result<Rendered, EmitError> {
+fn emit_item(item: &Item, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
     match item {
-        Item::Function(function) => emit_function(function, lang),
+        Item::Function(function) => emit_function(function, lang, index),
         _ => {
             let kind = item.kind();
             let def = lang.item_def(kind).ok_or_else(|| EmitError::UnknownItem {
@@ -61,6 +67,7 @@ fn emit_item(item: &Item, lang: &LanguageDef) -> Result<Rendered, EmitError> {
                 item,
                 def,
                 lang,
+                index,
                 ctx: item_context(item),
                 scope: ItemScope::Node,
             };
@@ -70,11 +77,16 @@ fn emit_item(item: &Item, lang: &LanguageDef) -> Result<Rendered, EmitError> {
 }
 
 /// Renders a single function via the target's entry template.
-fn emit_function(function: &Function, lang: &LanguageDef) -> Result<Rendered, EmitError> {
+fn emit_function(
+    function: &Function,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<Rendered, EmitError> {
     let ctx = context_for(function);
     let mut resolver = FunctionResolver {
         function,
         lang,
+        index,
         ctx,
         scope: Scope::Function,
     };
@@ -114,6 +126,10 @@ fn context_for(function: &Function) -> RenderContext {
         } else {
             CallerKind::Sync
         }),
+        // The function's engine-transparent metadata (Part 1), for
+        // `has_meta(<key>)` / `meta.<key> is <value>` facts on the `## Function`
+        // entry template.
+        meta: function.meta.clone(),
         ..Default::default()
     }
 }
@@ -147,6 +163,7 @@ fn vis_kind(visibility: Visibility) -> VisKind {
 fn item_context(item: &Item) -> RenderContext {
     let mut ctx = RenderContext {
         item: Some(pred_item_kind(item.kind())),
+        meta: item.meta().clone(),
         ..Default::default()
     };
     if let Some(visibility) = item_visibility(item) {
@@ -187,6 +204,7 @@ struct ItemResolver<'a> {
     item: &'a Item,
     def: &'a ItemDef,
     lang: &'a LanguageDef,
+    index: &'a UnitIndex<'a>,
     ctx: RenderContext,
     scope: ItemScope<'a>,
 }
@@ -241,7 +259,7 @@ impl<'a> ItemResolver<'a> {
         match &self.scope {
             ItemScope::Field(field) => match name {
                 "name" => Ok(Rendered::text(field.name.clone())),
-                "type" => resolve_type(&field.ty, self.lang),
+                "type" => resolve_type(&field.ty, self.lang, self.index),
                 _ => self.unknown_slot(name),
             },
             ItemScope::Variant(variant) => match name {
@@ -259,9 +277,9 @@ impl<'a> ItemResolver<'a> {
             | (Item::Enum { name: n, .. }, "name")
             | (Item::TypeDef { name: n, .. }, "name")
             | (Item::Const { name: n, .. }, "name") => Ok(Rendered::text(n.clone())),
-            (Item::TypeDef { target, .. }, "target") => resolve_type(target, self.lang),
-            (Item::Const { ty, .. }, "type") => resolve_type(ty, self.lang),
-            (Item::Const { value, .. }, "value") => emit_expr(value, self.lang),
+            (Item::TypeDef { target, .. }, "target") => resolve_type(target, self.lang, self.index),
+            (Item::Const { ty, .. }, "type") => resolve_type(ty, self.lang, self.index),
+            (Item::Const { value, .. }, "value") => emit_expr(value, self.lang, self.index),
             (Item::Use { path, .. }, "path") => Ok(Rendered::text(path.clone())),
             _ => self.unknown_slot(name),
         }
@@ -271,12 +289,8 @@ impl<'a> ItemResolver<'a> {
     /// rendering each element via its item slot with `first`/`last` loop facts.
     fn sequence(&self, name: &str, item_slot: &str) -> Result<Rendered, EmitError> {
         match (self.item, name) {
-            (Item::Struct { fields, .. }, "fields") => {
-                self.render_fields(fields, item_slot)
-            }
-            (Item::Enum { variants, .. }, "variants") => {
-                self.render_variants(variants, item_slot)
-            }
+            (Item::Struct { fields, .. }, "fields") => self.render_fields(fields, item_slot),
+            (Item::Enum { variants, .. }, "variants") => self.render_variants(variants, item_slot),
             _ => self.unknown_slot(name),
         }
     }
@@ -299,12 +313,14 @@ impl<'a> ItemResolver<'a> {
                 vis: Some(vis_kind(field.visibility)),
                 first: i == 0,
                 last: i + 1 == len,
+                meta: field.meta.clone(),
                 ..Default::default()
             };
             let mut elem = ItemResolver {
                 item: self.item,
                 def: self.def,
                 lang: self.lang,
+                index: self.index,
                 ctx,
                 scope: ItemScope::Field(field),
             };
@@ -333,12 +349,14 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                meta: variant.meta.clone(),
                 ..Default::default()
             };
             let mut elem = ItemResolver {
                 item: self.item,
                 def: self.def,
                 lang: self.lang,
+                index: self.index,
                 ctx,
                 scope: ItemScope::Variant(variant),
             };
@@ -360,6 +378,9 @@ impl<'a> SlotResolver for ItemResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
+            return Ok(render_meta_slot(&self.ctx.meta, key));
+        }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
             Some(SlotShape::Sequence { item_slot, .. }) => self.sequence(name, &item_slot),
@@ -383,6 +404,7 @@ enum Scope<'a> {
 struct FunctionResolver<'a> {
     function: &'a Function,
     lang: &'a LanguageDef,
+    index: &'a UnitIndex<'a>,
     ctx: RenderContext,
     scope: Scope<'a>,
 }
@@ -392,16 +414,16 @@ impl<'a> FunctionResolver<'a> {
     /// current context. Used for the per-element item slots (`param`,
     /// `statement`) and ordinary slots (`ret`, `vis`, …).
     fn render_named_slot(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        let slot = self
-            .lang
-            .function
-            .slots
-            .get(name)
-            .cloned()
-            .ok_or_else(|| EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: name.to_string(),
-            })?;
+        let slot =
+            self.lang
+                .function
+                .slots
+                .get(name)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
 
         let outcome = match &slot {
             SlotDef::Fixed(outcome) => outcome.clone(),
@@ -439,11 +461,22 @@ impl<'a> FunctionResolver<'a> {
             elem_ctx.first = i == 0;
             elem_ctx.last = i + 1 == len;
 
+            let scope = make_scope(i);
+            // The element carries its OWN metadata, not the function's — a
+            // parameter's `has_meta`/`meta.<key>` facts must read the param's
+            // metadata, so reset it here (the function's `meta` was cloned above
+            // only for the non-metadata facts).
+            elem_ctx.meta = match &scope {
+                Scope::Param(p) => p.meta.clone(),
+                Scope::Function => crate::ast::Meta::new(),
+            };
+
             let mut elem_resolver = FunctionResolver {
                 function: self.function,
                 lang: self.lang,
+                index: self.index,
                 ctx: elem_ctx,
-                scope: make_scope(i),
+                scope,
             };
             out.push(elem_resolver.render_named_slot(item_slot)?);
         }
@@ -464,9 +497,9 @@ impl<'a> FunctionResolver<'a> {
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
         match (&self.scope, name) {
             (Scope::Param(p), "name") => Ok(Rendered::text(p.name.clone())),
-            (Scope::Param(p), "type") => resolve_type(&p.ty, self.lang),
+            (Scope::Param(p), "type") => resolve_type(&p.ty, self.lang, self.index),
             (_, "name") => Ok(Rendered::text(self.function.name.clone())),
-            (_, "ret_type") => resolve_type(&self.function.return_type, self.lang),
+            (_, "ret_type") => resolve_type(&self.function.return_type, self.lang, self.index),
             _ => Err(EmitError::UnknownSlot {
                 target: self.lang.name.clone(),
                 slot: name.to_string(),
@@ -479,6 +512,9 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
+            return Ok(render_meta_slot(&self.ctx.meta, key));
+        }
         // Cardinality is data-driven: ask the binding table for this slot's
         // shape in the current scope. Scalar -> render directly; Sequence ->
         // loop the item slot; not engine-bound -> a named slot definition.
@@ -502,6 +538,7 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
                             &self.function.body,
                             &item_slot,
                             self.lang,
+                            self.index,
                             self.ctx.caller,
                         )
                     }
@@ -550,6 +587,7 @@ fn statement_context(
         caller,
         first,
         last,
+        meta: stmt.meta().clone(),
         ..Default::default()
     };
     match stmt {
@@ -593,6 +631,7 @@ fn statement_context(
 fn emit_statement(
     stmt: &Statement,
     lang: &LanguageDef,
+    index: &UnitIndex,
     caller: Option<CallerKind>,
     first: bool,
     last: bool,
@@ -601,6 +640,7 @@ fn emit_statement(
     let mut resolver = StmtResolver {
         stmt,
         lang,
+        index,
         caller,
         ctx,
         scope: StmtScope::Node,
@@ -617,12 +657,14 @@ fn emit_statement(
 fn emit_statement_clause(
     stmt: &Statement,
     lang: &LanguageDef,
+    index: &UnitIndex,
     caller: Option<CallerKind>,
 ) -> Result<Rendered, EmitError> {
     let ctx = statement_context(stmt, caller, true, true);
     let mut resolver = StmtResolver {
         stmt,
         lang,
+        index,
         caller,
         ctx,
         scope: StmtScope::Node,
@@ -638,6 +680,7 @@ fn render_statement_sequence(
     statements: &[Statement],
     item_slot: &str,
     lang: &LanguageDef,
+    index: &UnitIndex,
     caller: Option<CallerKind>,
 ) -> Result<Rendered, EmitError> {
     // The item slot for a statement sequence is always the recursive
@@ -652,7 +695,14 @@ fn render_statement_sequence(
     let len = statements.len();
     let mut out = Rendered::empty();
     for (i, stmt) in statements.iter().enumerate() {
-        out.push(emit_statement(stmt, lang, caller, i == 0, i + 1 == len)?);
+        out.push(emit_statement(
+            stmt,
+            lang,
+            index,
+            caller,
+            i == 0,
+            i + 1 == len,
+        )?);
     }
     Ok(out)
 }
@@ -672,6 +722,7 @@ enum StmtScope<'a> {
 struct StmtResolver<'a> {
     stmt: &'a Statement,
     lang: &'a LanguageDef,
+    index: &'a UnitIndex<'a>,
     /// The inherited enclosing-callable synchrony, threaded into nested
     /// statement sequences.
     caller: Option<CallerKind>,
@@ -694,16 +745,16 @@ impl<'a> StmtResolver<'a> {
     /// `stmt` helper, `switch_case`, or any def-defined helper) against the
     /// current statement context.
     fn render_named_slot(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        let slot = self
-            .lang
-            .function
-            .slots
-            .get(name)
-            .cloned()
-            .ok_or_else(|| EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: name.to_string(),
-            })?;
+        let slot =
+            self.lang
+                .function
+                .slots
+                .get(name)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
 
         let outcome = match &slot {
             SlotDef::Fixed(outcome) => outcome.clone(),
@@ -729,7 +780,7 @@ impl<'a> StmtResolver<'a> {
     /// so its `first`/`last` facts are both `true` (it is the sole element),
     /// mirroring how a one-statement sequence would render.
     fn render_nested_statement(&self, stmt: &Statement) -> Result<Rendered, EmitError> {
-        emit_statement(stmt, self.lang, self.caller, true, true)
+        emit_statement(stmt, self.lang, self.index, self.caller, true, true)
     }
 
     /// Renders a `for` init/step in *clause* (terminator-free) form through the
@@ -740,7 +791,7 @@ impl<'a> StmtResolver<'a> {
     /// instead of emitting a C-style header) simply never references
     /// `{init_clause}` / `{step_clause}`, so the slot is looked up lazily.
     fn render_statement_clause(&self, stmt: &Statement) -> Result<Rendered, EmitError> {
-        emit_statement_clause(stmt, self.lang, self.caller)
+        emit_statement_clause(stmt, self.lang, self.index, self.caller)
     }
 
     /// Produces the text of a scalar engine-bound statement sub-slot, resolved
@@ -748,7 +799,7 @@ impl<'a> StmtResolver<'a> {
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
         match &self.scope {
             StmtScope::Case(case) => match name {
-                "value" => emit_expr(&case.value, self.lang),
+                "value" => emit_expr(&case.value, self.lang, self.index),
                 _ => self.unknown_slot(name),
             },
             StmtScope::Node => self.scalar_node(name),
@@ -764,36 +815,62 @@ impl<'a> StmtResolver<'a> {
             // A `let`'s optional type annotation. Guarded by `has type` in the
             // def, so `None` here means the def referenced `{let_type}` in a
             // branch that should not have been selected.
-            (Statement::Let { ty: Some(ty), .. }, "let_type") => resolve_type(ty, self.lang),
+            (Statement::Let { ty: Some(ty), .. }, "let_type") => {
+                resolve_type(ty, self.lang, self.index)
+            }
             // Nested single expressions.
-            (Statement::Let { value: Some(v), .. }, "value") => emit_expr(v, self.lang),
-            (Statement::Return(Some(v)), "value") => emit_expr(v, self.lang),
-            (Statement::Expr(v), "value") => emit_expr(v, self.lang),
-            (Statement::If { cond, .. }, "cond") => emit_expr(cond, self.lang),
-            (Statement::While { cond, .. }, "cond") => emit_expr(cond, self.lang),
-            (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang),
-            (Statement::ForEach { iterable, .. }, "iterable") => emit_expr(iterable, self.lang),
-            (Statement::Switch { scrutinee, .. }, "scrutinee") => emit_expr(scrutinee, self.lang),
+            (Statement::Let { value: Some(v), .. }, "value") => emit_expr(v, self.lang, self.index),
+            (Statement::Return(Some(v)), "value") => emit_expr(v, self.lang, self.index),
+            (Statement::Expr(v), "value") => emit_expr(v, self.lang, self.index),
+            (Statement::If { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
+            (Statement::While { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
+            (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang, self.index),
+            (Statement::ForEach { iterable, .. }, "iterable") => {
+                emit_expr(iterable, self.lang, self.index)
+            }
+            (Statement::Switch { scrutinee, .. }, "scrutinee") => {
+                emit_expr(scrutinee, self.lang, self.index)
+            }
             // An assignment's target and value.
-            (Statement::Assign { target, .. }, "target") => emit_expr(target, self.lang),
-            (Statement::Assign { value, .. }, "value") => emit_expr(value, self.lang),
+            (Statement::Assign { target, .. }, "target") => {
+                emit_expr(target, self.lang, self.index)
+            }
+            (Statement::Assign { value, .. }, "value") => emit_expr(value, self.lang, self.index),
             // One-level structural sub-part slots (Part 2): render a DIRECT
             // named sub-part of the current statement's `value` when it is a
             // binary. `value.op` renders the operator spelling; `value.lhs` /
             // `value.rhs` render the rendered operand. One level only. Used by
             // a language def to emit a compound-assignment idiom's right
             // operand (`{value.rhs}` in `{target} += {value.rhs};`).
-            (Statement::Assign { value: Expr::Binary { op, .. }, .. }, "value.op") => {
-                binary_op_spelling(*op, self.lang).map(Rendered::text)
-            }
-            (Statement::Assign { value: Expr::Binary { lhs, .. }, .. }, "value.lhs") => {
-                emit_expr(lhs, self.lang)
-            }
-            (Statement::Assign { value: Expr::Binary { rhs, .. }, .. }, "value.rhs") => {
-                emit_expr(rhs, self.lang)
-            }
+            (
+                Statement::Assign {
+                    value: Expr::Binary { op, .. },
+                    ..
+                },
+                "value.op",
+            ) => binary_op_spelling(*op, self.lang).map(Rendered::text),
+            (
+                Statement::Assign {
+                    value: Expr::Binary { lhs, .. },
+                    ..
+                },
+                "value.lhs",
+            ) => emit_expr(lhs, self.lang, self.index),
+            (
+                Statement::Assign {
+                    value: Expr::Binary { rhs, .. },
+                    ..
+                },
+                "value.rhs",
+            ) => emit_expr(rhs, self.lang, self.index),
             // Nested single statements.
-            (Statement::If { else_block: Some(e), .. }, "else") => self.render_nested_statement(e),
+            (
+                Statement::If {
+                    else_block: Some(e),
+                    ..
+                },
+                "else",
+            ) => self.render_nested_statement(e),
             (Statement::For { init: Some(i), .. }, "init") => self.render_nested_statement(i),
             (Statement::For { step: Some(s), .. }, "step") => self.render_nested_statement(s),
             // Clause (terminator-free) forms for a C-style `for` header, routed
@@ -817,7 +894,13 @@ impl<'a> StmtResolver<'a> {
         // In a switch-case element scope, `body` loops the *case's* statements.
         if let StmtScope::Case(case) = &self.scope {
             if name == "body" {
-                return render_statement_sequence(&case.body, item_slot, self.lang, self.caller);
+                return render_statement_sequence(
+                    &case.body,
+                    item_slot,
+                    self.lang,
+                    self.index,
+                    self.caller,
+                );
             }
             return self.unknown_slot(name);
         }
@@ -832,10 +915,15 @@ impl<'a> StmtResolver<'a> {
             (Statement::While { body, .. }, "body") => body,
             (Statement::For { body, .. }, "body") => body,
             (Statement::ForEach { body, .. }, "body") => body,
-            (Statement::Switch { default: Some(d), .. }, "default") => d,
+            (
+                Statement::Switch {
+                    default: Some(d), ..
+                },
+                "default",
+            ) => d,
             _ => return self.unknown_slot(name),
         };
-        render_statement_sequence(statements, item_slot, self.lang, self.caller)
+        render_statement_sequence(statements, item_slot, self.lang, self.index, self.caller)
     }
 
     /// Loops a `switch`'s cases, rendering the `switch_case` item slot per case
@@ -854,11 +942,13 @@ impl<'a> StmtResolver<'a> {
                 caller: self.caller,
                 first: i == 0,
                 last: i + 1 == len,
+                meta: case.meta.clone(),
                 ..Default::default()
             };
             let mut elem_resolver = StmtResolver {
                 stmt: self.stmt,
                 lang: self.lang,
+                index: self.index,
                 caller: self.caller,
                 ctx,
                 scope: StmtScope::Case(case),
@@ -881,6 +971,9 @@ impl<'a> SlotResolver for StmtResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
+            return Ok(render_meta_slot(&self.ctx.meta, key));
+        }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
             Some(SlotShape::Sequence { item_slot, .. }) => self.sequence(name, &item_slot),
@@ -896,7 +989,7 @@ impl<'a> SlotResolver for StmtResolver<'a> {
 ///
 /// A `null` literal is gated by the `ptr` primitive: on a target that forbids
 /// `ptr`, `null` is forbidden too (`null` follows `ptr`).
-fn emit_expr(expr: &Expr, lang: &LanguageDef) -> Result<Rendered, EmitError> {
+fn emit_expr(expr: &Expr, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
     // `null` follows `ptr`: if the target forbids the `ptr` primitive, a `null`
     // literal is not expressible either.
     if matches!(expr, Expr::NullLiteral) {
@@ -908,6 +1001,7 @@ fn emit_expr(expr: &Expr, lang: &LanguageDef) -> Result<Rendered, EmitError> {
     let mut resolver = ExprResolver {
         expr,
         lang,
+        index,
         scope: ExprScope::Node,
     };
     resolver.render_named_slot("expr")
@@ -936,6 +1030,180 @@ fn binary_op_spelling(op: BinaryOp, lang: &LanguageDef) -> Result<String, EmitEr
             operator: op.as_str().to_string(),
         }),
         None => Ok(op.as_str().to_string()),
+    }
+}
+
+/// A parsed special (non-engine-bound) slot form: a metadata slot or a call to
+/// one of the closed template-side render helpers.
+///
+/// These are recognized by every resolver *before* the normal
+/// engine-bound/named-slot resolution, so `{meta.origin}`, `{resolve_fnptr(x)}`
+/// and `{escape(x, c)}` work uniformly wherever they appear in a template. The
+/// helper *set* is closed (only these names); their arguments reference an
+/// engine sub-slot of the current node.
+enum SpecialSlot<'a> {
+    /// `{meta.<key>}` — render the current node's metadata value for `<key>`
+    /// (empty string if absent — the forgiving choice, so a template can
+    /// reference a metadata slot a layer only sometimes sets).
+    Meta(&'a str),
+    /// `{resolve_fnptr(<arg>)}` — resolve the function the `<arg>` sub-slot's
+    /// fnptr value refers to and render it inline.
+    ResolveFnptr(&'a str),
+    /// `{escape(<arg>, <style>)}` — escape the `<arg>` sub-slot's string/char
+    /// literal contents for the named `<style>`.
+    Escape { arg: &'a str, style: &'a str },
+    /// `{field_type(<struct>, <field>)}` — render the declared type of `<field>`
+    /// on the struct named `<struct>` (a literal item name), via the target's
+    /// type machinery. Both arguments are literal names (not sub-slots).
+    FieldType { struct_name: &'a str, field: &'a str },
+}
+
+/// Parses a slot `name` as a [`SpecialSlot`], or `None` if it is an ordinary
+/// engine-bound or named slot. Recognizes only the closed helper set; a
+/// malformed helper call (unknown name, wrong arity) is left to the normal
+/// resolution path, which reports it as an unknown slot.
+fn parse_special_slot(name: &str) -> Option<SpecialSlot<'_>> {
+    if let Some(key) = name.strip_prefix("meta.") {
+        if !key.is_empty() {
+            return Some(SpecialSlot::Meta(key));
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("resolve_fnptr(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let arg = inner.trim();
+        if !arg.is_empty() && !arg.contains(',') {
+            return Some(SpecialSlot::ResolveFnptr(arg));
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("escape(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut parts = inner.splitn(2, ',');
+        let arg = parts.next().map(str::trim).unwrap_or("");
+        let style = parts.next().map(str::trim).unwrap_or("");
+        if !arg.is_empty() && !style.is_empty() {
+            return Some(SpecialSlot::Escape { arg, style });
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("field_type(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut parts = inner.splitn(2, ',');
+        let struct_name = parts.next().map(str::trim).unwrap_or("");
+        let field = parts.next().map(str::trim).unwrap_or("");
+        if !struct_name.is_empty() && !field.is_empty() {
+            return Some(SpecialSlot::FieldType { struct_name, field });
+        }
+        return None;
+    }
+    None
+}
+
+/// Renders a `{meta.<key>}` slot from a node's [`Meta`]: the value for `<key>`,
+/// or the empty string when absent (the forgiving contract). Metadata never
+/// participates in structural equality, and an absent key rendering empty means
+/// a node with no metadata renders byte-identically to before metadata existed.
+fn render_meta_slot(meta: &crate::ast::Meta, key: &str) -> Rendered {
+    Rendered::text(meta.get(key).unwrap_or("").to_string())
+}
+
+/// Inlines the function a fnptr `arg_expr` refers to, via the unit index. The
+/// `arg_expr` must be a bare [`Expr::Ref`] naming a top-level function in this
+/// unit; the function is rendered through the target's `## Function` entry
+/// template (its idiomatic function-as-value / anonymous-function spelling).
+///
+/// If the argument is not a resolvable function reference, this is an
+/// [`EmitError::UnknownSlot`] naming the `resolve_fnptr` call — the def asked to
+/// inline something that is not a fnptr value.
+fn render_resolve_fnptr(
+    arg_expr: &Expr,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+    call: &str,
+) -> Result<Rendered, EmitError> {
+    let name = match arg_expr {
+        Expr::Ref(n) => n.as_str(),
+        _ => {
+            return Err(EmitError::UnknownSlot {
+                target: lang.name.clone(),
+                slot: call.to_string(),
+            })
+        }
+    };
+    match index.function(name) {
+        Some(function) => {
+            // Prefer a def-provided `### anon_fn` slot — the target's
+            // *anonymous-function* spelling (a closure `|x| …`, an arrow
+            // `x => …`) — so the def controls the inline form and can reference
+            // the function's `{params}` / `{body}` / `{ret_type}` sub-slots. A
+            // target without an inline function form (or one that simply wants
+            // the full declaration) omits `### anon_fn`, and the function
+            // renders through its `## Function` entry template instead.
+            let ctx = context_for(function);
+            let mut resolver = FunctionResolver {
+                function,
+                lang,
+                index,
+                ctx,
+                scope: Scope::Function,
+            };
+            if lang.function.slots.contains_key("anon_fn") {
+                resolver.render_named_slot("anon_fn")
+            } else {
+                lang.function.entry.render(&mut resolver)
+            }
+        }
+        None => Err(EmitError::UnknownSlot {
+            target: lang.name.clone(),
+            slot: call.to_string(),
+        }),
+    }
+}
+
+/// Applies the `escape(<arg>, <style>)` helper to a string/char literal's
+/// contents. The `arg_expr` must be a [`Expr::StringLiteral`] or
+/// [`Expr::CharLiteral`] (whose stored contents are unescaped); the result is
+/// the escaped contents (without surrounding quotes — the template supplies
+/// those). An unknown `<style>` or a non-string argument is an
+/// [`EmitError::UnknownSlot`].
+fn render_escape(
+    arg_expr: &Expr,
+    style: &str,
+    lang: &LanguageDef,
+    call: &str,
+) -> Result<Rendered, EmitError> {
+    let style = EscapeStyle::from_name(style).ok_or_else(|| EmitError::UnknownSlot {
+        target: lang.name.clone(),
+        slot: call.to_string(),
+    })?;
+    let contents = match arg_expr {
+        Expr::StringLiteral(s) | Expr::CharLiteral(s) => s.as_str(),
+        _ => {
+            return Err(EmitError::UnknownSlot {
+                target: lang.name.clone(),
+                slot: call.to_string(),
+            })
+        }
+    };
+    Ok(Rendered::text(style.apply(contents)))
+}
+
+/// The locally-nameable spelling of a [`Type`] for the `type_of` fact: a named
+/// user type by name, or a primitive by its canonical Lamina spelling. Compound
+/// types (`ptr`/`fnptr`) have no single name and return `None` — the engine
+/// never invents one.
+fn type_of_type_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Named(name) => Some(name.clone()),
+        Type::Primitive(p) => Some(p.as_str().to_string()),
+        Type::Pointer(_) | Type::FnPtr { .. } => None,
     }
 }
 
@@ -971,7 +1239,11 @@ fn literal_value(expr: &Expr) -> Option<String> {
         Expr::IntLiteral(v) | Expr::FloatLiteral(v) => Some(v.clone()),
         Expr::StringLiteral(v) | Expr::CharLiteral(v) => Some(v.clone()),
         Expr::Ref(v) => Some(v.clone()),
-        Expr::BoolLiteral(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
+        Expr::BoolLiteral(b) => Some(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
         Expr::NullLiteral => Some("null".to_string()),
         _ => None,
     }
@@ -1005,6 +1277,7 @@ enum ExprScope<'a> {
 struct ExprResolver<'a> {
     expr: &'a Expr,
     lang: &'a LanguageDef,
+    index: &'a UnitIndex<'a>,
     scope: ExprScope<'a>,
 }
 
@@ -1019,27 +1292,88 @@ impl<'a> ExprResolver<'a> {
     }
 
     /// The render context for the current expression: sets the `expr is <kind>`
-    /// dispatch fact from the node's kind.
+    /// dispatch fact from the node's kind, and carries the node's metadata for
+    /// the `has_meta(<key>)` / `meta.<key> is <value>` facts (only
+    /// `StructLit` carries inline metadata; other kinds expose empty).
     fn ctx(&self) -> RenderContext {
         RenderContext {
             expr: Some(pred_expr_kind(self.expr.kind())),
+            meta: self.node_meta().clone(),
+            helper_facts: self.compute_helper_facts(),
             ..Default::default()
+        }
+    }
+
+    /// Pre-computes the predicate-side render-helper answers for the argument
+    /// sub-slots the current node exposes, keyed `(helper, arg)`:
+    /// `fnptr_ref_count(<arg>)`, `type_of(<arg>)`, `resolve(<arg>)`. Computed
+    /// once here (using the per-unit index) so predicate evaluation stays pure.
+    fn compute_helper_facts(&self) -> std::collections::BTreeMap<(String, String), String> {
+        let mut facts = std::collections::BTreeMap::new();
+        // The set of `(arg-name, expr)` pairs a def may query on this node.
+        let mut args: Vec<(&str, &Expr)> = vec![("self", self.expr)];
+        match &self.scope {
+            ExprScope::Field(init) => args.push(("value", &init.value)),
+            ExprScope::Arg(e) => args.push(("value", e)),
+            ExprScope::Node => {}
+        }
+        for (arg, expr) in args {
+            // `fnptr_ref_count(<arg>)`: count for a bare function reference.
+            if let Expr::Ref(name) = expr {
+                let n = self.index.fnptr_ref_count(name);
+                facts.insert(
+                    ("fnptr_ref_count".to_string(), arg.to_string()),
+                    n.to_string(),
+                );
+                // `resolve(<arg>)`: the referenced name's item kind, if any.
+                if let Some(kind) = self.index.resolve_kind(name) {
+                    facts.insert(("resolve".to_string(), arg.to_string()), kind.to_string());
+                }
+            }
+            // `type_of(<arg>)`: the resolved type name of the argument
+            // expression, where the engine can name it locally — a struct
+            // literal's aggregate type, or a reference resolved to a struct.
+            if let Some(ty) = self.type_of(expr) {
+                facts.insert(("type_of".to_string(), arg.to_string()), ty);
+            }
+            // `resolve(<arg>)` for a struct literal: resolve its aggregate type.
+            if let Expr::StructLit { type_name, .. } = expr {
+                if let Some(kind) = self.index.resolve_kind(type_name) {
+                    facts.insert(("resolve".to_string(), arg.to_string()), kind.to_string());
+                }
+            }
+        }
+        facts
+    }
+
+    /// The locally-nameable resolved type of `expr` for `type_of`: a struct
+    /// literal's aggregate type name, or a reference to a top-level const/struct
+    /// whose type the index can name. Returns `None` when the type is not
+    /// locally determinable (the engine never guesses).
+    fn type_of(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::StructLit { type_name, .. } => Some(type_name.clone()),
+            Expr::Ref(name) => match self.index.item(name) {
+                Some(crate::ast::Item::Const { ty, .. }) => type_of_type_name(ty),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
     /// Renders a named slot definition (the `expr` table, or a helper slot)
     /// against the current expression context.
     fn render_named_slot(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        let slot = self
-            .lang
-            .function
-            .slots
-            .get(name)
-            .cloned()
-            .ok_or_else(|| EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: name.to_string(),
-            })?;
+        let slot =
+            self.lang
+                .function
+                .slots
+                .get(name)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
 
         let ctx = self.ctx();
         let outcome = match &slot {
@@ -1067,6 +1401,7 @@ impl<'a> ExprResolver<'a> {
         let mut resolver = ExprResolver {
             expr: child,
             lang: self.lang,
+            index: self.index,
             scope: ExprScope::Node,
         };
         let inner = resolver.render_named_slot("expr")?;
@@ -1090,7 +1425,7 @@ impl<'a> ExprResolver<'a> {
             // dispatch (an initializer is a value position — a bare function
             // name here is the fnptr-value convention).
             (ExprScope::Field(init), "name") => Ok(Rendered::text(init.name.clone())),
-            (ExprScope::Field(init), "value") => emit_expr(&init.value, self.lang),
+            (ExprScope::Field(init), "value") => emit_expr(&init.value, self.lang, self.index),
             // Operator spelling.
             (ExprScope::Node, "op") => match self.expr {
                 Expr::Unary { op, .. } => unary_op_spelling(*op, self.lang).map(Rendered::text),
@@ -1133,7 +1468,7 @@ impl<'a> ExprResolver<'a> {
                 }
             }
             (ExprScope::Node, "ty") => match self.expr {
-                Expr::Cast { ty, .. } => resolve_type(ty, self.lang),
+                Expr::Cast { ty, .. } => resolve_type(ty, self.lang, self.index),
                 _ => self.unknown_slot(name),
             },
             // A struct literal's aggregate type name.
@@ -1181,6 +1516,7 @@ impl<'a> ExprResolver<'a> {
             let mut elem_resolver = ExprResolver {
                 expr: self.expr,
                 lang: self.lang,
+                index: self.index,
                 scope: ExprScope::Arg(elem),
             };
             let slot = self
@@ -1196,6 +1532,8 @@ impl<'a> ExprResolver<'a> {
             let ctx = RenderContext {
                 first: i == 0,
                 last: i + 1 == len,
+                meta: elem.meta().clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
             let outcome = match &slot {
@@ -1240,6 +1578,7 @@ impl<'a> ExprResolver<'a> {
             let mut elem_resolver = ExprResolver {
                 expr: self.expr,
                 lang: self.lang,
+                index: self.index,
                 scope: ExprScope::Field(init),
             };
             let slot = self
@@ -1255,6 +1594,8 @@ impl<'a> ExprResolver<'a> {
             let ctx = RenderContext {
                 first: i == 0,
                 last: i + 1 == len,
+                meta: init.meta.clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
             let outcome = match &slot {
@@ -1285,6 +1626,11 @@ impl<'a> SlotResolver for ExprResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        // Special slots (metadata + closed render helpers) are recognized first,
+        // before engine-bound and named-slot resolution.
+        if let Some(special) = parse_special_slot(name) {
+            return self.render_special(name, special);
+        }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
             // Route the sequence to the matching AST collection: a call's
@@ -1302,6 +1648,94 @@ impl<'a> SlotResolver for ExprResolver<'a> {
     }
 }
 
+impl<'a> ExprResolver<'a> {
+    /// The raw sub-expression bound to an engine sub-slot `arg` of the current
+    /// node, for the render helpers to operate on (the helper needs the *node*,
+    /// not its rendered text — e.g. `resolve_fnptr(value)` needs the fnptr
+    /// reference expression, `escape(value, c)` needs the string literal).
+    fn sub_expr(&self, arg: &str) -> Option<&'a Expr> {
+        match (&self.scope, arg) {
+            // A struct-literal field-initializer element's value.
+            (ExprScope::Field(init), "value") => Some(&init.value),
+            // A call-argument element's value.
+            (ExprScope::Arg(e), "value") => Some(e),
+            // The expression node's own single sub-expressions.
+            (ExprScope::Node, "value") => match self.expr {
+                Expr::Cast { value, .. } => Some(value),
+                // A literal's own contents are the "value" for `escape(value,…)`.
+                Expr::StringLiteral(_) | Expr::CharLiteral(_) => Some(self.expr),
+                _ => None,
+            },
+            (ExprScope::Node, "operand") => match self.expr {
+                Expr::Unary { operand, .. } => Some(operand),
+                _ => None,
+            },
+            (ExprScope::Node, "lhs") => match self.expr {
+                Expr::Binary { lhs, .. } => Some(lhs),
+                _ => None,
+            },
+            (ExprScope::Node, "rhs") => match self.expr {
+                Expr::Binary { rhs, .. } => Some(rhs),
+                _ => None,
+            },
+            (ExprScope::Node, "callee") => match self.expr {
+                Expr::Call { callee, .. } => Some(callee),
+                _ => None,
+            },
+            // `self` refers to the current expression node itself, letting a
+            // def write `resolve_fnptr(self)` when the node *is* the fnptr ref.
+            (ExprScope::Node, "self") => Some(self.expr),
+            _ => None,
+        }
+    }
+
+    /// Renders a [`SpecialSlot`] (metadata slot or a closed render helper) in
+    /// expression scope.
+    fn render_special(
+        &self,
+        name: &str,
+        special: SpecialSlot<'_>,
+    ) -> Result<Rendered, EmitError> {
+        match special {
+            SpecialSlot::Meta(key) => Ok(render_meta_slot(self.node_meta(), key)),
+            SpecialSlot::ResolveFnptr(arg) => {
+                let expr = self.sub_expr(arg).ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
+                render_resolve_fnptr(expr, self.lang, self.index, name)
+            }
+            SpecialSlot::Escape { arg, style } => {
+                let expr = self.sub_expr(arg).ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
+                render_escape(expr, style, self.lang, name)
+            }
+            SpecialSlot::FieldType { struct_name, field } => {
+                match self.index.field_type(struct_name, field) {
+                    Some(ty) => resolve_type(ty, self.lang, self.index),
+                    None => Err(EmitError::UnknownSlot {
+                        target: self.lang.name.clone(),
+                        slot: name.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The metadata of the node currently in scope (the field-init/arg element's
+    /// metadata, or the expression node's own — only `StructLit` carries inline
+    /// metadata; others are empty).
+    fn node_meta(&self) -> &crate::ast::Meta {
+        match &self.scope {
+            ExprScope::Field(init) => &init.meta,
+            ExprScope::Arg(e) => e.meta(),
+            ExprScope::Node => self.expr.meta(),
+        }
+    }
+}
+
 /// Resolves a Lamina type to its rendered target spelling.
 ///
 /// - [`Type::Primitive`] resolves via the capability matrix.
@@ -1311,7 +1745,7 @@ impl<'a> SlotResolver for ExprResolver<'a> {
 ///   then rendered via the language definition's `### pointer` / `### fnptr`
 ///   slot, whose sub-slots (`pointee`, `params`, `ret`) resolve in
 ///   [`SlotScope::Type`].
-fn resolve_type(ty: &Type, lang: &LanguageDef) -> Result<Rendered, EmitError> {
+fn resolve_type(ty: &Type, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
     match ty {
         Type::Primitive(primitive) => resolve_primitive(*primitive, lang).map(Rendered::text),
         Type::Named(name) => Ok(Rendered::text(name.clone())),
@@ -1319,11 +1753,11 @@ fn resolve_type(ty: &Type, lang: &LanguageDef) -> Result<Rendered, EmitError> {
             // A pointer is only expressible where the `ptr` primitive is not
             // forbidden.
             gate_primitive(Primitive::Ptr, lang)?;
-            render_type_slot("pointer", ty, lang)
+            render_type_slot("pointer", ty, lang, index)
         }
         Type::FnPtr { .. } => {
             gate_primitive(Primitive::Fnptr, lang)?;
-            render_type_slot("fnptr", ty, lang)
+            render_type_slot("fnptr", ty, lang, index)
         }
     }
 }
@@ -1349,10 +1783,16 @@ fn gate_primitive(primitive: Primitive, lang: &LanguageDef) -> Result<(), EmitEr
 
 /// Renders a compound type via the language definition's named slot
 /// (`pointer` / `fnptr`), resolving its sub-slots in [`SlotScope::Type`].
-fn render_type_slot(slot: &str, ty: &Type, lang: &LanguageDef) -> Result<Rendered, EmitError> {
+fn render_type_slot(
+    slot: &str,
+    ty: &Type,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<Rendered, EmitError> {
     let mut resolver = TypeResolver {
         ty,
         lang,
+        index,
         scope: TypeScope::Compound,
     };
     resolver.render_named_slot(slot)
@@ -1373,6 +1813,7 @@ enum TypeScope<'a> {
 struct TypeResolver<'a> {
     ty: &'a Type,
     lang: &'a LanguageDef,
+    index: &'a UnitIndex<'a>,
     scope: TypeScope<'a>,
 }
 
@@ -1388,16 +1829,16 @@ impl<'a> TypeResolver<'a> {
     /// Renders a named slot definition (the `pointer`/`fnptr` template or table)
     /// against an empty context — type slots do not branch on function facts.
     fn render_named_slot(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        let slot = self
-            .lang
-            .function
-            .slots
-            .get(name)
-            .cloned()
-            .ok_or_else(|| EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: name.to_string(),
-            })?;
+        let slot =
+            self.lang
+                .function
+                .slots
+                .get(name)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                })?;
 
         let ctx = RenderContext::default();
         let outcome = match &slot {
@@ -1423,20 +1864,20 @@ impl<'a> TypeResolver<'a> {
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
         match (&self.scope, name) {
             (TypeScope::Compound, "pointee") => match self.ty {
-                Type::Pointer(inner) => resolve_type(inner, self.lang),
+                Type::Pointer(inner) => resolve_type(inner, self.lang, self.index),
                 _ => Err(EmitError::UnknownSlot {
                     target: self.lang.name.clone(),
                     slot: name.to_string(),
                 }),
             },
             (TypeScope::Compound, "ret") => match self.ty {
-                Type::FnPtr { ret, .. } => resolve_type(ret, self.lang),
+                Type::FnPtr { ret, .. } => resolve_type(ret, self.lang, self.index),
                 _ => Err(EmitError::UnknownSlot {
                     target: self.lang.name.clone(),
                     slot: name.to_string(),
                 }),
             },
-            (TypeScope::Param(elem), "type") => resolve_type(elem, self.lang),
+            (TypeScope::Param(elem), "type") => resolve_type(elem, self.lang, self.index),
             _ => Err(EmitError::UnknownSlot {
                 target: self.lang.name.clone(),
                 slot: name.to_string(),
@@ -1463,6 +1904,7 @@ impl<'a> TypeResolver<'a> {
             let mut elem_resolver = TypeResolver {
                 ty: self.ty,
                 lang: self.lang,
+                index: self.index,
                 scope: TypeScope::Param(elem),
             };
             let slot = self
@@ -1508,6 +1950,11 @@ impl<'a> SlotResolver for TypeResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
+            // Types carry no metadata in the current kernel, so this renders
+            // empty; the channel is present so a def can reference it uniformly.
+            return Ok(render_meta_slot(self.ty.meta(), key));
+        }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
             Some(SlotShape::Sequence { item_slot, .. }) => self.render_params(&item_slot),
@@ -1649,14 +2096,17 @@ mod tests {
                 Param {
                     name: "a".to_string(),
                     ty: Type::Primitive(crate::ast::Primitive::I32),
+                    meta: crate::ast::Meta::new(),
                 },
                 Param {
                     name: "b".to_string(),
                     ty: Type::Primitive(crate::ast::Primitive::I32),
+                    meta: crate::ast::Meta::new(),
                 },
             ],
             return_type: Type::Primitive(crate::ast::Primitive::I32),
             body: vec![Statement::Return(Some(Expr::IntLiteral("0".to_string())))],
+            meta: crate::ast::Meta::new(),
         };
         let file = File {
             items: vec![Item::Function(func)],
@@ -1680,6 +2130,7 @@ mod tests {
                 Statement::Return(Some(Expr::IntLiteral("1".to_string()))),
                 Statement::Return(Some(Expr::IntLiteral("2".to_string()))),
             ],
+            meta: crate::ast::Meta::new(),
         };
         let file = File {
             items: vec![Item::Function(func)],
@@ -1841,6 +2292,7 @@ mod tests {
                 params: vec![],
                 return_type: ret,
                 body: vec![Statement::Return(Some(Expr::IntLiteral("0".to_string())))],
+                meta: crate::ast::Meta::new(),
             })],
         }
     }
@@ -1898,7 +2350,8 @@ mod tests {
     fn pointer_forbidden_when_ptr_forbidden() {
         // A target that forbids `ptr` cannot express a `Pointer` type.
         let mut lang = rust_types();
-        lang.capabilities.insert(Primitive::Ptr, crate::lang::Capability::Forbid);
+        lang.capabilities
+            .insert(Primitive::Ptr, crate::lang::Capability::Forbid);
         let file = file_returning(Type::Pointer(Box::new(Type::Primitive(Primitive::I32))));
         let err = emit(&file, &lang).expect_err("ptr forbidden");
         assert!(matches!(
@@ -1910,7 +2363,8 @@ mod tests {
     #[test]
     fn fnptr_forbidden_when_fnptr_forbidden() {
         let mut lang = rust_types();
-        lang.capabilities.insert(Primitive::Fnptr, crate::lang::Capability::Forbid);
+        lang.capabilities
+            .insert(Primitive::Fnptr, crate::lang::Capability::Forbid);
         let file = file_returning(Type::FnPtr {
             params: vec![],
             ret: Box::new(Type::Primitive(Primitive::Void)),
@@ -1939,6 +2393,7 @@ mod tests {
                 params: vec![],
                 return_type: Type::Primitive(Primitive::I32),
                 body: vec![Statement::Return(Some(expr))],
+                meta: crate::ast::Meta::new(),
             })],
         };
         let out = emit(&file, lang)?;
@@ -1953,7 +2408,10 @@ mod tests {
 
     #[test]
     fn int_literal_renders() {
-        assert_eq!(emit_returned(Expr::IntLiteral("42".into()), &rust()).unwrap(), "42");
+        assert_eq!(
+            emit_returned(Expr::IntLiteral("42".into()), &rust()).unwrap(),
+            "42"
+        );
     }
 
     #[test]
@@ -1966,8 +2424,14 @@ mod tests {
 
     #[test]
     fn bool_literal_renders() {
-        assert_eq!(emit_returned(Expr::BoolLiteral(true), &rust()).unwrap(), "true");
-        assert_eq!(emit_returned(Expr::BoolLiteral(false), &rust()).unwrap(), "false");
+        assert_eq!(
+            emit_returned(Expr::BoolLiteral(true), &rust()).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            emit_returned(Expr::BoolLiteral(false), &rust()).unwrap(),
+            "false"
+        );
     }
 
     #[test]
@@ -1981,12 +2445,18 @@ mod tests {
 
     #[test]
     fn char_literal_renders_quoted_by_the_def() {
-        assert_eq!(emit_returned(Expr::CharLiteral("x".into()), &rust()).unwrap(), "'x'");
+        assert_eq!(
+            emit_returned(Expr::CharLiteral("x".into()), &rust()).unwrap(),
+            "'x'"
+        );
     }
 
     #[test]
     fn ref_renders() {
-        assert_eq!(emit_returned(Expr::Ref("count".into()), &rust()).unwrap(), "count");
+        assert_eq!(
+            emit_returned(Expr::Ref("count".into()), &rust()).unwrap(),
+            "count"
+        );
     }
 
     #[test]
@@ -2127,7 +2597,8 @@ mod tests {
     fn null_follows_ptr_forbidden_errors() {
         // A target that forbids `ptr` must forbid `null` too.
         let mut lang = rust();
-        lang.capabilities.insert(Primitive::Ptr, crate::lang::Capability::Forbid);
+        lang.capabilities
+            .insert(Primitive::Ptr, crate::lang::Capability::Forbid);
         let err = emit_returned(Expr::NullLiteral, &lang).expect_err("null forbidden");
         assert!(matches!(
             err,
@@ -2236,6 +2707,7 @@ mod tests {
                 params: vec![],
                 return_type: Type::Primitive(Primitive::Void),
                 body,
+                meta: crate::ast::Meta::new(),
             })],
         };
         emit(&file, &cish()).expect("emit")
@@ -2251,10 +2723,10 @@ mod tests {
     #[test]
     fn bare_return_and_return_value_dispatch() {
         assert!(emit_fn_body(vec![Statement::Return(None)]).contains("return;"));
-        assert!(emit_fn_body(vec![Statement::Return(Some(Expr::IntLiteral(
-            "7".into()
-        )))])
-        .contains("return 7;"));
+        assert!(
+            emit_fn_body(vec![Statement::Return(Some(Expr::IntLiteral("7".into())))])
+                .contains("return 7;")
+        );
     }
 
     #[test]
@@ -2310,10 +2782,12 @@ mod tests {
                 SwitchCase {
                     value: Expr::IntLiteral("1".into()),
                     body: vec![Statement::Break],
+                    meta: crate::ast::Meta::new(),
                 },
                 SwitchCase {
                     value: Expr::IntLiteral("2".into()),
                     body: vec![Statement::Break],
+                    meta: crate::ast::Meta::new(),
                 },
             ],
             default: None,
@@ -2355,6 +2829,7 @@ mod tests {
                     cases: vec![],
                     default: None,
                 }],
+                meta: crate::ast::Meta::new(),
             })],
         };
         let err = emit(&file, &lang).expect_err("switch forbidden");
@@ -2450,17 +2925,23 @@ mod tests {
                     name: "x".into(),
                     ty: Type::Primitive(Primitive::I32),
                     visibility: Visibility::Public,
+                    meta: crate::ast::Meta::new(),
                 },
                 Field {
                     name: "y".into(),
                     ty: Type::Primitive(Primitive::I32),
                     visibility: Visibility::Private,
+                    meta: crate::ast::Meta::new(),
                 },
             ],
+            meta: crate::ast::Meta::new(),
         });
         // Public struct -> `pub`; each field carries its own vis; the second
         // field prepends its own `,\n` separator via the `!first` loop fact.
-        assert_eq!(out, "pub struct P {\n    pub x: i32,\n    y: i32\n}", "got: {out}");
+        assert_eq!(
+            out, "pub struct P {\n    pub x: i32,\n    y: i32\n}",
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -2468,10 +2949,8 @@ mod tests {
         let out = emit_one(Item::Enum {
             name: "E".into(),
             visibility: Visibility::Private,
-            variants: vec![
-                Variant { name: "A".into() },
-                Variant { name: "B".into() },
-            ],
+            variants: vec![Variant { name: "A".into() , meta: crate::ast::Meta::new() }, Variant { name: "B".into() , meta: crate::ast::Meta::new() }],
+            meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "enum E {\n    A,\n    B\n}", "got: {out}");
     }
@@ -2481,6 +2960,7 @@ mod tests {
         let out = emit_one(Item::TypeDef {
             name: "Id".into(),
             target: Type::Primitive(Primitive::I32),
+            meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "type Id = i32;");
     }
@@ -2492,6 +2972,7 @@ mod tests {
             ty: Type::Primitive(Primitive::I32),
             value: Expr::IntLiteral("7".into()),
             visibility: Visibility::Public,
+            meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "const K: i32 = 7;");
     }
@@ -2500,6 +2981,7 @@ mod tests {
     fn use_renders_path_verbatim() {
         let out = emit_one(Item::Use {
             path: "a::b::c".into(),
+            meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "use a::b::c;");
     }
@@ -2507,9 +2989,7 @@ mod tests {
     #[test]
     fn mixed_file_renders_items_in_order() {
         let items = vec![
-            Item::Use {
-                path: "std".into(),
-            },
+            Item::Use { path: "std".into() , meta: crate::ast::Meta::new() },
             Item::Function(Function {
                 name: "f".into(),
                 visibility: Visibility::Private,
@@ -2517,6 +2997,7 @@ mod tests {
                 params: vec![],
                 return_type: Type::Primitive(Primitive::Void),
                 body: vec![Statement::Return(Some(Expr::IntLiteral("0".into())))],
+                meta: crate::ast::Meta::new(),
             }),
         ];
         let out = emit(&File { items }, &itemish()).expect("emit");
@@ -2528,9 +3009,7 @@ mod tests {
         // The rust `RUST_DEF` in this module has no item sections at all, so
         // emitting any non-function item is a clean UnknownItem error.
         let file = File {
-            items: vec![Item::Use {
-                path: "x".into(),
-            }],
+            items: vec![Item::Use { path: "x".into() , meta: crate::ast::Meta::new() }],
         };
         let err = emit(&file, &rust()).expect_err("no item sections");
         assert!(

@@ -49,6 +49,7 @@ fn emit_body(body: Vec<Statement>, lang: &LanguageDef) -> Result<String, EmitErr
             params: vec![],
             return_type: Type::Primitive(Primitive::I32),
             body,
+            meta: lamina_core::ast::Meta::new(),
         })],
     };
     emit(&file, lang)
@@ -96,11 +97,13 @@ fn compound_add_idiom_emits_plus_equals() {
     )
     .expect("lvalue");
     let out_rust = emit_body(vec![assign.clone()], &rust()).unwrap();
-    assert_eq!(out_rust, "fn f() -> i32 {\n    x += 1;\n}", "got: {out_rust}");
+    assert_eq!(
+        out_rust, "fn f() -> i32 {\n    x += 1;\n}",
+        "got: {out_rust}"
+    );
     let out_ts = emit_body(vec![assign], &ts()).unwrap();
     assert_eq!(
-        out_ts,
-        "function f(): number {\n    x += 1;\n}",
+        out_ts, "function f(): number {\n    x += 1;\n}",
         "got: {out_ts}"
     );
 }
@@ -171,6 +174,7 @@ fn emit_returned(expr: Expr, lang: &LanguageDef) -> Result<String, EmitError> {
             params: vec![],
             return_type: Type::Primitive(Primitive::I32),
             body: vec![Statement::Return(Some(expr))],
+            meta: lamina_core::ast::Meta::new(),
         })],
     };
     let out = emit(&file, lang)?;
@@ -216,12 +220,15 @@ fn struct_literal_renders_per_target() {
             FieldInit {
                 name: "balance".into(),
                 value: Expr::IntLiteral("0".into()),
+                meta: lamina_core::ast::Meta::new(),
             },
             FieldInit {
                 name: "deposit".into(),
                 value: Expr::IntLiteral("100".into()),
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(
         emit_returned(lit.clone(), &rust()).unwrap(),
@@ -239,6 +246,7 @@ fn empty_struct_literal_renders() {
     let lit = Expr::StructLit {
         type_name: "Unit".into(),
         fields: vec![],
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_returned(lit.clone(), &rust()).unwrap(), "Unit {  }");
     assert_eq!(emit_returned(lit, &ts()).unwrap(), "{  }");
@@ -257,7 +265,9 @@ fn function_name_as_fnptr_field_value_renders_as_identifier() {
         fields: vec![FieldInit {
             name: "deposit".into(),
             value: r("account_deposit"),
+            meta: lamina_core::ast::Meta::new(),
         }],
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(
         emit_returned(lit.clone(), &rust()).unwrap(),
@@ -285,7 +295,9 @@ fn fnptr_field_is_gated_by_fnptr_capability() {
                 ret: Box::new(Type::Primitive(Primitive::Void)),
             },
             visibility: Visibility::Public,
+            meta: lamina_core::ast::Meta::new(),
         }],
+        meta: lamina_core::ast::Meta::new(),
     };
     let file = File {
         items: vec![struct_item],
@@ -296,7 +308,8 @@ fn fnptr_field_is_gated_by_fnptr_capability() {
 
     // Force `fnptr` forbidden -> declaring the field's type fails.
     let mut lang = rust();
-    lang.capabilities.insert(Primitive::Fnptr, Capability::Forbid);
+    lang.capabilities
+        .insert(Primitive::Fnptr, Capability::Forbid);
     let err = emit(&file, &lang).expect_err("fnptr forbidden");
     assert!(
         matches!(err, EmitError::ForbiddenPrimitive { ref primitive, .. } if primitive == "fnptr"),

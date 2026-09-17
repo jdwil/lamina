@@ -64,18 +64,20 @@ fn struct_with_fields_renders_rust() {
                 name: "x".to_string(),
                 ty: i32t(),
                 visibility: Visibility::Public,
+                meta: lamina_core::ast::Meta::new(),
             },
             Field {
                 name: "y".to_string(),
                 ty: i32t(),
                 visibility: Visibility::Private,
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     let out = emit_items(vec![item], &rust());
     assert_eq!(
-        out,
-        "pub struct Point {\n    pub x: i32,\n    y: i32,\n}",
+        out, "pub struct Point {\n    pub x: i32,\n    y: i32,\n}",
         "got: {out}"
     );
 }
@@ -90,20 +92,22 @@ fn struct_with_fields_renders_ts_interface() {
                 name: "x".to_string(),
                 ty: i32t(),
                 visibility: Visibility::Public,
+                meta: lamina_core::ast::Meta::new(),
             },
             Field {
                 name: "y".to_string(),
                 ty: i32t(),
                 visibility: Visibility::Private,
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     let out = emit_items(vec![item], &ts());
     // i32 widens to number in TS; a public struct maps to an exported
     // interface. Fields carry their own trailing `;` and separator newline.
     assert_eq!(
-        out,
-        "export interface Point {\n    x: number;\n    y: number;\n}",
+        out, "export interface Point {\n    x: number;\n    y: number;\n}",
         "got: {out}"
     );
 }
@@ -114,6 +118,7 @@ fn empty_struct_renders() {
         name: "Empty".to_string(),
         visibility: Visibility::Private,
         fields: vec![],
+        meta: lamina_core::ast::Meta::new(),
     };
     let out = emit_items(vec![item], &rust());
     assert_eq!(out, "struct Empty {\n    \n}", "got: {out}");
@@ -129,25 +134,27 @@ fn enum_of_variants_renders() {
         variants: vec![
             Variant {
                 name: "Red".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Green".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Blue".to_string(),
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
+        meta: lamina_core::ast::Meta::new(),
     };
     let rust_out = emit_items(vec![item.clone()], &rust());
     assert_eq!(
-        rust_out,
-        "pub enum Color {\n    Red,\n    Green,\n    Blue,\n}",
+        rust_out, "pub enum Color {\n    Red,\n    Green,\n    Blue,\n}",
         "got: {rust_out}"
     );
     let ts_out = emit_items(vec![item], &ts());
     assert_eq!(
-        ts_out,
-        "export enum Color {\n    Red,\n    Green,\n    Blue,\n}",
+        ts_out, "export enum Color {\n    Red,\n    Green,\n    Blue,\n}",
         "got: {ts_out}"
     );
 }
@@ -159,6 +166,7 @@ fn typedef_renders() {
     let item = Item::TypeDef {
         name: "Id".to_string(),
         target: i32t(),
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_items(vec![item.clone()], &rust()), "type Id = i32;");
     // i32 widens to number in TS.
@@ -174,6 +182,7 @@ fn const_renders() {
         ty: i32t(),
         value: Expr::IntLiteral("100".to_string()),
         visibility: Visibility::Public,
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(
         emit_items(vec![item.clone()], &rust()),
@@ -191,10 +200,12 @@ fn const_renders() {
 fn use_renders() {
     let item = Item::Use {
         path: "std::io".to_string(),
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_items(vec![item.clone()], &rust()), "use std::io;");
     let ts_item = Item::Use {
         path: "\"fs\"".to_string(),
+        meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_items(vec![ts_item], &ts()), "import \"fs\";");
 }
@@ -211,6 +222,7 @@ fn interleaved_struct_and_functions_render_in_order() {
             params: vec![],
             return_type: i32t(),
             body: vec![Statement::Return(Some(Expr::IntLiteral(ret.to_string())))],
+            meta: lamina_core::ast::Meta::new(),
         })
     };
     let items = vec![
@@ -222,7 +234,9 @@ fn interleaved_struct_and_functions_render_in_order() {
                 name: "n".to_string(),
                 ty: i32t(),
                 visibility: Visibility::Private,
+                meta: lamina_core::ast::Meta::new(),
             }],
+            meta: lamina_core::ast::Meta::new(),
         },
         func("second", "2"),
     ];
@@ -266,6 +280,7 @@ fn item_without_section_errors_cleanly() {
     let file = File {
         items: vec![Item::Use {
             path: "x".to_string(),
+            meta: lamina_core::ast::Meta::new(),
         }],
     };
     let err = emit(&file, &lang).expect_err("no Use section");

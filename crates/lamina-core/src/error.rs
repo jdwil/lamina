@@ -42,7 +42,9 @@ pub enum ParseError {
 pub enum LangDocError {
     /// The document did not begin with the required title line
     /// `# Lamina Language Definition: <name>`.
-    #[error("expected title line `# Lamina Language Definition: <name>` on line 1, found {found:?}")]
+    #[error(
+        "expected title line `# Lamina Language Definition: <name>` on line 1, found {found:?}"
+    )]
     MissingTitle {
         /// The actual first non-empty line (or empty string if the document was
         /// empty).
@@ -117,7 +119,9 @@ pub enum LangDocError {
 
     /// A capability line used an action that is not one of `identity`, `alias`,
     /// `widen`, `wrap`, or `forbid`.
-    #[error("unknown capability action {action:?} (expected identity, alias, widen, wrap, or forbid)")]
+    #[error(
+        "unknown capability action {action:?} (expected identity, alias, widen, wrap, or forbid)"
+    )]
     UnknownAction {
         /// The unrecognized action.
         action: String,

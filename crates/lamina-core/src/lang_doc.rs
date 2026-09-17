@@ -350,6 +350,17 @@ fn validate_slot_graph(
         }
         visited.push((name.clone(), scope));
 
+        // Special slots (Part 1/2): a metadata slot `{meta.<key>}` or a call to
+        // a closed render helper (`resolve_fnptr(...)`, `escape(..., style)`).
+        // These are engine-provided and resolve at render time; they need no
+        // `### <slot>` subsection and reference no further slots to validate.
+        // The helper *set* is closed (recognized by name); an argument names an
+        // engine sub-slot resolved within the current scope, so nothing further
+        // is added to the work list.
+        if is_special_slot(&name) {
+            continue;
+        }
+
         match slot_binding(&name, scope) {
             Some(SlotShape::Scalar) => {
                 // Resolves directly; references nothing further.
@@ -360,10 +371,12 @@ fn validate_slot_graph(
             }) => {
                 // The item slot subsection must exist, and its referenced slots
                 // are validated in the element scope.
-                let def = slots.get(&item_slot).ok_or_else(|| LangDocError::MissingItemSlot {
-                    collection: name.clone(),
-                    item: item_slot.clone(),
-                })?;
+                let def = slots
+                    .get(&item_slot)
+                    .ok_or_else(|| LangDocError::MissingItemSlot {
+                        collection: name.clone(),
+                        item: item_slot.clone(),
+                    })?;
                 for r in referenced_by(def) {
                     work.push((r, item_scope));
                 }
@@ -371,9 +384,9 @@ fn validate_slot_graph(
             None => {
                 // Must be satisfied by a subsection; its references stay in the
                 // same scope (function-level helper slots like `ret`, `vis`).
-                let def = slots.get(&name).ok_or_else(|| LangDocError::UnknownSlotReference {
-                    slot: name.clone(),
-                })?;
+                let def = slots
+                    .get(&name)
+                    .ok_or_else(|| LangDocError::UnknownSlotReference { slot: name.clone() })?;
                 for r in referenced_by(def) {
                     work.push((r, scope));
                 }
@@ -381,6 +394,22 @@ fn validate_slot_graph(
         }
     }
     Ok(())
+}
+
+/// Returns `true` if `name` is a special (engine-provided) slot form rather
+/// than an engine-bound AST slot or a `### <slot>` subsection: a metadata slot
+/// `meta.<key>`, or a call to a closed render helper (`resolve_fnptr(<arg>)` /
+/// `escape(<arg>, <style>)`). These resolve at render time and need no
+/// subsection, so slot-graph validation treats them as satisfied.
+///
+/// The helper set is CLOSED: only these names are recognized. A misspelled
+/// helper (e.g. `resolv_fnptr(x)`) does not match and falls through to the
+/// normal path, which reports it as an unknown slot reference.
+fn is_special_slot(name: &str) -> bool {
+    (name.starts_with("meta.") && name.len() > "meta.".len())
+        || (name.starts_with("resolve_fnptr(") && name.ends_with(')'))
+        || (name.starts_with("escape(") && name.ends_with(')'))
+        || (name.starts_with("field_type(") && name.ends_with(')'))
 }
 
 /// The slot names referenced by a slot definition's template(s).
@@ -473,17 +502,14 @@ fn parse_outcome_cell(table: &str, cell: &str) -> Result<Outcome, LangDocError> 
     // is exactly equivalent to a template of `{name}`, reusing the normal
     // slot-resolution + load-time validation path.
     if let Some(name) = cell.strip_prefix('@') {
-        let is_ident = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let is_ident =
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if is_ident {
-            let template = Template::parse(&format!("{{{name}}}")).map_err(|e| {
-                LangDocError::BadTemplate {
+            let template =
+                Template::parse(&format!("{{{name}}}")).map_err(|e| LangDocError::BadTemplate {
                     table: table.to_string(),
                     detail: e.to_string(),
-                }
-            })?;
+                })?;
             return Ok(Outcome::Render(template));
         }
         return Err(LangDocError::UnquotedTemplate {
@@ -567,9 +593,7 @@ fn unescape(s: &str) -> String {
 ///
 /// Returns a [`LangDocError`] on a malformed row, unknown primitive/action, or
 /// a missing required target.
-pub fn parse_capability_table(
-    table: &str,
-) -> Result<HashMap<Primitive, Capability>, LangDocError> {
+pub fn parse_capability_table(table: &str) -> Result<HashMap<Primitive, Capability>, LangDocError> {
     let mut capabilities = HashMap::new();
 
     for raw in table.lines() {
@@ -865,7 +889,10 @@ mod tests {
             ### vis\n```template\npub \n```\n\n\
             ### statement\n| When | Template |\n|------|----------|\n| stmt is return | @ret_stmt |\n| else | forbid |\n\n\
             ### ret_stmt\n```template\nreturn {value};\n```");
-        assert!(parse_language_def(&ok).is_ok(), "resolvable @ref should parse");
+        assert!(
+            parse_language_def(&ok).is_ok(),
+            "resolvable @ref should parse"
+        );
 
         let dangling = mk("```template\n{vis}fn {name}() {{ {body} }}\n```\n\n\
             ### vis\n```template\npub \n```\n\n\
@@ -921,7 +948,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_title() {
-        let doc = "## Function\n\n```template\n{name}\n```\n## Capabilities\n| i32 | identity | i32 |\n";
+        let doc =
+            "## Function\n\n```template\n{name}\n```\n## Capabilities\n| i32 | identity | i32 |\n";
         assert!(matches!(
             parse_language_def(doc),
             Err(LangDocError::MissingTitle { .. })

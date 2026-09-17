@@ -27,8 +27,7 @@ fn shipped_def(file: &str) -> LanguageDef {
     path.push("lamina-defs");
     path.push("languages");
     path.push(file);
-    load_language_def(&path)
-        .unwrap_or_else(|e| panic!("shipped def {file} should load: {e}"))
+    load_language_def(&path).unwrap_or_else(|e| panic!("shipped def {file} should load: {e}"))
 }
 
 fn rust() -> LanguageDef {
@@ -50,6 +49,7 @@ fn emit_body(body: Vec<Statement>, lang: &LanguageDef) -> String {
             params: vec![],
             return_type: Type::Primitive(lamina_core::ast::Primitive::I32),
             body,
+            meta: lamina_core::ast::Meta::new(),
         })],
     };
     emit(&file, lang).unwrap_or_else(|e| panic!("emit failed: {e}"))
@@ -265,10 +265,12 @@ fn switch_with_cases_and_default_ts() {
             SwitchCase {
                 value: int("1"),
                 body: vec![Statement::Return(Some(int("10")))],
+                meta: lamina_core::ast::Meta::new(),
             },
             SwitchCase {
                 value: int("2"),
                 body: vec![Statement::Return(Some(int("20")))],
+                meta: lamina_core::ast::Meta::new(),
             },
         ],
         default: Some(vec![Statement::Return(Some(int("0")))]),
@@ -288,6 +290,7 @@ fn switch_without_default_rust() {
         cases: vec![SwitchCase {
             value: int("1"),
             body: vec![Statement::Break],
+            meta: lamina_core::ast::Meta::new(),
         }],
         default: None,
     }];

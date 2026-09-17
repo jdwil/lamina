@@ -9,9 +9,9 @@
 //! express fails loudly rather than emitting garbage.
 
 use crate::ast::{
-    slot_binding, BinaryOp, Expr, ExprKind, Field, File, Function, Item, ItemKind, Modifier, Param,
-    Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type, UnaryOp, Variant,
-    Visibility,
+    slot_binding, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
+    Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type,
+    UnaryOp, Variant, Visibility,
 };
 use crate::error::EmitError;
 use crate::lang::{ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef};
@@ -530,6 +530,7 @@ fn pred_stmt_kind(kind: StatementKind) -> PredStmtKind {
         StatementKind::Switch => PredStmtKind::Switch,
         StatementKind::Break => PredStmtKind::Break,
         StatementKind::Continue => PredStmtKind::Continue,
+        StatementKind::Assign => PredStmtKind::Assign,
         StatementKind::Expr => PredStmtKind::Expr,
     }
 }
@@ -566,6 +567,18 @@ fn statement_context(
             ctx.has_step = step.is_some();
         }
         Statement::Switch { default, .. } => ctx.has_default = default.is_some(),
+        // An `assign` exposes its `value` sub-part for one-level structural
+        // predicates (Part 2): `value is <kind>`, `value.op is <op>` (when the
+        // value is a binary), and `target eq value.lhs` (structural equality of
+        // the target with the value's left operand). These let a language def
+        // recognize a compound-assignment idiom (`x = x + y` -> `x += y`).
+        Statement::Assign { target, value } => {
+            ctx.sub_value_kind = Some(pred_expr_kind(value.kind()));
+            if let Expr::Binary { op, lhs, .. } = value {
+                ctx.sub_value_op = Some(op.name().to_string());
+                ctx.target_eq_value_lhs = target == lhs.as_ref();
+            }
+        }
         _ => {}
     }
     ctx
@@ -761,6 +774,24 @@ impl<'a> StmtResolver<'a> {
             (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang),
             (Statement::ForEach { iterable, .. }, "iterable") => emit_expr(iterable, self.lang),
             (Statement::Switch { scrutinee, .. }, "scrutinee") => emit_expr(scrutinee, self.lang),
+            // An assignment's target and value.
+            (Statement::Assign { target, .. }, "target") => emit_expr(target, self.lang),
+            (Statement::Assign { value, .. }, "value") => emit_expr(value, self.lang),
+            // One-level structural sub-part slots (Part 2): render a DIRECT
+            // named sub-part of the current statement's `value` when it is a
+            // binary. `value.op` renders the operator spelling; `value.lhs` /
+            // `value.rhs` render the rendered operand. One level only. Used by
+            // a language def to emit a compound-assignment idiom's right
+            // operand (`{value.rhs}` in `{target} += {value.rhs};`).
+            (Statement::Assign { value: Expr::Binary { op, .. }, .. }, "value.op") => {
+                binary_op_spelling(*op, self.lang).map(Rendered::text)
+            }
+            (Statement::Assign { value: Expr::Binary { lhs, .. }, .. }, "value.lhs") => {
+                emit_expr(lhs, self.lang)
+            }
+            (Statement::Assign { value: Expr::Binary { rhs, .. }, .. }, "value.rhs") => {
+                emit_expr(rhs, self.lang)
+            }
             // Nested single statements.
             (Statement::If { else_block: Some(e), .. }, "else") => self.render_nested_statement(e),
             (Statement::For { init: Some(i), .. }, "init") => self.render_nested_statement(i),
@@ -924,6 +955,8 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
         ExprKind::Call => PredExprKind::Call,
         ExprKind::Unary => PredExprKind::Unary,
         ExprKind::Binary => PredExprKind::Binary,
+        ExprKind::Cast => PredExprKind::Cast,
+        ExprKind::StructLit => PredExprKind::StructLit,
     }
 }
 
@@ -955,13 +988,15 @@ fn is_compound(expr: &Expr) -> bool {
     matches!(expr, Expr::Unary { .. } | Expr::Binary { .. })
 }
 
-/// What an [`ExprResolver`] is rendering: an expression node, or one element of
-/// a call's argument list.
+/// What an [`ExprResolver`] is rendering: an expression node, one element of a
+/// call's argument list, or one field initializer of a struct literal.
 enum ExprScope<'a> {
     /// Rendering the expression node itself.
     Node,
     /// Rendering one call-argument element.
     Arg(&'a Expr),
+    /// Rendering one struct-literal field-initializer element.
+    Field(&'a FieldInit),
 }
 
 /// Resolves the slots of an expression (the `### expr` table and its sub-slots),
@@ -979,6 +1014,7 @@ impl<'a> ExprResolver<'a> {
         match self.scope {
             ExprScope::Node => SlotScope::Expr,
             ExprScope::Arg(_) => SlotScope::ExprArg,
+            ExprScope::Field(_) => SlotScope::FieldInit,
         }
     }
 
@@ -1049,6 +1085,12 @@ impl<'a> ExprResolver<'a> {
         match (&self.scope, name) {
             // A call-argument element renders its wrapped expression as `value`.
             (ExprScope::Arg(elem), "value") => self.render_child(elem),
+            // A struct-literal field-initializer element: its field name and
+            // its value expression. The value renders through the full `### expr`
+            // dispatch (an initializer is a value position — a bare function
+            // name here is the fnptr-value convention).
+            (ExprScope::Field(init), "name") => Ok(Rendered::text(init.name.clone())),
+            (ExprScope::Field(init), "value") => emit_expr(&init.value, self.lang),
             // Operator spelling.
             (ExprScope::Node, "op") => match self.expr {
                 Expr::Unary { op, .. } => unary_op_spelling(*op, self.lang).map(Rendered::text),
@@ -1081,6 +1123,22 @@ impl<'a> ExprResolver<'a> {
             },
             (ExprScope::Node, "callee") => match self.expr {
                 Expr::Call { callee, .. } => self.render_child(callee),
+                _ => self.unknown_slot(name),
+            },
+            // A cast's value sub-expression and its target type.
+            (ExprScope::Node, "value") if matches!(self.expr, Expr::Cast { .. }) => {
+                match self.expr {
+                    Expr::Cast { value, .. } => self.render_child(value),
+                    _ => self.unknown_slot(name),
+                }
+            }
+            (ExprScope::Node, "ty") => match self.expr {
+                Expr::Cast { ty, .. } => resolve_type(ty, self.lang),
+                _ => self.unknown_slot(name),
+            },
+            // A struct literal's aggregate type name.
+            (ExprScope::Node, "type_name") => match self.expr {
+                Expr::StructLit { type_name, .. } => Ok(Rendered::text(type_name.clone())),
                 _ => self.unknown_slot(name),
             },
             // Names / literal contents.
@@ -1162,6 +1220,65 @@ impl<'a> ExprResolver<'a> {
         }
         Ok(out)
     }
+
+    /// Loops a struct literal's field initializers, rendering `item_slot`
+    /// (`field_init`) per element with `first`/`last` loop facts, concatenating
+    /// (each element renders its own separators — no engine join).
+    fn render_fields(&mut self, item_slot: &str) -> Result<Rendered, EmitError> {
+        let fields: &'a [FieldInit] = match self.expr {
+            Expr::StructLit { fields, .. } => fields,
+            _ => {
+                return Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: "fields".to_string(),
+                })
+            }
+        };
+        let len = fields.len();
+        let mut out = Rendered::empty();
+        for (i, init) in fields.iter().enumerate() {
+            let mut elem_resolver = ExprResolver {
+                expr: self.expr,
+                lang: self.lang,
+                scope: ExprScope::Field(init),
+            };
+            let slot = self
+                .lang
+                .function
+                .slots
+                .get(item_slot)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: item_slot.to_string(),
+                })?;
+            let ctx = RenderContext {
+                first: i == 0,
+                last: i + 1 == len,
+                ..Default::default()
+            };
+            let outcome = match &slot {
+                SlotDef::Fixed(outcome) => outcome.clone(),
+                SlotDef::Table(table) => table
+                    .select(&ctx)
+                    .ok_or_else(|| EmitError::NoMatchingRow {
+                        target: self.lang.name.clone(),
+                        table: item_slot.to_string(),
+                    })?
+                    .clone(),
+            };
+            let rendered = match outcome {
+                Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                Outcome::Forbid => {
+                    return Err(EmitError::ForbiddenConstruct {
+                        target: self.lang.name.clone(),
+                    })
+                }
+            };
+            out.push(rendered);
+        }
+        Ok(out)
+    }
 }
 
 impl<'a> SlotResolver for ExprResolver<'a> {
@@ -1170,7 +1287,16 @@ impl<'a> SlotResolver for ExprResolver<'a> {
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
-            Some(SlotShape::Sequence { item_slot, .. }) => self.render_args(&item_slot),
+            // Route the sequence to the matching AST collection: a call's
+            // `args` loop the `expr_arg` item slot; a struct literal's `fields`
+            // loop the `field_init` item slot.
+            Some(SlotShape::Sequence { item_slot, .. }) => {
+                if item_slot == "field_init" {
+                    self.render_fields(&item_slot)
+                } else {
+                    self.render_args(&item_slot)
+                }
+            }
             None => self.render_named_slot(name),
         }
     }

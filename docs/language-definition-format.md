@@ -77,6 +77,12 @@ element. The pairing is fixed:
 |-----------------|---------------------------------|
 | `{params}`      | `### param`                     |
 | `{body}`        | `### statement`                 |
+| `{fields}` (in `struct_lit`) | `### field_init`   |
+
+`{fields}` on a struct-literal (construction) expression loops the field
+initializers, rendering `### field_init` per element; within it `{name}` is the
+field name and `{value}` its initializer expression (a value position, so a
+bare function name there is the function-pointer value form).
 
 Referencing `{params}` without a `### param` subsection (or `{body}` without
 `### statement`) is a load-time error.
@@ -208,12 +214,15 @@ or        := and ("||" and)*
 and       := unary ("&&" unary)*
 unary     := "!"? atom
 atom      := fact | "(" or ")"
-fact      := IDENT ("is" IDENT)?
+fact      := path ("is" IDENT | "eq" path)?
+path      := IDENT ("." IDENT)?
 ```
 
-A bare `IDENT` is a boolean fact; `IDENT is IDENT` is an enum query. The fact
-vocabulary is fixed by the engine — a definition may only *use* facts, never
-invent them:
+A bare `IDENT` is a boolean fact; `IDENT is IDENT` is an enum query. A `path`
+is a **one-level** sub-part reference (`value`, `value.op`, `target`) used by
+the structural facts below — only one `.` is allowed, so deeper paths
+(`value.lhs.rhs`) are a syntax error. The fact vocabulary is fixed by the engine
+— a definition may only *use* facts, never invent them:
 
 | Fact | Kind | Holds when |
 |------|------|-----------|
@@ -223,6 +232,69 @@ invent them:
 | `vis is public` / `vis is protected` / `vis is private` | enum | the visibility level |
 | `caller is async` / `caller is sync` | enum | the enclosing callable's synchrony (inherited) |
 | `first` / `last` | bool | this element is the first / last in the collection being looped (only meaningful inside an item slot) |
+| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit`) |
+| `stmt is <kind>` | enum | the statement being rendered is that kind (`block` `let` `return` `if` `while` `for` `foreach` `switch` `break` `continue` `assign` `expr`) |
+| `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use`) |
+| `has_value` `has_type` `has_else` `has_init` `has_cond` `has_step` `has_default` | bool | the statement carries that optional sub-part |
+| `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
+| `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
+| `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
+
+### One-Level Structural Predicates (Idiom Recognition)
+
+A language definition can recognize desugared idioms and emit their native form
+using a **bounded, one-level** view of the current node's immediate sub-parts.
+This is a purely *local* decision on the node being rendered — consistent with
+the recursive model — and stays non-Turing-complete because the vocabulary is
+closed: the engine defines which sub-part names, kinds, ops, and equality
+pairings are answerable; a definition only *composes* them with `&&`/`||`/`!`.
+
+Three structural query forms exist (all one level deep — no `a.b.c`):
+
+1. **Sub-part kind:** `value is binary` — the [dispatch kind](#when-predicates)
+   of a direct named sub-part (currently the `value` of an `assign`).
+2. **Sub-part operator:** `value.op is add` — the binary operator (machine
+   name) of the `value` sub-part, when it is a binary.
+3. **Structural equality:** `target eq value.lhs` — whether two one-level
+   sub-parts are structurally identical.
+
+To *render* a matched sub-part, one-level sub-part **slots** are exposed too:
+`{value.op}`, `{value.lhs}`, `{value.rhs}` resolve to the rendered sub-part
+when the current node's `value` is a binary (same one-level rule). This lets a
+target author compound assignment entirely in the definition — see the example
+below. A target *without* `+=` simply omits the compound rows and falls through
+to the plain `{target} = {value};` row: correct degradation. The same mechanism
+recognizes ternary shape (an `if` whose branches are single values) and
+increment (`i = i + 1` → `i++`).
+
+```text
+### stmt
+| When                                                                        | Template |
+|-----------------------------------------------------------------------------|----------|
+| stmt is assign && value is binary && value.op is add && target eq value.lhs | "{target} += {value.rhs};" |
+| stmt is assign                                                              | "{target} = {value};" |
+```
+
+### Assignment, Cast, and Construction Slots
+
+- **Assignment** (`stmt is assign`) exposes `{target}` (the lvalue place —
+  restricted to a ref/field/index at construction) and `{value}` (the assigned
+  expression). Its `value` sub-part is also visible to the one-level structural
+  facts/slots above (for the compound-assignment idiom).
+- **Cast** (`expr is cast`) exposes `{value}` (the value being cast) and `{ty}`
+  (the target type, rendered through the capability matrix). A target that
+  cannot express the cast to a given type surfaces a forbidden-primitive error
+  when `{ty}` is resolved. Typical spelling: `"{value} as {ty}"`.
+- **Struct-literal construction** (`expr is struct_lit`) exposes `{type_name}`
+  (the aggregate type name) and the `{fields}` collection (see `### field_init`
+  above). A target chooses its spelling: Rust `Type { field: value }`,
+  TypeScript a bare object literal `{ field: value }`.
+- **Function-as-value (fnptr):** a bare function name used as a value is a
+  function-pointer value (C-style decay) — there is no separate node; it is an
+  `expr is ref` rendered as the plain identifier. Storing one into a
+  `fnptr`-typed field is gated *transitively* by that field's declared `fnptr`
+  type: a target whose capability matrix forbids `fnptr` cannot declare the
+  field, so it cannot construct the aggregate either.
 
 ## Capabilities
 

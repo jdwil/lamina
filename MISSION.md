@@ -34,7 +34,7 @@ Keywords fall into two classes.
 
 file, use, fn, struct, enum, typedef, let, if, else, switch, case, default, while, for, foreach, return, break, continue, true, false, null
 
-(`let` is the local-binding statement; `foreach` is the iterator loop, distinct from the C-style counted `for` — see the imperative-core statement set.)
+(`let` is the local-binding statement; `foreach` is the iterator loop, distinct from the C-style counted `for` — see the imperative-core statement set. **Assignment** (`target = value`) is also a structural imperative statement: `target` is an lvalue — a ref, field access, or index — and the engine restricts it to those at construction. Compound assignment (`+=`), the ternary, and increment (`i++`) are NOT kernel nodes; they are language-definition *idioms* recognized from plain assignment / `if` / binary via the one-level structural predicates — see *Structural Predicates* below.)
 
 **Capability keywords** are effects/attributes that not every target supports. They ARE gated by the capability matrix (a language file may forbid them; forbidding one means a unit that uses it cannot target that language). See *Callable Modifiers* below:
 
@@ -65,6 +65,18 @@ The kernel reserves a **finite, closed superset** of semantically-distinct primi
 - Bitwise: `&` `|` `^` `<<` `>>` `>>>` (unsigned/logical right shift).
 
 A target that lacks an operator (e.g. no `>>>`, no `**`) `forbid`s it or the language file maps it to a call/library form (which, if it is really a library function, is a layer concern rather than an operator mapping). Operator precedence and associativity are a *parsing* concern (the AST is already a tree); the emitter parenthesizes to preserve grouping.
+
+**Cast (`value as Type`).** An explicit type conversion is a kernel expression, capability-gated: the target type is resolved through the capability matrix, so a cast to a primitive the target `forbid`s fails. The cast is *required* by the matrix model — a `widen` records a width diagnostic so a later narrow (storing back into a smaller type) must be an explicit cast in Lamina, never something the matrix does silently.
+
+**Construction (struct literal).** Constructing an aggregate — `Type { field: value, … }` — is a kernel expression. The language file spells it (Rust `Type { … }`, TypeScript an object literal or `new Type(…)`); fields render via the collection mechanism. Array/collection literals and enum-payload construction remain deferred with the array-type / enum-payload deferrals.
+
+**Function-as-value (fnptr).** A bare function name used as a value is a function pointer (C-style decay) — the basis of Lamina's C-struct-with-function-pointers object model. It is not a new node: it is an identifier reference rendered as the target's function-reference form, and storing one into a `fnptr`-typed field is gated by the `fnptr` capability through that field's declared type.
+
+### Structural Predicates (idiom recognition, capability/branching model)
+
+The branching model (the closed `When` predicate vocabulary) includes a small, **one-level** structural view of the node being rendered: a definition may query a direct named sub-part's kind (`value is binary`), a direct binary sub-part's operator (`value.op is add`), and structural equality between two one-level sub-parts (`target eq value.lhs`), and may render one-level sub-parts (`{value.rhs}`). This stays a closed, bounded, non-Turing-complete vocabulary (one level only — no arbitrary tree matching). It is what lets **compound assignment**, the **ternary**, and **increment** be recognized desugared idioms authored entirely in the language file rather than kernel nodes.
+
+**Native lambda / closure emission is deferred.** A lambda desugars to a named top-level `fn` plus an fnptr reference (which works today); emitting a *native* inline lambda requires cross-item analysis (resolve the fnptr's target, confirm single-use, inline it), which is non-local and outside the recursive-render model — it needs the deferred whole-program/multi-pass machinery.
 
 ### Capability Matrix
 

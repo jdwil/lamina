@@ -604,8 +604,64 @@ pub enum Statement {
     Break,
     /// A `continue;` statement (labels deferred).
     Continue,
+    /// An assignment (`target = value;`). `target` is an *lvalue* — a place an
+    /// assignment can name — restricted to [`Expr::Ref`], [`Expr::Field`], or
+    /// [`Expr::Index`]. Assigning to a literal or an operator expression is
+    /// meaningless, so [`Statement::assign`] validates the target at
+    /// construction. Compound assignment (`+=`) is NOT a distinct kernel node:
+    /// it is a language-definition *idiom* recognized from an `Assign` whose
+    /// `value` is a binary whose left operand equals the `target` (see the
+    /// one-level structural predicates in the language-definition format).
+    Assign {
+        /// The assignment target: an lvalue [`Expr`] (`Ref`/`Field`/`Index`).
+        target: Expr,
+        /// The value assigned to the target.
+        value: Expr,
+    },
     /// An expression-statement (e.g. a bare function call `f();`).
     Expr(Expr),
+}
+
+/// Returns `true` if `expr` is a valid *lvalue* — a place an assignment can
+/// name. The kernel lvalues are a variable [`Expr::Ref`], a field access
+/// [`Expr::Field`], and an index [`Expr::Index`]; everything else (a literal,
+/// a call, an operator expression, a cast, a struct literal) denotes a value,
+/// not a place, so it cannot be assigned to.
+pub fn is_lvalue(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Ref(_) | Expr::Field { .. } | Expr::Index { .. }
+    )
+}
+
+impl Statement {
+    /// Builds a [`Statement::Assign`], validating that `target` is an lvalue
+    /// (see [`is_lvalue`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AstError::NotAnLvalue`] if `target` is not a `Ref`, `Field`,
+    /// or `Index`.
+    pub fn assign(target: Expr, value: Expr) -> Result<Statement, AstError> {
+        if is_lvalue(&target) {
+            Ok(Statement::Assign { target, value })
+        } else {
+            Err(AstError::NotAnLvalue {
+                kind: target.kind().as_str(),
+            })
+        }
+    }
+}
+
+/// An error building an AST node whose invariants are checked at construction.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AstError {
+    /// An assignment target was not an lvalue (`Ref`/`Field`/`Index`).
+    #[error("assignment target must be an lvalue (ref/field/index), got {kind:?}")]
+    NotAnLvalue {
+        /// The offending target expression's kind spelling.
+        kind: &'static str,
+    },
 }
 
 /// One `case` of a [`Statement::Switch`]: a matched value and its body.
@@ -632,6 +688,7 @@ impl Statement {
             Statement::Switch { .. } => StatementKind::Switch,
             Statement::Break => StatementKind::Break,
             Statement::Continue => StatementKind::Continue,
+            Statement::Assign { .. } => StatementKind::Assign,
             Statement::Expr(_) => StatementKind::Expr,
         }
     }
@@ -664,6 +721,8 @@ pub enum StatementKind {
     Break,
     /// A `continue`.
     Continue,
+    /// An assignment.
+    Assign,
     /// An expression-statement.
     Expr,
 }
@@ -682,13 +741,14 @@ impl StatementKind {
             StatementKind::Switch => "switch",
             StatementKind::Break => "break",
             StatementKind::Continue => "continue",
+            StatementKind::Assign => "assign",
             StatementKind::Expr => "expr",
         }
     }
 
     /// Every statement kind, in canonical order. Keeps the closed `stmt`
     /// vocabulary in one place, shared by the predicate registry.
-    pub fn all() -> [StatementKind; 11] {
+    pub fn all() -> [StatementKind; 12] {
         [
             StatementKind::Block,
             StatementKind::Let,
@@ -700,6 +760,7 @@ impl StatementKind {
             StatementKind::Switch,
             StatementKind::Break,
             StatementKind::Continue,
+            StatementKind::Assign,
             StatementKind::Expr,
         ]
     }
@@ -778,6 +839,45 @@ pub enum Expr {
         /// The right-hand operand.
         rhs: Box<Expr>,
     },
+    /// A cast of a value to a target type (kernel spelling `value as Type`).
+    ///
+    /// Casts are REQUIRED by the capability model: a `widen` records a width
+    /// diagnostic so a later narrow (storing back into a smaller type) must be
+    /// *explicit* — and an explicit narrow is exactly a `Cast`. The target
+    /// spells it per its `### cast` slot (Rust `x as i64`, TypeScript
+    /// `x as number`, a C-family `(T)x`); a target that cannot express the cast
+    /// forbids that slot.
+    Cast {
+        /// The value being cast.
+        value: Box<Expr>,
+        /// The target type.
+        ty: Type,
+    },
+    /// An aggregate (struct) construction literal
+    /// (`TypeName { field: value, … }`).
+    ///
+    /// This is the kernel *construction* expression: it names an aggregate type
+    /// and initializes its fields. The target spells it per its `### struct_lit`
+    /// slot (Rust `Account { balance: 0 }`, TypeScript `{ balance: 0 }` or
+    /// `new Account(…)` — the definition's choice). Fields render as a sequence
+    /// slot (item slot `field_init`, with `first`/`last` loop facts), mirroring
+    /// the existing collection mechanism. A bare function name stored into a
+    /// `fnptr`-typed field is a function-pointer value (see [`Expr::Ref`]).
+    StructLit {
+        /// The aggregate type being constructed.
+        type_name: String,
+        /// The field initializers, in order (possibly empty).
+        fields: Vec<FieldInit>,
+    },
+}
+
+/// One field initializer of a [`Expr::StructLit`]: a field name and its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldInit {
+    /// The field's name.
+    pub name: String,
+    /// The value assigned to the field.
+    pub value: Expr,
 }
 
 impl Expr {
@@ -797,6 +897,8 @@ impl Expr {
             Expr::Call { .. } => ExprKind::Call,
             Expr::Unary { .. } => ExprKind::Unary,
             Expr::Binary { .. } => ExprKind::Binary,
+            Expr::Cast { .. } => ExprKind::Cast,
+            Expr::StructLit { .. } => ExprKind::StructLit,
         }
     }
 }
@@ -832,6 +934,10 @@ pub enum ExprKind {
     Unary,
     /// A binary operator expression.
     Binary,
+    /// A cast expression.
+    Cast,
+    /// A struct-literal (construction) expression.
+    StructLit,
 }
 
 impl ExprKind {
@@ -850,6 +956,8 @@ impl ExprKind {
             ExprKind::Call => "call",
             ExprKind::Unary => "unary",
             ExprKind::Binary => "binary",
+            ExprKind::Cast => "cast",
+            ExprKind::StructLit => "struct_lit",
         }
     }
 }
@@ -1096,6 +1204,11 @@ pub enum SlotScope {
     /// expression; loop facts (`first`/`last`) let the item template supply its
     /// own separator.
     ExprArg,
+    /// Resolving slots of a single [`FieldInit`] element (one element of a
+    /// [`Expr::StructLit`]'s `fields`). Exposes `name` (the field name) and
+    /// `value` (the field's value expression); loop facts (`first`/`last`) let
+    /// the item template supply its own separator.
+    FieldInit,
     /// Resolving slots of a single [`SwitchCase`] element (one element of a
     /// [`Statement::Switch`]'s `cases`). Exposes `value` (the matched
     /// expression) and `body` (the case's statement sequence); loop facts let
@@ -1198,6 +1311,7 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "binding" => Some(SlotShape::Scalar),
             "let_type" => Some(SlotShape::Scalar),
             "value" => Some(SlotShape::Scalar),
+            "target" => Some(SlotShape::Scalar),
             "cond" => Some(SlotShape::Scalar),
             "iterable" => Some(SlotShape::Scalar),
             "scrutinee" => Some(SlotShape::Scalar),
@@ -1206,6 +1320,14 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "step" => Some(SlotShape::Scalar),
             "init_clause" => Some(SlotShape::Scalar),
             "step_clause" => Some(SlotShape::Scalar),
+            // One-level structural sub-part slots (Part 2). A dotted slot name
+            // `value.rhs` / `value.lhs` / `value.op` references a DIRECT named
+            // sub-part of the current statement's `value` sub-expression when
+            // it is a binary, letting a language def render a compound-assign
+            // idiom (`x += y` from `x = x + y`). One level only — deeper paths
+            // are not bound. `value.op` renders the operator spelling; the
+            // others render the rendered sub-expression.
+            "value.lhs" | "value.rhs" | "value.op" => Some(SlotShape::Scalar),
             "then" => Some(SlotShape::Sequence {
                 item_slot: "statement".to_string(),
                 item_scope: SlotScope::Statement,
@@ -1268,15 +1390,29 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "obj" => Some(SlotShape::Scalar),
             "index" => Some(SlotShape::Scalar),
             "callee" => Some(SlotShape::Scalar),
+            "ty" => Some(SlotShape::Scalar),
+            "type_name" => Some(SlotShape::Scalar),
             "args" => Some(SlotShape::Sequence {
                 item_slot: "expr_arg".to_string(),
                 item_scope: SlotScope::ExprArg,
+            }),
+            "fields" => Some(SlotShape::Sequence {
+                item_slot: "field_init".to_string(),
+                item_scope: SlotScope::FieldInit,
             }),
             _ => None,
         },
         // A single call-argument element: `value` renders the argument
         // expression (dispatching through the `### expr` table).
         SlotScope::ExprArg => match name {
+            "value" => Some(SlotShape::Scalar),
+            _ => None,
+        },
+        // A single struct-literal field initializer: `name` is the field name
+        // (scalar leaf) and `value` renders the field's value expression
+        // (dispatching through the `### expr` table).
+        SlotScope::FieldInit => match name {
+            "name" => Some(SlotShape::Scalar),
             "value" => Some(SlotShape::Scalar),
             _ => None,
         },
@@ -1550,8 +1686,8 @@ mod tests {
 
     #[test]
     fn statement_kind_set_is_closed() {
-        // Exactly 11 statement kinds; guard against accidental drift.
-        assert_eq!(StatementKind::all().len(), 11);
+        // Exactly 12 statement kinds; guard against accidental drift.
+        assert_eq!(StatementKind::all().len(), 12);
         // Spot-check the kind spellings used by the `stmt is <kind>` fact.
         assert_eq!(StatementKind::ForEach.as_str(), "foreach");
         assert_eq!(StatementKind::Switch.as_str(), "switch");
@@ -1781,5 +1917,111 @@ mod tests {
             Some(SlotShape::Scalar)
         );
         assert_eq!(slot_binding("bogus", SlotScope::Use), None);
+    }
+
+    #[test]
+    fn assign_kind_and_lvalue_validation() {
+        // A `Ref`/`Field`/`Index` target is a valid lvalue.
+        for target in [
+            Expr::Ref("x".into()),
+            Expr::Field {
+                obj: Box::new(Expr::Ref("o".into())),
+                field: "f".into(),
+            },
+            Expr::Index {
+                obj: Box::new(Expr::Ref("xs".into())),
+                index: Box::new(Expr::IntLiteral("0".into())),
+            },
+        ] {
+            assert!(is_lvalue(&target));
+            let stmt = Statement::assign(target, Expr::IntLiteral("1".into())).expect("lvalue");
+            assert_eq!(stmt.kind(), StatementKind::Assign);
+        }
+        // A non-lvalue target (a literal, a call, an operator expr) is rejected.
+        for bad in [
+            Expr::IntLiteral("1".into()),
+            Expr::Call {
+                callee: Box::new(Expr::Ref("f".into())),
+                args: vec![],
+            },
+            Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(Expr::Ref("a".into())),
+                rhs: Box::new(Expr::Ref("b".into())),
+            },
+        ] {
+            assert!(!is_lvalue(&bad));
+            assert!(matches!(
+                Statement::assign(bad, Expr::IntLiteral("1".into())),
+                Err(AstError::NotAnLvalue { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn assign_binds_target_and_sub_part_slots() {
+        assert_eq!(
+            slot_binding("target", SlotScope::Statement),
+            Some(SlotShape::Scalar)
+        );
+        // One-level structural sub-part slots resolve as scalars at statement
+        // scope (Part 2).
+        for name in ["value.lhs", "value.rhs", "value.op"] {
+            assert_eq!(
+                slot_binding(name, SlotScope::Statement),
+                Some(SlotShape::Scalar),
+                "{name} should be scalar at statement scope"
+            );
+        }
+        // A two-level path is not bound (one level only).
+        assert_eq!(slot_binding("value.lhs.rhs", SlotScope::Statement), None);
+    }
+
+    #[test]
+    fn cast_kind_and_slots() {
+        let c = Expr::Cast {
+            value: Box::new(Expr::Ref("x".into())),
+            ty: Type::Primitive(Primitive::I64),
+        };
+        assert_eq!(c.kind(), ExprKind::Cast);
+        assert_eq!(ExprKind::Cast.as_str(), "cast");
+        assert_eq!(slot_binding("ty", SlotScope::Expr), Some(SlotShape::Scalar));
+    }
+
+    #[test]
+    fn struct_lit_kind_and_slots() {
+        let s = Expr::StructLit {
+            type_name: "Account".into(),
+            fields: vec![FieldInit {
+                name: "balance".into(),
+                value: Expr::IntLiteral("0".into()),
+            }],
+        };
+        assert_eq!(s.kind(), ExprKind::StructLit);
+        assert_eq!(ExprKind::StructLit.as_str(), "struct_lit");
+        assert_eq!(
+            slot_binding("type_name", SlotScope::Expr),
+            Some(SlotShape::Scalar)
+        );
+        match slot_binding("fields", SlotScope::Expr) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "field_init");
+                assert_eq!(item_scope, SlotScope::FieldInit);
+            }
+            other => panic!("fields should be a field_init sequence, got {other:?}"),
+        }
+        // A field-init element exposes `name` and `value`.
+        assert_eq!(
+            slot_binding("name", SlotScope::FieldInit),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(
+            slot_binding("value", SlotScope::FieldInit),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::FieldInit), None);
     }
 }

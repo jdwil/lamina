@@ -19,11 +19,17 @@
 //! and_expr  := unary ("&&" unary)*
 //! unary     := "!"? atom
 //! atom      := fact | "(" or_expr ")"
-//! fact      := IDENT ("is" IDENT)?
+//! fact      := PATH ("is" IDENT | "eq" PATH)?
+//! PATH      := IDENT ("." IDENT)?
 //! ```
 //!
 //! A bare `IDENT` is a boolean fact (e.g. `export`, `async`). `IDENT is IDENT`
 //! is an enum query (e.g. `ret is void`, `vis is public`, `caller is async`).
+//! A `PATH` is a one-level sub-part reference (`value`, `value.op`, `target`),
+//! used by the closed structural facts: `value is binary` (kind of the `value`
+//! sub-part), `value.op is add` (binary operator of the `value` sub-part), and
+//! `target eq value.lhs` (structural equality of two one-level sub-parts). Only
+//! ONE level of `.` is allowed; deeper paths are a syntax error.
 
 use crate::error::PredicateError;
 
@@ -50,14 +56,21 @@ pub enum PredExpr {
     Or(Box<PredExpr>, Box<PredExpr>),
 }
 
-/// A single fact: a boolean flag or an enum query (`key is value`).
+/// A single fact: a boolean flag, an enum query (`key is value`), or a
+/// one-level structural-equality query (`key eq other`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
-    /// The fact key (e.g. `export`, `ret`, `vis`, `caller`).
+    /// The fact key (e.g. `export`, `ret`, `vis`, `caller`, or a one-level
+    /// sub-part path like `value` / `value.op` / `target`).
     pub key: String,
-    /// For an enum query, the value being tested (e.g. `void` in `ret is
-    /// void`). `None` for a boolean flag.
+    /// For an enum query (`key is value`), the value being tested (e.g. `void`
+    /// in `ret is void`, `binary` in `value is binary`, `add` in `value.op is
+    /// add`). `None` for a boolean flag or an equality query.
     pub value: Option<String>,
+    /// For a one-level structural-equality query (`key eq other`), the
+    /// right-hand sub-part path being compared (e.g. `value.lhs` in `target eq
+    /// value.lhs`). `None` for a boolean flag or an enum query.
+    pub eq: Option<String>,
 }
 
 /// The set of facts the engine can answer about the thing being rendered.
@@ -124,6 +137,22 @@ pub struct RenderContext {
     pub has_step: bool,
     /// `has_default` — a `switch` carries a `default` branch.
     pub has_default: bool,
+    /// Answers `value is <kind>` — the [`ExprKind`] of the current node's
+    /// direct `value` sub-part (Part 2, one-level structural predicate). Set
+    /// when the node being rendered has a `value` sub-expression (an `assign`'s
+    /// right-hand side); `None` otherwise.
+    pub sub_value_kind: Option<ExprKind>,
+    /// Answers `value.op is <op>` — the binary operator machine name (e.g.
+    /// `add`) of the current node's direct `value` sub-part, when that
+    /// sub-part is a binary expression (Part 2, one-level structural
+    /// predicate). `None` when `value` is absent or not a binary.
+    pub sub_value_op: Option<String>,
+    /// Answers `target eq value.lhs` — whether the current node's `target`
+    /// sub-part is structurally equal to its `value` sub-part's left operand
+    /// (Part 2, one-level structural equality). Computed via the derived
+    /// `PartialEq` on `Expr`. `false` when either sub-part is absent or `value`
+    /// is not a binary.
+    pub target_eq_value_lhs: bool,
 }
 
 /// The return-shape a node has, for `ret is ...` queries.
@@ -188,6 +217,10 @@ pub enum ExprKind {
     Unary,
     /// A binary operator expression (`expr is binary`).
     Binary,
+    /// A cast expression (`expr is cast`).
+    Cast,
+    /// A struct-literal construction expression (`expr is struct_lit`).
+    StructLit,
 }
 
 impl ExprKind {
@@ -206,6 +239,8 @@ impl ExprKind {
             ExprKind::Call => "call",
             ExprKind::Unary => "unary",
             ExprKind::Binary => "binary",
+            ExprKind::Cast => "cast",
+            ExprKind::StructLit => "struct_lit",
         }
     }
 }
@@ -238,6 +273,8 @@ pub enum StmtKind {
     Break,
     /// A `continue` (`stmt is continue`).
     Continue,
+    /// An assignment (`stmt is assign`).
+    Assign,
     /// An expression-statement (`stmt is expr`).
     Expr,
 }
@@ -256,6 +293,7 @@ impl StmtKind {
             StmtKind::Switch => "switch",
             StmtKind::Break => "break",
             StmtKind::Continue => "continue",
+            StmtKind::Assign => "assign",
             StmtKind::Expr => "expr",
         }
     }
@@ -366,6 +404,22 @@ impl RenderContext {
                 self.item.map(|k| k.as_str() == kind).unwrap_or(false)
                     && item_kind_is_known(kind)
             }
+            // One-level structural sub-part kind query: `value is <kind>` — the
+            // dispatch kind of the current node's direct `value` sub-part.
+            ("value", Some(kind)) if fact.eq.is_none() => {
+                self.sub_value_kind.map(|k| k.as_str() == kind).unwrap_or(false)
+                    && expr_kind_is_known(kind)
+            }
+            // One-level structural sub-part operator query: `value.op is <op>` —
+            // the binary operator (machine name) of the current node's `value`
+            // sub-part, when it is a binary.
+            ("value.op", Some(op)) => {
+                self.sub_value_op.as_deref() == Some(op)
+            }
+            // One-level structural equality: `target eq value.lhs`.
+            ("target", None) if fact.eq.as_deref() == Some("value.lhs") => {
+                self.target_eq_value_lhs
+            }
             _ => false,
         }
     }
@@ -388,7 +442,16 @@ fn expr_kind_is_known(kind: &str) -> bool {
             | "call"
             | "unary"
             | "binary"
+            | "cast"
+            | "struct_lit"
     )
+}
+
+/// Returns `true` if `op` is a known binary-operator machine name (e.g. `add`,
+/// `sub`). Used to validate the one-level `value.op is <op>` structural fact
+/// against the closed kernel binary-operator vocabulary.
+fn binary_op_name_is_known(op: &str) -> bool {
+    crate::ast::BinaryOp::from_name(op).is_some()
 }
 
 /// Returns `true` if `kind` is a known `stmt is <kind>` value spelling. Keeps
@@ -407,6 +470,7 @@ fn stmt_kind_is_known(kind: &str) -> bool {
             | "switch"
             | "break"
             | "continue"
+            | "assign"
             | "expr"
     )
 }
@@ -459,13 +523,27 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     let known = known || matches!((fact.key.as_str(), fact.value.as_deref()), ("stmt", Some(k)) if stmt_kind_is_known(k));
     // `item is <kind>` is validated against the closed item vocabulary.
     let known = known || matches!((fact.key.as_str(), fact.value.as_deref()), ("item", Some(k)) if item_kind_is_known(k));
+    // `value is <kind>` — one-level sub-part kind query — is validated against
+    // the closed expression-kind vocabulary (and must not be an `eq` query).
+    let known = known
+        || (fact.eq.is_none()
+            && matches!((fact.key.as_str(), fact.value.as_deref()), ("value", Some(k)) if expr_kind_is_known(k)));
+    // `value.op is <op>` — one-level sub-part operator query — is validated
+    // against the closed binary-operator machine-name vocabulary.
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("value.op", Some(op)) if binary_op_name_is_known(op));
+    // `target eq value.lhs` — the one closed one-level structural-equality
+    // query. Only this exact pairing is answerable.
+    let known = known
+        || (fact.key == "target" && fact.value.is_none() && fact.eq.as_deref() == Some("value.lhs"));
     if known {
         Ok(())
     } else {
         Err(PredicateError::UnknownFact {
-            fact: match &fact.value {
-                Some(v) => format!("{} is {}", fact.key, v),
-                None => fact.key.clone(),
+            fact: match (&fact.value, &fact.eq) {
+                (Some(v), _) => format!("{} is {}", fact.key, v),
+                (None, Some(other)) => format!("{} eq {}", fact.key, other),
+                (None, None) => fact.key.clone(),
             },
         })
     }
@@ -497,6 +575,7 @@ pub fn parse_predicate(src: &str) -> Result<Predicate, PredicateError> {
 enum PTok {
     Ident(String),
     Is,
+    Eq,
     And,
     Or,
     Not,
@@ -537,9 +616,24 @@ fn lex_predicate(src: &str) -> Result<Vec<PTok>, PredicateError> {
             }
             _ if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
+                // A path identifier: an ident optionally followed by ONE `.`
+                // and a second ident segment (`value.op`). Only one level of
+                // `.` is permitted; a second `.` is a syntax error, keeping the
+                // structural vocabulary one level deep.
+                let mut dots = 0;
                 while i < bytes.len() {
                     let ch = bytes[i] as char;
                     if ch.is_ascii_alphanumeric() || ch == '_' {
+                        i += 1;
+                    } else if ch == '.' {
+                        dots += 1;
+                        if dots > 1 {
+                            return Err(PredicateError::Syntax {
+                                detail: "sub-part paths are one level deep only \
+                                         (no `a.b.c`)"
+                                    .to_string(),
+                            });
+                        }
                         i += 1;
                     } else {
                         break;
@@ -548,6 +642,7 @@ fn lex_predicate(src: &str) -> Result<Vec<PTok>, PredicateError> {
                 let word = &src[start..i];
                 match word {
                     "is" => tokens.push(PTok::Is),
+                    "eq" => tokens.push(PTok::Eq),
                     _ => tokens.push(PTok::Ident(word.to_string())),
                 }
             }
@@ -615,24 +710,40 @@ impl PredParser {
             }
             Some(PTok::Ident(key)) => {
                 self.pos += 1;
-                // Optional `is IDENT`.
-                let value = if self.peek() == Some(&PTok::Is) {
-                    self.pos += 1;
-                    match self.peek().cloned() {
-                        Some(PTok::Ident(v)) => {
-                            self.pos += 1;
-                            Some(v)
-                        }
-                        _ => {
-                            return Err(PredicateError::Syntax {
-                                detail: format!("expected a value after `{key} is`"),
-                            })
+                // Optional relation: `is IDENT` (enum/kind query) or `eq PATH`
+                // (one-level structural equality). At most one applies.
+                let (value, eq) = match self.peek() {
+                    Some(PTok::Is) => {
+                        self.pos += 1;
+                        match self.peek().cloned() {
+                            Some(PTok::Ident(v)) => {
+                                self.pos += 1;
+                                (Some(v), None)
+                            }
+                            _ => {
+                                return Err(PredicateError::Syntax {
+                                    detail: format!("expected a value after `{key} is`"),
+                                })
+                            }
                         }
                     }
-                } else {
-                    None
+                    Some(PTok::Eq) => {
+                        self.pos += 1;
+                        match self.peek().cloned() {
+                            Some(PTok::Ident(v)) => {
+                                self.pos += 1;
+                                (None, Some(v))
+                            }
+                            _ => {
+                                return Err(PredicateError::Syntax {
+                                    detail: format!("expected a sub-part path after `{key} eq`"),
+                                })
+                            }
+                        }
+                    }
+                    _ => (None, None),
                 };
-                let fact = Fact { key, value };
+                let fact = Fact { key, value, eq };
                 validate_fact(&fact)?;
                 Ok(PredExpr::Fact(fact))
             }
@@ -911,5 +1022,116 @@ mod tests {
     fn rejects_unknown_has_fact() {
         let err = parse_predicate("has_frob").expect_err("unknown has fact");
         assert!(matches!(err, PredicateError::UnknownFact { .. }));
+    }
+
+    #[test]
+    fn assign_and_new_expr_kinds_parse_and_dispatch() {
+        // The new `stmt is assign` and `expr is cast`/`expr is struct_lit`
+        // dispatch facts parse and evaluate.
+        let assign = parse_predicate("stmt is assign").expect("parse");
+        let c = RenderContext {
+            stmt: Some(StmtKind::Assign),
+            ..Default::default()
+        };
+        assert!(c.eval(&assign));
+        for kind in ["cast", "struct_lit"] {
+            parse_predicate(&format!("expr is {kind}"))
+                .unwrap_or_else(|e| panic!("`expr is {kind}` should parse: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn sub_part_kind_fact_value_is_binary() {
+        // `value is binary` queries the current node's direct `value` sub-part.
+        let p = parse_predicate("value is binary").expect("parse");
+        let c = RenderContext {
+            sub_value_kind: Some(ExprKind::Binary),
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        // A different sub-part kind does not match.
+        let c2 = RenderContext {
+            sub_value_kind: Some(ExprKind::Call),
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
+        // No sub-part in context -> the fact does not hold.
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn sub_part_op_fact_value_op_is_add() {
+        let p = parse_predicate("value.op is add").expect("parse");
+        let c = RenderContext {
+            sub_value_op: Some("add".to_string()),
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        let c2 = RenderContext {
+            sub_value_op: Some("sub".to_string()),
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn structural_equality_fact_target_eq_value_lhs() {
+        let p = parse_predicate("target eq value.lhs").expect("parse");
+        let c = RenderContext {
+            target_eq_value_lhs: true,
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn compound_assign_predicate_composes() {
+        // The canonical compound-assign guard composes the three one-level
+        // facts with `&&`.
+        let p = parse_predicate("value is binary && value.op is add && target eq value.lhs")
+            .expect("parse");
+        let c = RenderContext {
+            sub_value_kind: Some(ExprKind::Binary),
+            sub_value_op: Some("add".to_string()),
+            target_eq_value_lhs: true,
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        // Missing any conjunct fails.
+        let c2 = RenderContext {
+            sub_value_kind: Some(ExprKind::Binary),
+            sub_value_op: Some("sub".to_string()),
+            target_eq_value_lhs: true,
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
+    }
+
+    #[test]
+    fn rejects_unknown_sub_part_facts() {
+        // An unknown sub-part op or an unknown equality pairing is rejected.
+        assert!(matches!(
+            parse_predicate("value.op is matmul"),
+            Err(PredicateError::UnknownFact { .. })
+        ));
+        assert!(matches!(
+            parse_predicate("target eq value.rhs"),
+            Err(PredicateError::UnknownFact { .. })
+        ));
+        assert!(matches!(
+            parse_predicate("value is lambda"),
+            Err(PredicateError::UnknownFact { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_two_level_path() {
+        // Sub-part paths are one level deep only.
+        assert!(matches!(
+            parse_predicate("value.lhs.rhs is int"),
+            Err(PredicateError::Syntax { .. })
+        ));
     }
 }

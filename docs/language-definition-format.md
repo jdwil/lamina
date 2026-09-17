@@ -232,9 +232,9 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `vis is public` / `vis is protected` / `vis is private` | enum | the visibility level |
 | `caller is async` / `caller is sync` | enum | the enclosing callable's synchrony (inherited) |
 | `first` / `last` | bool | this element is the first / last in the collection being looped (only meaningful inside an item slot) |
-| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit`) |
+| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit` `node` `text`) |
 | `stmt is <kind>` | enum | the statement being rendered is that kind (`block` `let` `return` `if` `while` `for` `foreach` `switch` `break` `continue` `assign` `expr`) |
-| `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use`) |
+| `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use` `tree`) |
 | `has_value` `has_type` `has_else` `has_init` `has_cond` `has_step` `has_default` | bool | the statement carries that optional sub-part |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
@@ -300,6 +300,80 @@ increment (`i = i + 1` → `i++`).
   `fnptr`-typed field is gated *transitively* by that field's declared `fnptr`
   type: a target whose capability matrix forbids `fnptr` cannot declare the
   field, so it cannot construct the aggregate either.
+
+## The Declarative Tree Core (`node` / `attr` / `text`)
+
+Lamina has a **second kernel core** alongside the imperative one: a declarative
+tree. It is the universal substrate of every document and structured-data format
+— an HTML element, a CSS rule, a JSON object, a YAML/TOML table are all "a named
+node with attributes and children." The kernel keeps the vocabulary generic and
+frozen: only three nodes exist, and NO format-specific keyword (no `div`, no CSS
+property) is kernel — those are language-definition detail or layer concerns.
+
+A tree node is a **first-class expression**, so the two cores interoperate: a
+`fn` may return a node (its return type is a `Named` type, e.g. `-> Node`,
+reusing the ordinary type machinery), and a node's attribute value or child may
+be an arbitrary expression, enabling JSX-like interpolation (`<div>{name}</div>`
+is a `node` whose child is an `expr is ref`).
+
+The three tree expression kinds dispatch through the SAME `### expr` table as
+every other expression:
+
+- **`expr is node`** — a named node. Exposes `{node_name}` (scalar leaf), the
+  `{attrs}` collection (item slot `### attr`), and the `{children}` collection
+  (item slot `### child`). A definition maps the generic node to its target
+  syntax: HTML `<name attrs>children</name>`, JSON `{"tag": …, …}`.
+- **`expr is text`** — literal text content. Exposes `{value}`, which renders
+  its inner expression through the `### expr` dispatch (typically a string
+  literal, but any expression for interpolation). HTML emits raw text; JSON
+  emits a quoted string.
+- **`### attr`** — the item slot for each element of a node's `{attrs}`. Exposes
+  `{name}` (the attribute name) and `{value}` (its value expression, dispatched
+  through `### expr`). Loop facts `first`/`last` let it supply its own
+  separator, exactly like `### param` / `### expr_arg`.
+- **`### child`** — the item slot for each element of a node's `{children}`.
+  Exposes `{value}` (the child expression). Loop facts supply the separator (or
+  none, as HTML uses).
+
+Because a node is generic, the same tree AST renders to structurally-different
+targets purely from the definition. From `div class="box"` containing
+`p > "hi"`:
+
+```text
+### expr                       (HTML)
+| When           | Template |
+|-----------------|----------|
+| expr is node    | @element |
+| expr is text    | "{value}" |
+| expr is string  | "{value}" |
+| else            | forbid |
+
+### element
+```template
+<{node_name}{attrs}>{children}</{node_name}>
+```
+```
+
+emits `<div class="box"><p>hi</p></div>`, while a JSON definition of the same
+`### expr` table (node → `{"tag": …}`, string → `"{value}"` quoted) emits a JSON
+object from the identical AST.
+
+### Top-level tree values (declarative-only files)
+
+A file whose root **is** a tree — a pure markup/config document — is a top-level
+`tree` item (`item is tree`). It has no `## <Item>` entry template of its own:
+it renders straight through the shared `### expr` dispatch, exactly as an
+embedded tree expression would.
+
+A purely declarative target (HTML, JSON, YAML, …) has no imperative callable, so
+it may **omit `## Function` entirely** and instead host its shared render slots
+under a **`## Tree`** section. `## Tree` is slots-only (no entry template): it
+holds `### expr` and its `### attr` / `### child` item slots (plus any node
+sub-slots the target names), which are merged into the shared slot map and
+validated at load time starting from `### expr`. `## Capabilities` is still
+required (the matrix must cover every primitive); a definition must have at
+least one of `## Function` or `## Tree`. See `lamina-defs/languages/html.mdl`
+and `json.mdl` for complete declarative-only examples.
 
 ## Construct Metadata
 

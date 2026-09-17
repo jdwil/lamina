@@ -66,6 +66,9 @@ impl<'a> UnitIndex<'a> {
             if let Item::Const { value, .. } = item {
                 count_fnptr_refs_in_expr(value, &items, &mut fnptr_ref_counts);
             }
+            if let Item::Tree(expr) = item {
+                count_fnptr_refs_in_expr(expr, &items, &mut fnptr_ref_counts);
+            }
         }
         UnitIndex {
             items,
@@ -123,6 +126,8 @@ fn item_name(item: &Item) -> Option<&str> {
         | Item::TypeDef { name, .. }
         | Item::Const { name, .. } => Some(name),
         Item::Use { .. } => None,
+        // A top-level tree value binds no name the index can key on.
+        Item::Tree(_) => None,
     }
 }
 
@@ -259,6 +264,19 @@ fn count_fnptr_refs_in_expr(
                 count_fnptr_refs_in_expr(&f.value, items, counts);
             }
         }
+        // Tree-core nodes: an attribute value or a child may itself be a
+        // function-pointer value (interpolation), so recurse into both.
+        Expr::Node {
+            attrs, children, ..
+        } => {
+            for a in attrs {
+                count_fnptr_refs_in_expr(&a.value, items, counts);
+            }
+            for c in children {
+                count_fnptr_refs_in_expr(c, items, counts);
+            }
+        }
+        Expr::Text(inner) => count_fnptr_refs_in_expr(inner, items, counts),
         Expr::IntLiteral(_)
         | Expr::FloatLiteral(_)
         | Expr::BoolLiteral(_)

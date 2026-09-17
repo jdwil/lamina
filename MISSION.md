@@ -16,9 +16,9 @@ The engine has a finite set of primitives and keywords it understands. In order 
 The kernel spans two small, orthogonal paradigms. Most languages use one; some use both.
 
 - **Imperative core** — statements, expressions, and functions. Describes *behavior*. This is the `fn`/`if`/`while`/`return` world and the numeric/scalar primitives below. Targets: Rust, TypeScript, Swift, Kotlin, Python, etc.
-- **Declarative tree core** — named tree nodes with attributes and text. Describes *structure*. This is the substrate shared by **all** document and structured-data formats: an HTML element, a CSS rule, a Markdown block, a JSON object, a YAML/TOML table are all "a named node with attributes and children." Targets: HTML, CSS, Markdown, XML, JSON, YAML, TOML, config formats.
+- **Declarative tree core** — named tree nodes with attributes and text. Describes *structure*. This is the substrate shared by **all** document and structured-data formats: an HTML element, a CSS rule, a Markdown block, a JSON object, a YAML/TOML table are all "a named node with attributes and children." Targets: HTML, CSS, Markdown, XML, JSON, YAML, TOML, config formats. The core has exactly three nodes: **`node`** (a named node with attributes and children), **`attr`** (a name/value attribute on a node), and **`text`** (literal text content). A tree is a first-class **expression/value**: the two cores interoperate through expressions — a `fn` may return a node, and a node's attribute value or child may be any expression (enabling JSX-like interpolation, `<div>{name}</div>`). A file may also be a single top-level tree value (a pure markup/config document). Attribute and text/leaf values **reuse the imperative core's literals** — one kernel, two cores sharing primitives.
 
-Both cores stay deliberately tiny and frozen. Concrete vocabularies — every HTML tag, every CSS property, a specific config schema, a framework component model — are NOT kernel; they are language-definition detail or, better, **layers** built over the two cores. (The exact tree-core keyword set is intentionally left unpinned until the tree-core slice is built and can be pressure-tested against real HTML/CSS/JSON examples.)
+Both cores stay deliberately tiny and frozen. Concrete vocabularies — every HTML tag, every CSS property, a specific config schema, a framework component model — are NOT kernel; they are language-definition detail or, better, **layers** built over the two cores.
 
 A project also has a dimension neither core alone captures: the **file tree** itself — which files exist, their paths, and their formats. A directory tree is itself a named tree (a directory is a node; a file is a leaf whose content is imperative source or a tree document), so it fits the tree-core concept, but it introduces a new output model: the engine emits a *filesystem layout of many artifacts*, not a single string. This is where `lamina.toml` and composite/meta language files live.
 
@@ -32,7 +32,7 @@ Keywords fall into two classes.
 
 **Structural keywords** are kernel syntax that every target must be able to express. They are never gated by the capability matrix and may be desugared by the engine into a smaller statement set the language file must implement (fn, struct, if, while, return, block):
 
-file, use, fn, struct, enum, typedef, let, if, else, switch, case, default, while, for, foreach, return, break, continue, true, false, null
+file, use, fn, struct, enum, typedef, let, if, else, switch, case, default, while, for, foreach, return, break, continue, true, false, null, node, attr, text, tree
 
 (`let` is the local-binding statement; `foreach` is the iterator loop, distinct from the C-style counted `for` — see the imperative-core statement set. **Assignment** (`target = value`) is also a structural imperative statement: `target` is an lvalue — a ref, field access, or index — and the engine restricts it to those at construction. Compound assignment (`+=`), the ternary, and increment (`i++`) are NOT kernel nodes; they are language-definition *idioms* recognized from plain assignment / `if` / binary via the one-level structural predicates — see *Structural Predicates* below.)
 

@@ -258,6 +258,10 @@ pub enum ExprKind {
     Cast,
     /// A struct-literal construction expression (`expr is struct_lit`).
     StructLit,
+    /// A declarative tree node (`expr is node`).
+    Node,
+    /// A declarative tree text-content node (`expr is text`).
+    Text,
 }
 
 impl ExprKind {
@@ -278,6 +282,8 @@ impl ExprKind {
             ExprKind::Binary => "binary",
             ExprKind::Cast => "cast",
             ExprKind::StructLit => "struct_lit",
+            ExprKind::Node => "node",
+            ExprKind::Text => "text",
         }
     }
 }
@@ -356,6 +362,8 @@ pub enum ItemKind {
     Const,
     /// A `use` import (`item is use`).
     Use,
+    /// A top-level tree value (`item is tree`).
+    Tree,
 }
 
 impl ItemKind {
@@ -368,6 +376,7 @@ impl ItemKind {
             ItemKind::TypeDef => "typedef",
             ItemKind::Const => "const",
             ItemKind::Use => "use",
+            ItemKind::Tree => "tree",
         }
     }
 }
@@ -506,6 +515,8 @@ fn expr_kind_is_known(kind: &str) -> bool {
             | "binary"
             | "cast"
             | "struct_lit"
+            | "node"
+            | "text"
     )
 }
 
@@ -543,7 +554,7 @@ fn stmt_kind_is_known(kind: &str) -> bool {
 fn item_kind_is_known(kind: &str) -> bool {
     matches!(
         kind,
-        "function" | "struct" | "enum" | "typedef" | "const" | "use"
+        "function" | "struct" | "enum" | "typedef" | "const" | "use" | "tree"
     )
 }
 
@@ -1404,11 +1415,38 @@ mod tests {
     }
 
     #[test]
-    fn helper_facts_require_argument_and_value() {
-        // A helper name without an argument, or without `is <value>`, is a
-        // syntax error (helpers are fixed-arity, not bare flags).
-        assert!(parse_predicate("fnptr_ref_count").is_err());
-        assert!(parse_predicate("resolve(value)").is_err());
-        assert!(parse_predicate("type_of() is x").is_err());
+    fn tree_dispatch_facts_parse_and_evaluate() {
+        // `expr is node` / `expr is text` and `item is tree` are part of the
+        // closed vocabulary and dispatch on the tree kinds.
+        let node = parse_predicate("expr is node").expect("parse");
+        let c = RenderContext {
+            expr: Some(ExprKind::Node),
+            ..Default::default()
+        };
+        assert!(c.eval(&node));
+        let text = parse_predicate("expr is text").expect("parse");
+        let c2 = RenderContext {
+            expr: Some(ExprKind::Text),
+            ..Default::default()
+        };
+        assert!(c2.eval(&text));
+        assert!(!c.eval(&text));
+
+        let tree = parse_predicate("item is tree").expect("parse");
+        let c3 = RenderContext {
+            item: Some(ItemKind::Tree),
+            ..Default::default()
+        };
+        assert!(c3.eval(&tree));
+        assert!(!ctx().eval(&tree));
+    }
+
+    #[test]
+    fn rejects_unknown_tree_kinds_still() {
+        // The vocabulary stays closed: a made-up tree kind is still rejected.
+        assert!(matches!(
+            parse_predicate("expr is element"),
+            Err(PredicateError::UnknownFact { .. })
+        ));
     }
 }

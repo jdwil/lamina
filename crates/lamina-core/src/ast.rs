@@ -182,6 +182,15 @@ pub enum Item {
         /// Engine-transparent metadata (see [`Meta`]); default empty.
         meta: Meta,
     },
+    /// A **top-level tree value** (the tree core): a file whose root *is* a
+    /// declarative tree, i.e. a pure config/markup document (an HTML page, a
+    /// JSON object). The inner [`Expr`] is a tree expression — typically an
+    /// [`Expr::Node`], but any expression is permitted so the two cores
+    /// interoperate uniformly. Unlike the other item kinds, a tree item has no
+    /// entry template of its own: it renders straight through the shared
+    /// `### expr` dispatch, exactly as a tree expression embedded in imperative
+    /// code would.
+    Tree(Expr),
 }
 
 impl Item {
@@ -195,6 +204,7 @@ impl Item {
             Item::TypeDef { .. } => ItemKind::TypeDef,
             Item::Const { .. } => ItemKind::Const,
             Item::Use { .. } => ItemKind::Use,
+            Item::Tree(_) => ItemKind::Tree,
         }
     }
 
@@ -209,6 +219,8 @@ impl Item {
             | Item::TypeDef { meta, .. }
             | Item::Const { meta, .. }
             | Item::Use { meta, .. } => meta,
+            // A tree item's metadata is the tree expression's own metadata.
+            Item::Tree(expr) => expr.meta(),
         }
     }
 }
@@ -276,6 +288,7 @@ impl PartialEq for Item {
                 },
             ) => an == bn && at == bt && aval == bval && av == bv,
             (Item::Use { path: a, .. }, Item::Use { path: b, .. }) => a == b,
+            (Item::Tree(a), Item::Tree(b)) => a == b,
             _ => false,
         }
     }
@@ -347,6 +360,8 @@ pub enum ItemKind {
     Const,
     /// A `use` import.
     Use,
+    /// A top-level tree value (the tree core).
+    Tree,
 }
 
 impl ItemKind {
@@ -361,6 +376,7 @@ impl ItemKind {
             ItemKind::TypeDef => "typedef",
             ItemKind::Const => "const",
             ItemKind::Use => "use",
+            ItemKind::Tree => "tree",
         }
     }
 
@@ -375,6 +391,7 @@ impl ItemKind {
             ItemKind::TypeDef => "TypeDef",
             ItemKind::Const => "Const",
             ItemKind::Use => "Use",
+            ItemKind::Tree => "Tree",
         }
     }
 
@@ -387,13 +404,14 @@ impl ItemKind {
             ItemKind::TypeDef => SlotScope::TypeDef,
             ItemKind::Const => SlotScope::Const,
             ItemKind::Use => SlotScope::Use,
+            ItemKind::Tree => SlotScope::Node,
         }
     }
 
     /// Every item kind, in canonical order. Keeps the closed `item` vocabulary
     /// in one place, shared by the predicate registry and the language-def
     /// parser (which parses one `## <Item>` section per kind).
-    pub fn all() -> [ItemKind; 6] {
+    pub fn all() -> [ItemKind; 7] {
         [
             ItemKind::Function,
             ItemKind::Struct,
@@ -401,6 +419,7 @@ impl ItemKind {
             ItemKind::TypeDef,
             ItemKind::Const,
             ItemKind::Use,
+            ItemKind::Tree,
         ]
     }
 }
@@ -1163,7 +1182,73 @@ pub enum Expr {
         /// idiomatic inline object/closure form.
         meta: Meta,
     },
+    /// A **declarative tree node** (the tree core): a named node with
+    /// attributes and children.
+    ///
+    /// This is the universal substrate of every document and structured-data
+    /// format — an HTML element, a CSS rule, a JSON object, a YAML/TOML table
+    /// are all "a named node with attributes and children." The kernel keeps
+    /// the vocabulary generic: `name` is an opaque string whose meaning is a
+    /// language-definition / layer concern (an `html` layer defines `div`; a
+    /// JSON target maps the same node to an object), so NO format-specific
+    /// keyword lives in the kernel.
+    ///
+    /// A node is a first-class *expression*, so the imperative core can hold,
+    /// return, and build one (a `fn` may return a `Node`; a child or an
+    /// attribute value may be an arbitrary expression, enabling JSX-like
+    /// interpolation `<div>{name}</div>`). Children are arbitrary expressions —
+    /// a child may be another `Node`, a `Text`, or any other [`Expr`].
+    Node {
+        /// The node's name (generic — the language def / layer gives it
+        /// meaning).
+        name: String,
+        /// The node's attributes, in order (possibly empty).
+        attrs: Vec<Attr>,
+        /// The node's children, in order (possibly empty). Each child is an
+        /// arbitrary expression (another node, a text node, or an interpolated
+        /// value).
+        children: Vec<Expr>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. A layer
+        /// may tag a node (e.g. `void=true` for an HTML void element) so a
+        /// language definition can branch on it.
+        meta: Meta,
+    },
+    /// **Literal text content** in a tree (the tree core). The inner expression
+    /// is typically a [`Expr::StringLiteral`] but may be any expression
+    /// (interpolation), so a text node can carry an interpolated value the same
+    /// way a child can. Modelling `text` as an explicit node (rather than
+    /// merely allowing a bare literal child) lets a target treat text
+    /// distinctly from element children — e.g. HTML escapes text content but
+    /// not element markup, and JSON quotes a string scalar.
+    Text(Box<Expr>),
 }
+
+/// An **attribute** on a tree [`Expr::Node`]: a name and a value expression.
+///
+/// The value reuses the imperative core's literal/expression nodes (per the
+/// tree-core decision to share one value system), so an attribute value may be
+/// a [`Expr::StringLiteral`], an [`Expr::IntLiteral`], or an arbitrary
+/// expression (e.g. an interpolated `{someVar}`).
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
+pub struct Attr {
+    /// The attribute's name (generic — the language def / layer gives it
+    /// meaning).
+    pub name: String,
+    /// The attribute's value expression (reuses the imperative literals).
+    pub value: Expr,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
+}
+
+impl PartialEq for Attr {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.value == other.value
+    }
+}
+
+impl Eq for Attr {}
 
 /// One field initializer of a [`Expr::StructLit`]: a field name and its value.
 ///
@@ -1253,6 +1338,21 @@ impl PartialEq for Expr {
                     ..
                 },
             ) => at == bt && af == bf,
+            (
+                Expr::Node {
+                    name: an,
+                    attrs: aa,
+                    children: ac,
+                    ..
+                },
+                Expr::Node {
+                    name: bn,
+                    attrs: ba,
+                    children: bc,
+                    ..
+                },
+            ) => an == bn && aa == ba && ac == bc,
+            (Expr::Text(a), Expr::Text(b)) => a == b,
             _ => false,
         }
     }
@@ -1273,6 +1373,7 @@ impl Expr {
     pub fn meta(&self) -> &Meta {
         match self {
             Expr::StructLit { meta, .. } => meta,
+            Expr::Node { meta, .. } => meta,
             _ => {
                 static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Meta::new)
@@ -1298,6 +1399,8 @@ impl Expr {
             Expr::Binary { .. } => ExprKind::Binary,
             Expr::Cast { .. } => ExprKind::Cast,
             Expr::StructLit { .. } => ExprKind::StructLit,
+            Expr::Node { .. } => ExprKind::Node,
+            Expr::Text(_) => ExprKind::Text,
         }
     }
 }
@@ -1337,6 +1440,10 @@ pub enum ExprKind {
     Cast,
     /// A struct-literal (construction) expression.
     StructLit,
+    /// A declarative tree node (the tree core).
+    Node,
+    /// A declarative tree text-content node (the tree core).
+    Text,
 }
 
 impl ExprKind {
@@ -1357,6 +1464,8 @@ impl ExprKind {
             ExprKind::Binary => "binary",
             ExprKind::Cast => "cast",
             ExprKind::StructLit => "struct_lit",
+            ExprKind::Node => "node",
+            ExprKind::Text => "text",
         }
     }
 }
@@ -1635,6 +1744,21 @@ pub enum SlotScope {
     Const,
     /// Resolving slots of a [`Item::Use`] declaration: its `path` (scalar).
     Use,
+    /// Resolving slots of a tree [`Expr::Node`]: its `name` (scalar), and its
+    /// `attrs` / `children` sequences (which loop the `attr` / `child` item
+    /// slots).
+    Node,
+    /// Resolving slots of a single [`Attr`] element (one element of a node's
+    /// `attrs`). Exposes `name` (the attribute name) and `value` (the
+    /// attribute's value expression, dispatched through the `### expr` table);
+    /// loop facts (`first`/`last`) let the item template supply its own
+    /// separator.
+    Attr,
+    /// Resolving slots of a single node child element (one element of a node's
+    /// `children`). Its `value` sub-slot renders the child expression
+    /// (dispatching through the `### expr` table); loop facts (`first`/`last`)
+    /// let the item template supply its own separator.
+    Child,
 }
 
 /// The shape of an engine-bound slot: how the AST field it maps to is rendered.
@@ -1791,6 +1915,9 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "callee" => Some(SlotShape::Scalar),
             "ty" => Some(SlotShape::Scalar),
             "type_name" => Some(SlotShape::Scalar),
+            // A tree node's own name (scalar leaf). `value` (already bound
+            // above) doubles as the tree text node's inner expression.
+            "node_name" => Some(SlotShape::Scalar),
             "args" => Some(SlotShape::Sequence {
                 item_slot: "expr_arg".to_string(),
                 item_scope: SlotScope::ExprArg,
@@ -1798,6 +1925,15 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "fields" => Some(SlotShape::Sequence {
                 item_slot: "field_init".to_string(),
                 item_scope: SlotScope::FieldInit,
+            }),
+            // A tree node's attributes and children loop their own item slots.
+            "attrs" => Some(SlotShape::Sequence {
+                item_slot: "attr".to_string(),
+                item_scope: SlotScope::Attr,
+            }),
+            "children" => Some(SlotShape::Sequence {
+                item_slot: "child".to_string(),
+                item_scope: SlotScope::Child,
             }),
             _ => None,
         },
@@ -1867,6 +2003,37 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // A `use` import: `path` is a scalar leaf rendered verbatim.
         SlotScope::Use => match name {
             "path" => Some(SlotShape::Scalar),
+            _ => None,
+        },
+        // A tree node, when rendered as an item (top-level tree value). Its
+        // `node_name` is a scalar leaf; `attrs`/`children` loop their item
+        // slots. (When a node is rendered as an *expression* — the usual case —
+        // these same slots are bound in [`SlotScope::Expr`] above.)
+        SlotScope::Node => match name {
+            "node_name" => Some(SlotShape::Scalar),
+            "value" => Some(SlotShape::Scalar),
+            "attrs" => Some(SlotShape::Sequence {
+                item_slot: "attr".to_string(),
+                item_scope: SlotScope::Attr,
+            }),
+            "children" => Some(SlotShape::Sequence {
+                item_slot: "child".to_string(),
+                item_scope: SlotScope::Child,
+            }),
+            _ => None,
+        },
+        // A single attribute element: `name` is the attribute name (scalar
+        // leaf); `value` renders the attribute's value expression (dispatched
+        // through the `### expr` table).
+        SlotScope::Attr => match name {
+            "name" => Some(SlotShape::Scalar),
+            "value" => Some(SlotShape::Scalar),
+            _ => None,
+        },
+        // A single node-child element: `value` renders the child expression
+        // (dispatched through the `### expr` table).
+        SlotScope::Child => match name {
+            "value" => Some(SlotShape::Scalar),
             _ => None,
         },
     }
@@ -2236,7 +2403,7 @@ mod tests {
 
     #[test]
     fn item_kind_set_is_closed_and_spellings_match_headings() {
-        assert_eq!(ItemKind::all().len(), 6);
+        assert_eq!(ItemKind::all().len(), 7);
         // Each `item is <kind>` spelling and its `## <Heading>` are consistent.
         for kind in ItemKind::all() {
             assert!(!kind.as_str().is_empty());
@@ -2447,5 +2614,98 @@ mod tests {
             Some(SlotShape::Scalar)
         );
         assert_eq!(slot_binding("bogus", SlotScope::FieldInit), None);
+    }
+
+    #[test]
+    fn node_and_text_kinds_and_slots() {
+        let node = Expr::Node {
+            name: "div".into(),
+            attrs: vec![Attr {
+                name: "class".into(),
+                value: Expr::StringLiteral("x".into()),
+                meta: crate::ast::Meta::new(),
+            }],
+            children: vec![Expr::Text(Box::new(Expr::StringLiteral("hi".into())))],
+            meta: crate::ast::Meta::new(),
+        };
+        assert_eq!(node.kind(), ExprKind::Node);
+        assert_eq!(ExprKind::Node.as_str(), "node");
+        let text = Expr::Text(Box::new(Expr::StringLiteral("hi".into())));
+        assert_eq!(text.kind(), ExprKind::Text);
+        assert_eq!(ExprKind::Text.as_str(), "text");
+
+        // A node's `node_name` is a scalar leaf in expression scope; `attrs`
+        // and `children` are sequences looping the `attr` / `child` item slots.
+        assert_eq!(
+            slot_binding("node_name", SlotScope::Expr),
+            Some(SlotShape::Scalar)
+        );
+        match slot_binding("attrs", SlotScope::Expr) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "attr");
+                assert_eq!(item_scope, SlotScope::Attr);
+            }
+            other => panic!("attrs should be an attr sequence, got {other:?}"),
+        }
+        match slot_binding("children", SlotScope::Expr) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "child");
+                assert_eq!(item_scope, SlotScope::Child);
+            }
+            other => panic!("children should be a child sequence, got {other:?}"),
+        }
+        // An attr element exposes `name` and `value`; a child exposes `value`.
+        assert_eq!(
+            slot_binding("name", SlotScope::Attr),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(
+            slot_binding("value", SlotScope::Attr),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(
+            slot_binding("value", SlotScope::Child),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::Child), None);
+    }
+
+    #[test]
+    fn node_equality_ignores_metadata() {
+        // Two structurally-equal nodes are equal regardless of metadata (tree
+        // nodes follow the same metadata-ignoring equality as the rest of the
+        // AST).
+        let a = Expr::Node {
+            name: "p".into(),
+            attrs: vec![],
+            children: vec![],
+            meta: crate::ast::Meta::new(),
+        };
+        let b = Expr::Node {
+            name: "p".into(),
+            attrs: vec![],
+            children: vec![],
+            meta: crate::ast::Meta::new().with("void", "true"),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tree_item_kind_and_scope() {
+        let item = Item::Tree(Expr::Node {
+            name: "html".into(),
+            attrs: vec![],
+            children: vec![],
+            meta: crate::ast::Meta::new(),
+        });
+        assert_eq!(item.kind(), ItemKind::Tree);
+        assert_eq!(ItemKind::Tree.as_str(), "tree");
+        assert_eq!(ItemKind::Tree.scope(), SlotScope::Node);
     }
 }

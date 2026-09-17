@@ -49,6 +49,7 @@ const TITLE_PREFIX: &str = "# Lamina Language Definition:";
 const FUNCTION_HEADING: &str = "## Function";
 const CAPABILITIES_HEADING: &str = "## Capabilities";
 const OPERATORS_HEADING: &str = "## Operators";
+const TREE_HEADING: &str = "## Tree";
 
 /// Parses a rigid template-model `.mdl` language-definition document into a
 /// [`LanguageDef`].
@@ -65,25 +66,72 @@ const OPERATORS_HEADING: &str = "## Operators";
 pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
     let name = parse_title(src)?;
 
-    require_heading(src, FUNCTION_HEADING)?;
+    // `## Capabilities` is always required (the capability matrix gates every
+    // primitive, declarative or imperative). `## Function` is OPTIONAL: a
+    // purely declarative target (HTML, JSON, YAML, …) has no imperative
+    // callable to render, so it may omit `## Function` entirely and instead
+    // host its shared deep-helper slots (`### expr`, `### attr`, `### child`,
+    // …) under a `## Tree` section. At least one of `## Function` / `## Tree`
+    // must be present — a definition with neither can render nothing.
     require_heading(src, CAPABILITIES_HEADING)?;
 
-    // The `## Function` section is required and always present; it also hosts
-    // the SHARED deep-helper slots (`### expr`, `### statement`, `### pointer`,
-    // …) that the expression/type/statement resolvers reach regardless of which
-    // top-level item is being rendered.
-    let function_src = section_body(src, FUNCTION_HEADING);
-    let (entry, slots) = parse_entry_and_slots(&function_src, SlotScope::Function)?;
+    let has_function = src.lines().any(|l| l.trim_end() == FUNCTION_HEADING);
+    let has_tree = src.lines().any(|l| l.trim_end() == TREE_HEADING);
+    if !has_function && !has_tree {
+        return Err(LangDocError::MissingSection {
+            heading: FUNCTION_HEADING.to_string(),
+        });
+    }
+
+    // The `## Function` section, when present, carries the imperative entry
+    // template and hosts the SHARED deep-helper slots (`### expr`,
+    // `### statement`, `### pointer`, …) reached by the expression/type/
+    // statement resolvers regardless of which top-level item is being rendered.
+    // When absent (a declarative-only target), the `FunctionDef` has an empty
+    // entry template and its slots come from the `## Tree` section instead.
+    let (entry, mut slots) = if has_function {
+        let function_src = section_body(src, FUNCTION_HEADING);
+        parse_entry_and_slots(&function_src, SlotScope::Function)?
+    } else {
+        (
+            Template::parse("").map_err(|e| LangDocError::BadTemplate {
+                table: "<entry>".to_string(),
+                detail: e.to_string(),
+            })?,
+            HashMap::new(),
+        )
+    };
+
+    // The `## Tree` section is a slots-only home for the declarative tree
+    // core's shared helper slots (`### expr` and its `### attr` / `### child`
+    // item slots, plus any node sub-slots a target names). It has no entry
+    // template — a tree renders through the `### expr` dispatch. Its slots are
+    // MERGED into the function slot map (both the expression resolver and the
+    // top-level tree item read `lang.function.slots`), then the tree slot graph
+    // is validated starting from the `### expr` entry point in expression
+    // scope.
+    if has_tree {
+        let tree_src = section_body(src, TREE_HEADING);
+        let tree_slots = parse_slot_subsections(&tree_src)?;
+        for (k, v) in tree_slots {
+            slots.insert(k, v);
+        }
+        validate_tree_slot_graph(&slots)?;
+    }
+
     let function = FunctionDef { entry, slots };
 
     // Each non-function item kind gets its OWN `## <Item>` section (a sibling of
     // `## Function`). These sections are OPTIONAL: a definition that omits one
     // simply cannot emit that item kind (using it becomes an emit-time
     // `UnknownItem` error). When present, each is parsed exactly like the
-    // function section but validated in its own slot scope.
+    // function section but validated in its own slot scope. `Tree` is excluded:
+    // a top-level tree value renders through the shared `### expr` dispatch, not
+    // a `## <Item>` entry template, so `## Tree` is a helper section (handled
+    // above), never an item section.
     let mut items = HashMap::new();
     for kind in ItemKind::all() {
-        if kind == ItemKind::Function {
+        if kind == ItemKind::Function || kind == ItemKind::Tree {
             continue;
         }
         let heading = format!("## {}", kind.heading());
@@ -336,13 +384,35 @@ fn validate_slot_graph(
     slots: &HashMap<String, SlotDef>,
     scope: SlotScope,
 ) -> Result<(), LangDocError> {
-    let mut visited: Vec<(String, SlotScope)> = Vec::new();
     // Seed with the entry template's referenced slots, in the section's scope.
-    let mut work: Vec<(String, SlotScope)> = entry
+    let work: Vec<(String, SlotScope)> = entry
         .slot_names()
         .iter()
         .map(|s| (s.to_string(), scope))
         .collect();
+    validate_slots_from(work, slots)
+}
+
+/// Validates the declarative tree core's shared helper slots (hosted under
+/// `## Tree`). A tree renders through the `### expr` dispatch, so validation is
+/// seeded from the `expr` slot in expression scope; the transitive closure then
+/// reaches `### attr` / `### child` (via the `attrs` / `children` sequence
+/// bindings) and any node sub-slots the target names. An absent `### expr` is a
+/// dangling reference exactly as at function scope.
+fn validate_tree_slot_graph(slots: &HashMap<String, SlotDef>) -> Result<(), LangDocError> {
+    validate_slots_from(vec![("expr".to_string(), SlotScope::Expr)], slots)
+}
+
+/// The shared slot-graph traversal used by both [`validate_slot_graph`] (seeded
+/// from an entry template) and [`validate_tree_slot_graph`] (seeded from the
+/// `### expr` tree entry point). Every reachable slot must resolve to an
+/// engine-bound slot (in the scope it is referenced in) or a `### <slot>`
+/// subsection, and any sequence-shaped slot must have its item subsection.
+fn validate_slots_from(
+    mut work: Vec<(String, SlotScope)>,
+    slots: &HashMap<String, SlotDef>,
+) -> Result<(), LangDocError> {
+    let mut visited: Vec<(String, SlotScope)> = Vec::new();
 
     while let Some((name, scope)) = work.pop() {
         if visited.contains(&(name.clone(), scope)) {
@@ -1181,20 +1251,73 @@ mod tests {
     }
 
     #[test]
-    fn item_section_missing_field_item_slot_errors() {
-        // Referencing `{fields}` without a `### field` subsection is a
-        // load-time MissingItemSlot error (shape-driven, from slot_binding).
+    fn declarative_only_def_omits_function_section() {
+        // A def with a `## Tree` section and NO `## Function` loads: the tree
+        // helper slots are merged into the function slot map (which the
+        // expression resolver reads), and the entry template is empty.
         let doc = format!(
-            "{}\n\
-             ## Struct\n\n\
-             ```template\nstruct {{name}} {{{{ {{fields}} }}}}\n```\n",
-            mk(FN_SECTION)
+            "# Lamina Language Definition: html\n\n\
+             ## Tree\n\n\
+             ### expr\n\
+             | When         | Template |\n\
+             |--------------|----------|\n\
+             | expr is node | @element |\n\
+             | expr is text | \"{{value}}\" |\n\
+             | else         | forbid |\n\n\
+             ### element\n\
+             ```template\n\
+             <{{node_name}}{{attrs}}>{{children}}</{{node_name}}>\n\
+             ```\n\n\
+             ### attr\n\
+             | When | Template |\n\
+             |------|----------|\n\
+             | else | \" {{name}}\" |\n\n\
+             ### child\n\
+             | When | Template |\n\
+             |------|----------|\n\
+             | else | \"{{value}}\" |\n\n\
+             {FULL_CAPS}"
+        );
+        let def = parse_language_def(&doc).expect("declarative-only def parses");
+        assert_eq!(def.name, "html");
+        // The tree helper slots landed in the function slot map.
+        assert!(def.function.slots.contains_key("expr"));
+        assert!(def.function.slots.contains_key("element"));
+        assert!(def.function.slots.contains_key("attr"));
+        assert!(def.function.slots.contains_key("child"));
+        // No imperative entry, so the entry template is empty (no slots).
+        assert!(def.function.entry.slot_names().is_empty());
+    }
+
+    #[test]
+    fn def_with_neither_function_nor_tree_is_rejected() {
+        let doc = format!(
+            "# Lamina Language Definition: empty\n\n{FULL_CAPS}"
+        );
+        assert!(matches!(
+            parse_language_def(&doc),
+            Err(LangDocError::MissingSection { .. })
+        ));
+    }
+
+    #[test]
+    fn tree_section_dangling_slot_is_a_load_error() {
+        // A `### expr` node row references `@element` but there is no
+        // `### element` subsection -> load-time dangling-reference error.
+        let doc = format!(
+            "# Lamina Language Definition: html\n\n\
+             ## Tree\n\n\
+             ### expr\n\
+             | When         | Template |\n\
+             |--------------|----------|\n\
+             | expr is node | @element |\n\
+             | else         | forbid |\n\n\
+             {FULL_CAPS}"
         );
         assert_eq!(
             parse_language_def(&doc),
-            Err(LangDocError::MissingItemSlot {
-                collection: "fields".to_string(),
-                item: "field".to_string(),
+            Err(LangDocError::UnknownSlotReference {
+                slot: "element".to_string()
             })
         );
     }

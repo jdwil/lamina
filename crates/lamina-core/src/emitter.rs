@@ -9,7 +9,7 @@
 //! express fails loudly rather than emitting garbage.
 
 use crate::ast::{
-    slot_binding, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
+    slot_binding, Attr, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
     Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type,
     UnaryOp, Variant, Visibility,
 };
@@ -57,6 +57,10 @@ pub fn emit(file: &File, lang: &LanguageDef) -> Result<String, EmitError> {
 fn emit_item(item: &Item, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
     match item {
         Item::Function(function) => emit_function(function, lang, index),
+        // A top-level tree value renders straight through the shared `### expr`
+        // dispatch — it has no entry template of its own; a pure markup/config
+        // file is just its root tree expression.
+        Item::Tree(expr) => emit_expr(expr, lang, index),
         _ => {
             let kind = item.kind();
             let def = lang.item_def(kind).ok_or_else(|| EmitError::UnknownItem {
@@ -144,6 +148,7 @@ fn pred_item_kind(kind: ItemKind) -> PredItemKind {
         ItemKind::TypeDef => PredItemKind::TypeDef,
         ItemKind::Const => PredItemKind::Const,
         ItemKind::Use => PredItemKind::Use,
+        ItemKind::Tree => PredItemKind::Tree,
     }
 }
 
@@ -182,6 +187,7 @@ fn item_visibility(item: &Item) -> Option<Visibility> {
         | Item::Enum { visibility, .. }
         | Item::Const { visibility, .. } => Some(*visibility),
         Item::TypeDef { .. } | Item::Use { .. } => None,
+        Item::Tree(_) => None,
     }
 }
 
@@ -1225,6 +1231,8 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
         ExprKind::Binary => PredExprKind::Binary,
         ExprKind::Cast => PredExprKind::Cast,
         ExprKind::StructLit => PredExprKind::StructLit,
+        ExprKind::Node => PredExprKind::Node,
+        ExprKind::Text => PredExprKind::Text,
     }
 }
 
@@ -1269,6 +1277,10 @@ enum ExprScope<'a> {
     Arg(&'a Expr),
     /// Rendering one struct-literal field-initializer element.
     Field(&'a FieldInit),
+    /// Rendering one tree-node attribute element.
+    Attr(&'a Attr),
+    /// Rendering one tree-node child element.
+    Child(&'a Expr),
 }
 
 /// Resolves the slots of an expression (the `### expr` table and its sub-slots),
@@ -1288,6 +1300,8 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Node => SlotScope::Expr,
             ExprScope::Arg(_) => SlotScope::ExprArg,
             ExprScope::Field(_) => SlotScope::FieldInit,
+            ExprScope::Attr(_) => SlotScope::Attr,
+            ExprScope::Child(_) => SlotScope::Child,
         }
     }
 
@@ -1315,6 +1329,8 @@ impl<'a> ExprResolver<'a> {
         match &self.scope {
             ExprScope::Field(init) => args.push(("value", &init.value)),
             ExprScope::Arg(e) => args.push(("value", e)),
+            ExprScope::Attr(a) => args.push(("value", &a.value)),
+            ExprScope::Child(e) => args.push(("value", e)),
             ExprScope::Node => {}
         }
         for (arg, expr) in args {
@@ -1426,6 +1442,22 @@ impl<'a> ExprResolver<'a> {
             // name here is the fnptr-value convention).
             (ExprScope::Field(init), "name") => Ok(Rendered::text(init.name.clone())),
             (ExprScope::Field(init), "value") => emit_expr(&init.value, self.lang, self.index),
+            // A tree-node attribute element: its name and its value expression.
+            (ExprScope::Attr(attr), "name") => Ok(Rendered::text(attr.name.clone())),
+            (ExprScope::Attr(attr), "value") => emit_expr(&attr.value, self.lang, self.index),
+            // A tree-node child element: its child expression (dispatched
+            // through the `### expr` table).
+            (ExprScope::Child(child), "value") => emit_expr(child, self.lang, self.index),
+            // A tree node's own name.
+            (ExprScope::Node, "node_name") => match self.expr {
+                Expr::Node { name, .. } => Ok(Rendered::text(name.clone())),
+                _ => self.unknown_slot(name),
+            },
+            // A tree text node's inner expression (dispatched through `### expr`).
+            (ExprScope::Node, "value") if matches!(self.expr, Expr::Text(_)) => match self.expr {
+                Expr::Text(inner) => emit_expr(inner, self.lang, self.index),
+                _ => self.unknown_slot(name),
+            },
             // Operator spelling.
             (ExprScope::Node, "op") => match self.expr {
                 Expr::Unary { op, .. } => unary_op_spelling(*op, self.lang).map(Rendered::text),
@@ -1620,6 +1652,131 @@ impl<'a> ExprResolver<'a> {
         }
         Ok(out)
     }
+
+    /// Loops a tree node's attributes, rendering `item_slot` (`attr`) per
+    /// attribute with `first`/`last` loop facts, concatenating (each element
+    /// renders its own separators — no engine join).
+    fn render_attrs(&mut self, item_slot: &str) -> Result<Rendered, EmitError> {
+        let attrs: &'a [Attr] = match self.expr {
+            Expr::Node { attrs, .. } => attrs,
+            _ => {
+                return Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: "attrs".to_string(),
+                })
+            }
+        };
+        let len = attrs.len();
+        let mut out = Rendered::empty();
+        for (i, attr) in attrs.iter().enumerate() {
+            let mut elem_resolver = ExprResolver {
+                expr: self.expr,
+                lang: self.lang,
+                index: self.index,
+                scope: ExprScope::Attr(attr),
+            };
+            let slot = self
+                .lang
+                .function
+                .slots
+                .get(item_slot)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: item_slot.to_string(),
+                })?;
+            let ctx = RenderContext {
+                first: i == 0,
+                last: i + 1 == len,
+                meta: attr.meta.clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
+                ..Default::default()
+            };
+            let outcome = match &slot {
+                SlotDef::Fixed(outcome) => outcome.clone(),
+                SlotDef::Table(table) => table
+                    .select(&ctx)
+                    .ok_or_else(|| EmitError::NoMatchingRow {
+                        target: self.lang.name.clone(),
+                        table: item_slot.to_string(),
+                    })?
+                    .clone(),
+            };
+            let rendered = match outcome {
+                Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                Outcome::Forbid => {
+                    return Err(EmitError::ForbiddenConstruct {
+                        target: self.lang.name.clone(),
+                    })
+                }
+            };
+            out.push(rendered);
+        }
+        Ok(out)
+    }
+
+    /// Loops a tree node's children, rendering `item_slot` (`child`) per child
+    /// with `first`/`last` loop facts, concatenating (each element renders its
+    /// own separators — no engine join). Each child is an arbitrary expression
+    /// (another node, a text node, or an interpolated value).
+    fn render_children(&mut self, item_slot: &str) -> Result<Rendered, EmitError> {
+        let children: &'a [Expr] = match self.expr {
+            Expr::Node { children, .. } => children,
+            _ => {
+                return Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: "children".to_string(),
+                })
+            }
+        };
+        let len = children.len();
+        let mut out = Rendered::empty();
+        for (i, child) in children.iter().enumerate() {
+            let mut elem_resolver = ExprResolver {
+                expr: self.expr,
+                lang: self.lang,
+                index: self.index,
+                scope: ExprScope::Child(child),
+            };
+            let slot = self
+                .lang
+                .function
+                .slots
+                .get(item_slot)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: item_slot.to_string(),
+                })?;
+            let ctx = RenderContext {
+                first: i == 0,
+                last: i + 1 == len,
+                meta: child.meta().clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
+                ..Default::default()
+            };
+            let outcome = match &slot {
+                SlotDef::Fixed(outcome) => outcome.clone(),
+                SlotDef::Table(table) => table
+                    .select(&ctx)
+                    .ok_or_else(|| EmitError::NoMatchingRow {
+                        target: self.lang.name.clone(),
+                        table: item_slot.to_string(),
+                    })?
+                    .clone(),
+            };
+            let rendered = match outcome {
+                Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                Outcome::Forbid => {
+                    return Err(EmitError::ForbiddenConstruct {
+                        target: self.lang.name.clone(),
+                    })
+                }
+            };
+            out.push(rendered);
+        }
+        Ok(out)
+    }
 }
 
 impl<'a> SlotResolver for ExprResolver<'a> {
@@ -1639,6 +1796,10 @@ impl<'a> SlotResolver for ExprResolver<'a> {
             Some(SlotShape::Sequence { item_slot, .. }) => {
                 if item_slot == "field_init" {
                     self.render_fields(&item_slot)
+                } else if item_slot == "attr" {
+                    self.render_attrs(&item_slot)
+                } else if item_slot == "child" {
+                    self.render_children(&item_slot)
                 } else {
                     self.render_args(&item_slot)
                 }
@@ -1659,6 +1820,10 @@ impl<'a> ExprResolver<'a> {
             (ExprScope::Field(init), "value") => Some(&init.value),
             // A call-argument element's value.
             (ExprScope::Arg(e), "value") => Some(e),
+            // A tree-node attribute element's value.
+            (ExprScope::Attr(a), "value") => Some(&a.value),
+            // A tree-node child element's value (the child expression).
+            (ExprScope::Child(e), "value") => Some(e),
             // The expression node's own single sub-expressions.
             (ExprScope::Node, "value") => match self.expr {
                 Expr::Cast { value, .. } => Some(value),
@@ -1731,6 +1896,8 @@ impl<'a> ExprResolver<'a> {
         match &self.scope {
             ExprScope::Field(init) => &init.meta,
             ExprScope::Arg(e) => e.meta(),
+            ExprScope::Attr(a) => &a.meta,
+            ExprScope::Child(e) => e.meta(),
             ExprScope::Node => self.expr.meta(),
         }
     }

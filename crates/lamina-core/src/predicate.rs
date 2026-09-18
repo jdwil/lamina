@@ -173,6 +173,18 @@ pub struct RenderContext {
     /// declaration to a discriminated-union form, while a payloadless enum
     /// still renders as a plain enum.
     pub has_payload: bool,
+    /// `has_attributes` — a `struct` or `enum` carries at least one type-level
+    /// attribute (see [`TypeAttribute`](crate::ast::TypeAttribute)). Set on the
+    /// `## Struct` / `## Enum` entry template so a target can branch the
+    /// derive/annotation line on whether any attribute is present; a type with
+    /// no attributes leaves this false and renders byte-identically to before
+    /// attributes existed.
+    pub has_attributes: bool,
+    /// Answers `attr is <name>` — the type attribute currently being rendered
+    /// in a per-element `### attribute` item slot (e.g. `attr is debug`).
+    /// `None` when the node being rendered is not a single type-attribute
+    /// element.
+    pub attribute: Option<crate::ast::TypeAttribute>,
     /// Answers `value is <kind>` — the [`ExprKind`] of the current node's
     /// direct `value` sub-part (Part 2, one-level structural predicate). Set
     /// when the node being rendered has a `value` sub-expression (an `assign`'s
@@ -480,6 +492,7 @@ impl RenderContext {
             ("has_items", None) => self.has_items,
             ("has_alias", None) => self.has_alias,
             ("has_payload", None) => self.has_payload,
+            ("has_attributes", None) => self.has_attributes,
             // Enum queries.
             ("ret", Some("void")) => self.ret == Some(RetKind::Void),
             ("ret", Some("never")) => self.ret == Some(RetKind::Never),
@@ -512,6 +525,15 @@ impl RenderContext {
                     .map(|k| k.as_str() == kind)
                     .unwrap_or(false)
                     && variant_kind_is_known(kind)
+            }
+            // Type-attribute dispatch: `attr is <name>`. The value must be a
+            // known type-attribute spelling and match the attribute currently
+            // being rendered in a `### attribute` item slot.
+            ("attr", Some(name)) => {
+                self.attribute
+                    .map(|a| a.as_str() == name)
+                    .unwrap_or(false)
+                    && type_attribute_is_known(name)
             }
             // One-level structural sub-part kind query: `value is <kind>` — the
             // dispatch kind of the current node's direct `value` sub-part.
@@ -632,6 +654,14 @@ fn variant_kind_is_known(kind: &str) -> bool {
     matches!(kind, "unit" | "tuple" | "struct")
 }
 
+/// Returns `true` if `name` is a known `attr is <name>` value spelling. Keeps
+/// the closed type-attribute fact vocabulary in one place, shared by
+/// [`RenderContext::eval_fact`] and [`validate_fact`]. Mirrors
+/// [`variant_kind_is_known`], delegating to the [`TypeAttribute`] vocabulary.
+fn type_attribute_is_known(name: &str) -> bool {
+    crate::ast::TypeAttribute::from_name(name).is_some()
+}
+
 /// Validates that a fact is part of the closed registry. Used at parse time so
 /// a malformed `When` predicate fails loudly rather than silently evaluating to
 /// `false`.
@@ -659,6 +689,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_items", None)
             | ("has_alias", None)
             | ("has_payload", None)
+            | ("has_attributes", None)
             | ("ret", Some("void"))
             | ("ret", Some("never"))
             | ("ret", Some("type"))
@@ -681,6 +712,10 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // vocabulary.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("variant", Some(k)) if variant_kind_is_known(k));
+    // `attr is <name>` is validated against the closed type-attribute
+    // vocabulary; an unknown attribute value is rejected at parse time.
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("attr", Some(k)) if type_attribute_is_known(k));
     // `value is <kind>` — one-level sub-part kind query — is validated against
     // the closed expression-kind vocabulary (and must not be an `eq` query).
     let known = known
@@ -982,6 +1017,16 @@ impl PredParser {
                             Some(PTok::Ident(v)) => {
                                 self.pos += 1;
                                 (Some(v), None)
+                            }
+                            // `eq` is a reserved token (the structural-equality
+                            // operator) but is also a valid enum *value* word —
+                            // notably the `eq` type attribute (`attr is eq`). In
+                            // the value position after `is`, accept it as the
+                            // literal word `eq`; the equality operator only ever
+                            // appears directly after a key, never after `is`.
+                            Some(PTok::Eq) => {
+                                self.pos += 1;
+                                (Some("eq".to_string()), None)
                             }
                             _ => {
                                 return Err(PredicateError::Syntax {
@@ -1530,5 +1575,75 @@ mod tests {
             parse_predicate("expr is element"),
             Err(PredicateError::UnknownFact { .. })
         ));
+    }
+
+    // ---- Type attributes -----------------------------------------------
+
+    #[test]
+    fn has_attributes_fact_parses_and_evaluates() {
+        let p = parse_predicate("has_attributes").expect("parse");
+        let with = RenderContext {
+            has_attributes: true,
+            ..Default::default()
+        };
+        assert!(with.eval(&p));
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn attr_dispatch_fact_parses_and_evaluates() {
+        let p = parse_predicate("attr is debug").expect("parse");
+        let c = RenderContext {
+            attribute: Some(crate::ast::TypeAttribute::Debug),
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        // A different attribute does not match.
+        let c2 = RenderContext {
+            attribute: Some(crate::ast::TypeAttribute::Clone),
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
+        // No attribute in context -> the fact does not hold.
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn attr_all_values_parse_and_dispatch() {
+        for attr in crate::ast::TypeAttribute::all() {
+            let name = attr.as_str();
+            let p = parse_predicate(&format!("attr is {name}"))
+                .unwrap_or_else(|e| panic!("`attr is {name}` should parse: {e:?}"));
+            let c = RenderContext {
+                attribute: Some(attr),
+                ..Default::default()
+            };
+            assert!(c.eval(&p), "`attr is {name}` should hold for {attr:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_attr_value() {
+        // An unknown attribute value is rejected at parse time.
+        let err = parse_predicate("attr is serialize").expect_err("unknown attr");
+        assert!(matches!(err, PredicateError::UnknownFact { .. }));
+    }
+
+    #[test]
+    fn attr_composes_with_loop_facts() {
+        // The Rust derive idiom composes `attr is <name>` with `first`.
+        let p = parse_predicate("attr is debug && first").expect("parse");
+        let c = RenderContext {
+            attribute: Some(crate::ast::TypeAttribute::Debug),
+            first: true,
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        let c2 = RenderContext {
+            attribute: Some(crate::ast::TypeAttribute::Debug),
+            first: false,
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
     }
 }

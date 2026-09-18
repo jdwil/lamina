@@ -59,6 +59,7 @@ fn struct_with_fields_renders_rust() {
     let item = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         fields: vec![
             Field {
                 name: "x".to_string(),
@@ -87,6 +88,7 @@ fn struct_with_fields_renders_ts_interface() {
     let item = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         fields: vec![
             Field {
                 name: "x".to_string(),
@@ -117,6 +119,7 @@ fn empty_struct_renders() {
     let item = Item::Struct {
         name: "Empty".to_string(),
         visibility: Visibility::Private,
+        attributes: Vec::new(),
         fields: vec![],
         meta: lamina_core::ast::Meta::new(),
     };
@@ -131,6 +134,7 @@ fn enum_of_variants_renders() {
     let item = Item::Enum {
         name: "Color".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         variants: vec![
             Variant {
                 name: "Red".to_string(),
@@ -237,6 +241,7 @@ fn interleaved_struct_and_functions_render_in_order() {
         Item::Struct {
             name: "Mid".to_string(),
             visibility: Visibility::Private,
+            attributes: Vec::new(),
             fields: vec![Field {
                 name: "n".to_string(),
                 ty: i32t(),

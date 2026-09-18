@@ -144,6 +144,7 @@ fn payload_enum() -> Item {
     Item::Enum {
         name: "Shape".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         variants: vec![
             variant("Empty", VariantPayload::None),
             variant("Circle", VariantPayload::Tuple(vec![i32t()])),
@@ -195,6 +196,7 @@ fn payloadless_enum_still_renders_plain_both_targets() {
     let item = Item::Enum {
         name: "Color".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         variants: vec![
             variant("Red", VariantPayload::None),
             variant("Green", VariantPayload::None),
@@ -260,6 +262,7 @@ fn c_style_target_forbids_payload_variant() {
     let plain = Item::Enum {
         name: "Color".to_string(),
         visibility: Visibility::Private,
+        attributes: Vec::new(),
         variants: vec![
             variant("Red", VariantPayload::None),
             variant("Green", VariantPayload::None),
@@ -272,6 +275,7 @@ fn c_style_target_forbids_payload_variant() {
     let with_payload = Item::Enum {
         name: "Shape".to_string(),
         visibility: Visibility::Private,
+        attributes: Vec::new(),
         variants: vec![variant("Circle", VariantPayload::Tuple(vec![i32t()]))],
         meta: Meta::new(),
     };

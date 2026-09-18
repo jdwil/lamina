@@ -456,6 +456,7 @@ fn closure_captures_are_known_from_metadata_not_structure() {
     let env = Item::Struct {
         name: "Env".into(),
         visibility: Visibility::Private,
+        attributes: Vec::new(),
         fields: vec![
             Field {
                 name: "captured_x".into(),
@@ -580,6 +581,7 @@ fn field_type_helper_renders_declared_field_type() {
     let point = Item::Struct {
         name: "Point".into(),
         visibility: Visibility::Private,
+        attributes: Vec::new(),
         fields: vec![Field {
             name: "x".into(),
             ty: Type::Primitive(Primitive::I32),

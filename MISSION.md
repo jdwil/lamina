@@ -11,6 +11,20 @@ ProductHost and commercial licenses: same address.
 
 The engine has a finite set of primitives and keywords it understands. In order for the engine to produce raw code during transpilation, it must be provided a language file. Each language file provides a capability matrix, which lets the engine know which of its primitives and keywords the target language supports. Layers may only lower to Lamina code utilizing constructs that are supported by the capability matrix of the given language file. This means a given Lamina project may transpile to multiple languages, but not all languages. Here is a list of keywords and primitives that are supported.
 
+## Out-of-the-Gate Target Languages
+
+Lamina commits to supporting a **deliberately diverse** set of targets from the start — chosen both for practical use and to stress-test the kernel. If a demanding target (notably Haskell) requires kernel keywords we lack, that is a signal to add them *now*, before layers, parser, and downstream tooling calcify. Everything built in Lamina core must support these targets:
+
+- **Imperative (brace family):** Rust, TypeScript, Swift, Kotlin, Java, C, Go
+- **Dynamically typed imperative:** JavaScript, Python, Ruby
+- **Functional:** Haskell
+- **Declarative tree / data:** CSS, HTML, JSON, YAML, TOML
+- **Query:** SQL
+- **Wearable/niche:** Monkey C (Garmin Connect IQ)
+- **Composite (a milestone, not a plain language file):** Svelte/SvelteKit — a `.svelte` file braids TypeScript + HTML + scoped CSS and requires the composite/delegating language-definition mechanism (not yet built).
+
+Diversity is the point: Python tests the brace-free/indentation path; C tests maximal `forbid` plus the struct+fnptr reconstruction substrate; Haskell tests the limits of a statement-and-mutation kernel lowering to a pure-functional target; CSS tests the tree core against styles; Svelte tests composite output. Some (Svelte, HTML-as-XML+layer) depend on machinery not yet built and are sequenced later.
+
 ### Two Kernel Cores
 
 The kernel spans two small, orthogonal paradigms. Most languages use one; some use both.
@@ -51,6 +65,10 @@ A modifier is **semantic metadata first, emitted text second.** Some modifiers u
 **Visibility** is not on/off but a choice among three kernel levels: `public`, `protected`, `private`. Each language file maps each kernel level to its target spelling or forbids it (Rust `pub` / `pub(crate)` / none; Swift `public` / `internal` / `private`; TypeScript may forbid `protected` for free functions). For free functions in kernel v0 there is no inheritance, so `protected` reads as the middle tier (more than private, less than public) and maps to a target's module/package visibility. (When an OOP layer later introduces classes, an OOP-level `protected` with true subclass semantics will be reconciled against this kernel module-tier meaning.)
 
 Modifiers that apply only to a *method on a type* (static, override, virtual, abstract, final, mutating, class-vs-instance) are NOT kernel callable modifiers — methods and receivers are layer concepts, so those belong to an OOP layer, not the kernel.
+
+### Type Attributes
+
+Analogous to callable modifiers, the kernel reserves a **superset** of *type-level attributes* that may be applied to an aggregate type (`struct`/`enum`): `debug`, `eq`, `ord`, `hash`, `clone`, `copy`, `default`, `iterable`. These are the behavioral capabilities a target may automatically derive for a type. The kernel is permissive; each language file realizes each attribute per target, in one of three ways: **realize** (emit the target's derive/annotation spelling — Rust folds the whole set into one `#[derive(Debug, Clone, PartialEq)]` line), **inherent** (emit nothing because the target provides the behavior with no declaration), or **forbid** (the target cannot realize the attribute as a type attribute, so a type carrying it cannot target that language). Like a callable modifier, a type attribute is **semantic metadata first, emitted text second** — it stays attached to the IR node regardless of a target's spelling, and (like metadata) is ignored by structural equality. Attributes realize through the item-slot mechanism (a `### attribute` slot in each `## Struct` / `## Enum`, with the `attr is <name>` dispatch fact and the `has_attributes` branch fact), consistent with how operators use a scalar slot rather than per-op facts — not a separate matrix section.
 
 ### Operators
 

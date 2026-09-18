@@ -1672,6 +1672,52 @@ pub enum Expr {
         /// metadata channel with no special-casing.
         meta: Meta,
     },
+    /// A **lambda**: a first-class anonymous function value — the kernel's ONE
+    /// functional-core primitive.
+    ///
+    /// A lambda is essentially an anonymous [`Function`] value: it reuses the
+    /// same [`Param`] and statement-body machinery. It is the single
+    /// irreducible functional construct the imperative kernel was missing —
+    /// `map`/`fold`/`filter`, ranges, list comprehensions, and let-expressions
+    /// all REDUCE to *lambda + recursion + application + collections*, so they
+    /// are LIBRARY concerns rendered per-target at the call site, NOT kernel.
+    /// Adding this one primitive makes the kernel dual-paradigm (imperative +
+    /// functional).
+    ///
+    /// The `body` is a statement **block** (the most general form), NOT
+    /// expression-only: lambda body shape varies by target
+    /// (Python/Haskell are expression-only; JS/Rust/Swift/Kotlin allow
+    /// statement blocks), so the kernel holds the general form and a
+    /// single-expression lambda is simply a one-statement body (a `return` or
+    /// expression statement) that a def may render concisely.
+    ///
+    /// **Capture is the target's concern** — the kernel adds NO capture
+    /// analysis. Closure-capable targets (Rust, TS/JS, Haskell, Swift, Kotlin)
+    /// render this node DIRECTLY as their native closure. Expression-only
+    /// targets (Python) render a single-expression lambda directly and HOIST a
+    /// multi-statement one to a named `def`; lambda-less targets (C) hoist to a
+    /// named function + fnptr — both via the existing `origin=lambda` metadata /
+    /// `fresh_name` reconstruction path, of which `Expr::Lambda` is now the
+    /// PRIMARY kernel representation.
+    ///
+    /// Structural equality **ignores** the `meta` field (see [`Meta`]).
+    Lambda {
+        /// The lambda's parameters, in order (possibly empty). Reuses the
+        /// existing [`Param`] (name + type).
+        params: Vec<Param>,
+        /// The optional declared return type. Inference targets (where the
+        /// return type is elided) omit it; the `has_ret_type` fact guards its
+        /// rendering.
+        return_type: Option<Type>,
+        /// The lambda's body: a statement block (the general form). A
+        /// single-expression lambda is a one-statement body.
+        body: Vec<Statement>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. The
+        /// existing lambda-reconstruction path tags a hoisted anonymous
+        /// function here (e.g. `origin=lambda`) so a lambda-less / expression-
+        /// only target can reconstruct the idiomatic form.
+        meta: Meta,
+    },
 }
 
 /// An **attribute** on a tree [`Expr::Node`]: a name and a value expression.
@@ -1811,6 +1857,22 @@ impl PartialEq for Expr {
             // A raw node's structural identity is its verbatim string; metadata
             // is ignored (consistent with every other node).
             (Expr::Raw { code: a, .. }, Expr::Raw { code: b, .. }) => a == b,
+            // A lambda's structural identity is its params, return type, and
+            // body; metadata is ignored (consistent with every other node).
+            (
+                Expr::Lambda {
+                    params: ap,
+                    return_type: ar,
+                    body: ab,
+                    ..
+                },
+                Expr::Lambda {
+                    params: bp,
+                    return_type: br,
+                    body: bb,
+                    ..
+                },
+            ) => ap == bp && ar == br && ab == bb,
             _ => false,
         }
     }
@@ -1834,6 +1896,7 @@ impl Expr {
             Expr::Node { meta, .. } => meta,
             Expr::ArrayLit { meta, .. } => meta,
             Expr::Raw { meta, .. } => meta,
+            Expr::Lambda { meta, .. } => meta,
             _ => {
                 static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Meta::new)
@@ -1863,6 +1926,7 @@ impl Expr {
             Expr::Text(_) => ExprKind::Text,
             Expr::ArrayLit { .. } => ExprKind::ArrayLit,
             Expr::Raw { .. } => ExprKind::Raw,
+            Expr::Lambda { .. } => ExprKind::Lambda,
         }
     }
 }
@@ -1910,6 +1974,8 @@ pub enum ExprKind {
     ArrayLit,
     /// A raw / verbatim expression fragment (the layer escape hatch).
     Raw,
+    /// A lambda (anonymous function value) — the functional-core primitive.
+    Lambda,
 }
 
 impl ExprKind {
@@ -1934,6 +2000,7 @@ impl ExprKind {
             ExprKind::Text => "text",
             ExprKind::ArrayLit => "array",
             ExprKind::Raw => "raw",
+            ExprKind::Lambda => "lambda",
         }
     }
 }
@@ -2254,6 +2321,14 @@ pub enum SlotScope {
     /// [`SlotScope::Statement`] `value` slot, so no separate scope is needed for
     /// them.)
     Raw,
+    /// Resolving slots of a [`Expr::Lambda`]: its `params` (a Sequence looping
+    /// the shared `param` item slot, resolved in [`SlotScope::Param`]), its
+    /// optional `ret_type` (a scalar, guarded by the `has_ret_type` fact), and
+    /// its `body` (a Sequence of statements looping the recursive `statement`
+    /// item slot, resolved in [`SlotScope::Statement`]). A closure-capable
+    /// target renders these into its native closure syntax; capture is the
+    /// target's concern.
+    Lambda,
 }
 
 /// The shape of an engine-bound slot: how the AST field it maps to is rendered.
@@ -2602,6 +2677,24 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // (a scalar leaf), emitted unchanged.
         SlotScope::Raw => match name {
             "value" => Some(SlotShape::Scalar),
+            _ => None,
+        },
+        // A lambda: `params` loops the shared `param` item slot (reusing
+        // [`SlotScope::Param`], so a lambda parameter renders through the same
+        // `name`/`type` sub-slots as a function parameter); `ret_type` is a
+        // scalar (the optional declared return type, guarded by `has_ret_type`);
+        // `body` loops the recursive `statement` item slot (the general
+        // statement-block form).
+        SlotScope::Lambda => match name {
+            "ret_type" => Some(SlotShape::Scalar),
+            "params" => Some(SlotShape::Sequence {
+                item_slot: "param".to_string(),
+                item_scope: SlotScope::Param,
+            }),
+            "body" => Some(SlotShape::Sequence {
+                item_slot: "statement".to_string(),
+                item_scope: SlotScope::Statement,
+            }),
             _ => None,
         },
     }

@@ -1665,6 +1665,7 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
         ExprKind::Text => PredExprKind::Text,
         ExprKind::ArrayLit => PredExprKind::ArrayLit,
         ExprKind::Raw => PredExprKind::Raw,
+        ExprKind::Lambda => PredExprKind::Lambda,
     }
 }
 
@@ -1719,6 +1720,9 @@ enum ExprScope<'a> {
     Child(&'a Expr),
     /// Rendering one array-literal element.
     ArrayElem(&'a Expr),
+    /// Rendering one lambda parameter element (reuses the shared `param` item
+    /// slot, resolving in [`SlotScope::Param`] via the lambda's own params).
+    LambdaParam(&'a Param),
 }
 
 /// Resolves the slots of an expression (the `### expr` table and its sub-slots),
@@ -1735,12 +1739,18 @@ impl<'a> ExprResolver<'a> {
     /// The [`SlotScope`] for querying [`slot_binding`] in the current scope.
     fn scope_kind(&self) -> SlotScope {
         match self.scope {
+            // The expression node itself: a lambda's own slots (`params`,
+            // `ret_type`, `body`) live in [`SlotScope::Lambda`]; every other
+            // expression node resolves its sub-slots in [`SlotScope::Expr`].
+            ExprScope::Node if matches!(self.expr, Expr::Lambda { .. }) => SlotScope::Lambda,
             ExprScope::Node => SlotScope::Expr,
             ExprScope::Arg(_) => SlotScope::ExprArg,
             ExprScope::Field(_) => SlotScope::FieldInit,
             ExprScope::Attr(_) => SlotScope::Attr,
             ExprScope::Child(_) => SlotScope::Child,
             ExprScope::ArrayElem(_) => SlotScope::ArrayElem,
+            // A lambda parameter reuses the shared `param` sub-slots.
+            ExprScope::LambdaParam(_) => SlotScope::Param,
         }
     }
 
@@ -1753,6 +1763,15 @@ impl<'a> ExprResolver<'a> {
             expr: Some(pred_expr_kind(self.expr.kind())),
             meta: self.node_meta().clone(),
             helper_facts: self.compute_helper_facts(),
+            // A lambda exposes whether it carries an explicit return type so the
+            // `### expr` `lambda` row can render the annotation conditionally.
+            has_ret_type: matches!(
+                self.expr,
+                Expr::Lambda {
+                    return_type: Some(_),
+                    ..
+                }
+            ),
             ..Default::default()
         }
     }
@@ -1771,6 +1790,9 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Attr(a) => args.push(("value", &a.value)),
             ExprScope::Child(e) => args.push(("value", e)),
             ExprScope::ArrayElem(e) => args.push(("value", e)),
+            // A lambda parameter exposes no value sub-expression (only name +
+            // type), so there are no render-helper args to compute.
+            ExprScope::LambdaParam(_) => {}
             ExprScope::Node => {}
         }
         for (arg, expr) in args {
@@ -1890,6 +1912,22 @@ impl<'a> ExprResolver<'a> {
             // An array-literal element: its element expression (dispatched
             // through the `### expr` table).
             (ExprScope::ArrayElem(elem), "value") => emit_expr(elem, self.lang, self.index),
+            // A lambda parameter element: reuses the shared `param` sub-slots
+            // (`name` and `type`), so a lambda parameter renders identically to
+            // a function parameter.
+            (ExprScope::LambdaParam(p), "name") => Ok(Rendered::text(p.name.clone())),
+            (ExprScope::LambdaParam(p), "type") => resolve_type(&p.ty, self.lang, self.index),
+            // A lambda's optional declared return type (guarded by the
+            // `has_ret_type` fact). Rendering `ret_type` when the lambda elides
+            // the type would be a definition error, so it is an unknown slot in
+            // that case.
+            (ExprScope::Node, "ret_type") => match self.expr {
+                Expr::Lambda {
+                    return_type: Some(ty),
+                    ..
+                } => resolve_type(ty, self.lang, self.index),
+                _ => self.unknown_slot(name),
+            },
             // A tree node's own name.
             (ExprScope::Node, "node_name") => match self.expr {
                 Expr::Node { name, .. } => Ok(Rendered::text(name.clone())),
@@ -2307,6 +2345,73 @@ impl<'a> ExprResolver<'a> {
         }
         Ok(out)
     }
+
+    /// Loops a lambda's parameters, rendering `item_slot` (`param`) per
+    /// parameter with `first`/`last` loop facts, concatenating (each element
+    /// renders its own separator — no engine join). Reuses the shared `param`
+    /// item slot and [`SlotScope::Param`], so a lambda parameter renders through
+    /// the same `name`/`type` sub-slots as a function parameter.
+    fn render_lambda_params(&mut self, item_slot: &str) -> Result<Rendered, EmitError> {
+        let params: &'a [Param] = match self.expr {
+            Expr::Lambda { params, .. } => params,
+            _ => {
+                return Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: "params".to_string(),
+                })
+            }
+        };
+        let len = params.len();
+        let mut out = Rendered::empty();
+        for (i, param) in params.iter().enumerate() {
+            let mut elem_resolver = ExprResolver {
+                expr: self.expr,
+                lang: self.lang,
+                index: self.index,
+                scope: ExprScope::LambdaParam(param),
+            };
+            let slot = self
+                .lang
+                .function
+                .slots
+                .get(item_slot)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: item_slot.to_string(),
+                })?;
+            let ctx = RenderContext {
+                first: i == 0,
+                last: i + 1 == len,
+                meta: param.meta.clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
+                ..Default::default()
+            };
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl<'a> SlotResolver for ExprResolver<'a> {
@@ -2332,6 +2437,24 @@ impl<'a> SlotResolver for ExprResolver<'a> {
                     self.render_children(&item_slot)
                 } else if item_slot == "array_elem" {
                     self.render_elems(&item_slot)
+                } else if item_slot == "param" {
+                    // A lambda's parameters loop the shared `param` item slot.
+                    self.render_lambda_params(&item_slot)
+                } else if item_slot == "statement" {
+                    // A lambda's body is a statement sequence, rendered through
+                    // the dedicated statement machinery (recursive `statement`
+                    // item slot). A lambda has no enclosing-callable synchrony
+                    // of its own, so `caller` is threaded as `None`.
+                    let body: &'a [Statement] = match self.expr {
+                        Expr::Lambda { body, .. } => body,
+                        _ => {
+                            return Err(EmitError::UnknownSlot {
+                                target: self.lang.name.clone(),
+                                slot: "body".to_string(),
+                            })
+                        }
+                    };
+                    render_statement_sequence(body, &item_slot, self.lang, self.index, None)
                 } else {
                     self.render_args(&item_slot)
                 }
@@ -2436,6 +2559,7 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Attr(a) => &a.meta,
             ExprScope::Child(e) => e.meta(),
             ExprScope::ArrayElem(e) => e.meta(),
+            ExprScope::LambdaParam(p) => &p.meta,
             ExprScope::Node => self.expr.meta(),
         }
     }

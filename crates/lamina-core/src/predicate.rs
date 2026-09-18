@@ -180,6 +180,11 @@ pub struct RenderContext {
     /// no attributes leaves this false and renders byte-identically to before
     /// attributes existed.
     pub has_attributes: bool,
+    /// `has_ret_type` — a lambda ([`Expr::Lambda`](crate::ast::Expr::Lambda))
+    /// carries an explicit declared return type. Set on the `### expr` `lambda`
+    /// row so a target can render the return-type annotation conditionally
+    /// (Rust `|x| -> i32 { … }`); an inference-only lambda leaves it false.
+    pub has_ret_type: bool,
     /// Answers `attr is <name>` — the type attribute currently being rendered
     /// in a per-element `### attribute` item slot (e.g. `attr is displayable`).
     /// `None` when the node being rendered is not a single type-attribute
@@ -301,6 +306,8 @@ pub enum ExprKind {
     ArrayLit,
     /// A raw / verbatim expression fragment (`expr is raw`).
     Raw,
+    /// A lambda / anonymous function value (`expr is lambda`).
+    Lambda,
 }
 
 impl ExprKind {
@@ -325,6 +332,7 @@ impl ExprKind {
             ExprKind::Text => "text",
             ExprKind::ArrayLit => "array",
             ExprKind::Raw => "raw",
+            ExprKind::Lambda => "lambda",
         }
     }
 }
@@ -502,6 +510,7 @@ impl RenderContext {
             ("has_alias", None) => self.has_alias,
             ("has_payload", None) => self.has_payload,
             ("has_attributes", None) => self.has_attributes,
+            ("has_ret_type", None) => self.has_ret_type,
             // Enum queries.
             ("ret", Some("void")) => self.ret == Some(RetKind::Void),
             ("ret", Some("never")) => self.ret == Some(RetKind::Never),
@@ -616,6 +625,7 @@ fn expr_kind_is_known(kind: &str) -> bool {
             | "text"
             | "array"
             | "raw"
+            | "lambda"
     )
 }
 
@@ -701,6 +711,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_alias", None)
             | ("has_payload", None)
             | ("has_attributes", None)
+            | ("has_ret_type", None)
             | ("ret", Some("void"))
             | ("ret", Some("never"))
             | ("ret", Some("type"))
@@ -1220,7 +1231,7 @@ mod tests {
     fn expr_kind_all_values_parse() {
         for kind in [
             "int", "float", "bool", "string", "char", "null", "ref", "field", "index", "call",
-            "unary", "binary",
+            "unary", "binary", "cast", "struct_lit", "node", "text", "array", "raw", "lambda",
         ] {
             parse_predicate(&format!("expr is {kind}"))
                 .unwrap_or_else(|e| panic!("`expr is {kind}` should parse: {e:?}"));
@@ -1229,7 +1240,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_expr_kind() {
-        let err = parse_predicate("expr is lambda").expect_err("unknown expr kind");
+        // `closure` is not a kernel expression kind (the functional-core
+        // primitive is spelled `lambda`), so it must be rejected.
+        let err = parse_predicate("expr is closure").expect_err("unknown expr kind");
         assert!(matches!(err, PredicateError::UnknownFact { .. }));
     }
 
@@ -1446,7 +1459,7 @@ mod tests {
             Err(PredicateError::UnknownFact { .. })
         ));
         assert!(matches!(
-            parse_predicate("value is lambda"),
+            parse_predicate("value is closure"),
             Err(PredicateError::UnknownFact { .. })
         ));
     }

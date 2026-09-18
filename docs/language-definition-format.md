@@ -295,7 +295,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `vis is public` / `vis is protected` / `vis is private` | enum | the visibility level |
 | `caller is async` / `caller is sync` | enum | the enclosing callable's synchrony (inherited) |
 | `first` / `last` | bool | this element is the first / last in the collection being looped (only meaningful inside an item slot) |
-| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit` `node` `text` `array`) |
+| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit` `node` `text` `array` `raw` `lambda`) |
 | `stmt is <kind>` | enum | the statement being rendered is that kind (`block` `let` `return` `if` `while` `for` `foreach` `switch` `break` `continue` `assign` `expr`) |
 | `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use` `tree`) |
 | `variant is <kind>` | enum | the enum variant being rendered has that payload shape (`unit` `tuple` `struct`) |
@@ -305,6 +305,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `has_alias` | bool | (`use` import / import item) the module — or a selectively-imported item — carries an alias (`use path as p`, `a as b`) |
 | `has_payload` | bool | (`enum`) at least one variant carries a payload (tuple or struct) — lets a target branch the whole enum to a discriminated-union form |
 | `has_attributes` | bool | (`struct`/`enum`) the type carries at least one type-level attribute — lets a target branch its derive/annotation line |
+| `has_ret_type` | bool | (`expr is lambda`) the lambda being rendered declares an explicit return type — lets a target render the return-type annotation conditionally |
 | `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`displayable` `equatable` `comparable` `hashable` `cloneable` `copyable` `hasdefault` `iterable`) |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
@@ -408,6 +409,54 @@ fixed array lives in the kernel.
   each with its own `has_alias` fact for the `name as alias` form) and `{alias}`;
   TypeScript spells the three forms `import path;`, `import * as p from path;`,
   `import { a, b as c } from path;`.
+
+### Lambda (the functional-core primitive)
+
+A **lambda** (`expr is lambda`) is the kernel's one first-class function value —
+essentially an anonymous `Function`. It is the single irreducible functional
+construct: `map`/`fold`/`filter`, ranges, list comprehensions, and
+let-expressions all reduce to *lambda + recursion + application + collections*,
+so they are **library** concerns (rendered idiomatically per target at the call
+site via the def/metadata), not kernel. This one addition makes the kernel
+dual-paradigm (imperative + functional).
+
+A lambda exposes three slots (resolved in the lambda's own scope):
+
+- `{params}` — the parameter collection, looped through the **shared
+  `### param` item slot** (identical `{name}`/`{type}` sub-slots as a function
+  parameter, each supplying its own `, ` separator via the `first` loop fact).
+- `{ret_type}` — the optional declared return type, rendered through the type
+  machinery. Guarded by the **`has_ret_type`** fact: an inference-only lambda
+  omits it, an annotated lambda selects a row that renders it.
+- `{body}` — the lambda body, a **statement block** (the general form) looped
+  through the recursive `### statement` item slot, so a lambda body composes
+  exactly like a function body. A single-expression lambda is simply a
+  one-statement body.
+
+**Capture is the target's concern** — the kernel adds no capture analysis.
+Closure-capable targets render the node directly as their native closure. The
+two shipped defs do so:
+
+```text
+### expr
+| expr is lambda && has_ret_type | @lambda_ret |
+| expr is lambda                 | @lambda     |
+```
+
+Rust spells it a closure `|params| { body }` (and `|params| -> Ret { body }`
+when annotated); TypeScript spells it an arrow function `(params) => { body }`
+(and `(params): Ret => { body }`). Both render the **block body form** for the
+general case; this is the faithful rendering of the general statement-block body
+and requires no additional kernel construct. A def *may* choose a concise
+single-expression spelling for a one-statement body, but the shipped defs keep
+the block form for uniformity.
+
+Expression-only targets (Python: `lambda x: expr`) and lambda-less targets (C)
+instead **realize** `Expr::Lambda` by the existing hoist-to-named-function path
+(`origin=lambda` metadata + `fresh_name` + `{resolve_fnptr(...)}` inlining via
+the `### anon_fn` slot). `Expr::Lambda` is the primary kernel representation of a
+function value; that reconstruction path is how a target *without* native
+closures realizes it — the two compose, they are not parallel lambda concepts.
 
 ### Type Attributes (derivable capabilities on `struct` / `enum`)
 

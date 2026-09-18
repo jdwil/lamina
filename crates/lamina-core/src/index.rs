@@ -385,6 +385,15 @@ fn count_fnptr_refs_in_expr(
                 count_fnptr_refs_in_expr(e, items, counts);
             }
         }
+        // A lambda's body is a statement block: a bare function reference in a
+        // value position within the body is a fnptr value, so recurse through
+        // the body statements. (Parameters are binding positions, not value
+        // references, so they carry no fnptr values themselves.)
+        Expr::Lambda { body, .. } => {
+            for s in body {
+                count_fnptr_refs_in_stmt(s, items, counts);
+            }
+        }
         Expr::IntLiteral(_)
         | Expr::FloatLiteral(_)
         | Expr::BoolLiteral(_)

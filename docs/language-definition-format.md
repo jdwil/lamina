@@ -241,6 +241,8 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `has_items` | bool | (`use` import) the import carries a selective item list (`use path::{a, b}`) |
 | `has_alias` | bool | (`use` import / import item) the module — or a selectively-imported item — carries an alias (`use path as p`, `a as b`) |
 | `has_payload` | bool | (`enum`) at least one variant carries a payload (tuple or struct) — lets a target branch the whole enum to a discriminated-union form |
+| `has_attributes` | bool | (`struct`/`enum`) the type carries at least one type-level attribute — lets a target branch its derive/annotation line |
+| `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`debug` `eq` `ord` `hash` `clone` `copy` `default` `iterable`) |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
@@ -343,6 +345,51 @@ fixed array lives in the kernel.
   each with its own `has_alias` fact for the `name as alias` form) and `{alias}`;
   TypeScript spells the three forms `import path;`, `import * as p from path;`,
   `import { a, b as c } from path;`.
+
+### Type Attributes (derivable capabilities on `struct` / `enum`)
+
+A `struct` or `enum` may request a set of **type-level attributes** — the
+type-level analog of a callable modifier. The kernel reserves the *superset* of
+behavioral capabilities a target may realize for an aggregate type:
+
+`debug` · `eq` · `ord` · `hash` · `clone` · `copy` · `default` · `iterable`
+
+Each attribute is **semantic metadata first, emitted text second** (like a
+callable modifier): it stays attached to the IR node regardless of a target's
+spelling, so it also informs the *raise* direction, examples, and analysis.
+Attributes are **ignored by structural equality** (exactly as metadata is), so
+requesting attributes never perturbs idiom recognition.
+
+Attributes realize through the **item-slot mechanism**, not a separate matrix
+section — consistent with how operators use a scalar slot rather than
+per-operator facts. A `## Struct` / `## Enum` entry template references a
+`{derive}` slot (or whatever the target names it) that branches on the
+`has_attributes` fact, plus an `### attribute` item slot looped over the type's
+attributes with the usual `first`/`last` loop facts and a per-element
+`attr is <name>` dispatch fact. Each attribute has one of **three realization
+outcomes**:
+
+- **realize** — emit the target's derive/annotation text (Rust maps the whole
+  set into one `#[derive(Debug, Clone, PartialEq)]` line before the keyword);
+- **inherent** — emit the **empty string**, because the target provides the
+  behavior with no declaration (the metadata-first principle: the attribute is
+  not lost, it simply has no spelling);
+- **forbid** — the **`forbid` sentinel**: the target cannot realize the
+  attribute as a type attribute, so a type carrying it surfaces a
+  forbidden-construct error and cannot target that language.
+
+**Empty is byte-identical.** A type with no attributes leaves `has_attributes`
+false, so `{derive}` renders `""` and the output matches the pre-attribute form
+exactly.
+
+The shipped `rust.mdl` folds the attributes into a single `#[derive(...)]` line
+(`eq` → `PartialEq`, `ord` → `PartialOrd` — Rust's full `Ord` also needs
+`Eq`/`PartialEq`, so the single idiomatic `PartialOrd` is used for this pass;
+`iterable` → `forbid`, Rust having no single derive for iteration). The shipped
+`typescript.mdl` has no derive mechanism, so its `### derive` slot renders `""`
+when empty and `forbid`s when any attribute is present — a TS type that requests
+attributes is a clean forbidden-construct while an attribute-free one stays
+byte-identical.
 
 ## The Declarative Tree Core (`node` / `attr` / `text`)
 

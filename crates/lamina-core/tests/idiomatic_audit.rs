@@ -861,6 +861,7 @@ fn struct_item() {
     let item = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         fields: vec![
             Field {
                 name: "x".to_string(),
@@ -892,6 +893,7 @@ fn enum_item() {
     let item = Item::Enum {
         name: "Color".to_string(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         variants: vec![
             Variant {
                 name: "Red".to_string(),

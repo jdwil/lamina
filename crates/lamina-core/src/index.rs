@@ -418,6 +418,7 @@ mod tests {
             items: vec![Item::Struct {
                 name: "S".into(),
                 visibility: Visibility::Public,
+                attributes: Vec::new(),
                 fields: vec![crate::ast::Field {
                     name: "x".into(),
                     ty: Type::Primitive(Primitive::I32),

@@ -288,6 +288,7 @@ fn fnptr_field_is_gated_by_fnptr_capability() {
     let struct_item = Item::Struct {
         name: "Account".into(),
         visibility: Visibility::Public,
+        attributes: Vec::new(),
         fields: vec![Field {
             name: "deposit".into(),
             ty: Type::FnPtr {

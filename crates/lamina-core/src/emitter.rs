@@ -11,7 +11,7 @@
 use crate::ast::{
     slot_binding, Attr, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
     Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type,
-    UnaryOp, Variant, VariantKind as AstVariantKind, VariantPayload, Visibility,
+    TypeAttribute, UnaryOp, Variant, VariantKind as AstVariantKind, VariantPayload, Visibility,
 };
 use crate::error::EmitError;
 use crate::index::{EscapeStyle, UnitIndex};
@@ -203,6 +203,16 @@ fn item_context(item: &Item) -> RenderContext {
             .iter()
             .any(|v| !matches!(v.payload, VariantPayload::None));
     }
+    // A `struct`/`enum` surfaces whether it carries any type-level attribute so
+    // the entry template can branch its derive/annotation line on
+    // `has_attributes`; an attribute-free type leaves this false and renders
+    // byte-identically to before attributes existed.
+    match item {
+        Item::Struct { attributes, .. } | Item::Enum { attributes, .. } => {
+            ctx.has_attributes = !attributes.is_empty();
+        }
+        _ => {}
+    }
     ctx
 }
 
@@ -230,6 +240,8 @@ enum ItemScope<'a> {
     Variant(&'a Variant),
     /// Rendering one tuple-payload type element of an enum variant.
     PayloadType(&'a Type),
+    /// Rendering one type-attribute element of a struct/enum.
+    Attribute(&'a TypeAttribute),
     /// Rendering one selectively-imported `use` item element.
     UseItem(&'a crate::ast::UseItem),
 }
@@ -255,6 +267,7 @@ impl<'a> ItemResolver<'a> {
             ItemScope::Field(_) => SlotScope::Field,
             ItemScope::Variant(_) => SlotScope::Variant,
             ItemScope::PayloadType(_) => SlotScope::PayloadType,
+            ItemScope::Attribute(_) => SlotScope::Attribute,
             ItemScope::UseItem(_) => SlotScope::UseItem,
         }
     }
@@ -310,6 +323,10 @@ impl<'a> ItemResolver<'a> {
                 "type" => resolve_type(ty, self.lang, self.index),
                 _ => self.unknown_slot(name),
             },
+            ItemScope::Attribute(attr) => match name {
+                "name" => Ok(Rendered::text(attr.as_str().to_string())),
+                _ => self.unknown_slot(name),
+            },
             ItemScope::UseItem(use_item) => match name {
                 "name" => Ok(Rendered::text(use_item.name.clone())),
                 // The alias renders when present; an unaliased item renders
@@ -347,9 +364,53 @@ impl<'a> ItemResolver<'a> {
         match (self.item, name) {
             (Item::Struct { fields, .. }, "fields") => self.render_fields(fields, item_slot),
             (Item::Enum { variants, .. }, "variants") => self.render_variants(variants, item_slot),
+            (Item::Struct { attributes, .. }, "attributes")
+            | (Item::Enum { attributes, .. }, "attributes") => {
+                self.render_attributes(attributes, item_slot)
+            }
             (Item::Use { items, .. }, "items") => self.render_use_items(items, item_slot),
             _ => self.render_variant_payload(name, item_slot),
         }
+    }
+
+    /// Loops a struct's/enum's type attributes, rendering the `attribute` item
+    /// slot per attribute with `first`/`last` loop facts and the per-element
+    /// `attr is <name>` dispatch fact set. `has_attributes` is propagated from
+    /// the parent so a row may still consult it. Only meaningful when looping
+    /// the `attributes` sequence; the item slot is fixed as `attribute`.
+    fn render_attributes(
+        &self,
+        attributes: &[TypeAttribute],
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        if item_slot != "attribute" {
+            return self.unknown_slot(item_slot);
+        }
+        let len = attributes.len();
+        let mut out = Rendered::empty();
+        for (i, attr) in attributes.iter().enumerate() {
+            let ctx = RenderContext {
+                item: self.ctx.item,
+                first: i == 0,
+                last: i + 1 == len,
+                // The per-element `attr is <name>` dispatch fact.
+                attribute: Some(*attr),
+                // Keep `has_attributes` as-is (it is true here by construction);
+                // a row may still consult it alongside `attr is <name>`.
+                has_attributes: self.ctx.has_attributes,
+                ..Default::default()
+            };
+            let mut elem = ItemResolver {
+                item: self.item,
+                def: self.def,
+                lang: self.lang,
+                index: self.index,
+                ctx,
+                scope: ItemScope::Attribute(attr),
+            };
+            out.push(elem.render_named_slot(item_slot)?);
+        }
+        Ok(out)
     }
 
     /// Loops a `use` import's selective items, rendering the `use_item` item
@@ -3410,6 +3471,7 @@ mod tests {
         let out = emit_one(Item::Struct {
             name: "P".into(),
             visibility: Visibility::Public,
+            attributes: Vec::new(),
             fields: vec![
                 Field {
                     name: "x".into(),
@@ -3439,6 +3501,7 @@ mod tests {
         let out = emit_one(Item::Enum {
             name: "E".into(),
             visibility: Visibility::Private,
+            attributes: Vec::new(),
             variants: vec![Variant { name: "A".into() , payload: crate::ast::VariantPayload::None, meta: crate::ast::Meta::new() }, Variant { name: "B".into() , payload: crate::ast::VariantPayload::None, meta: crate::ast::Meta::new() }],
             meta: crate::ast::Meta::new(),
         });

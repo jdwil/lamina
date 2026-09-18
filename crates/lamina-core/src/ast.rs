@@ -137,6 +137,13 @@ pub enum Item {
         visibility: Visibility,
         /// The fields, in declaration order (possibly empty).
         fields: Vec<Field>,
+        /// The type-level attributes applied to this struct, in source order
+        /// (see [`TypeAttribute`]); default empty. The kernel reserves the
+        /// superset of derivable capabilities; a language definition realizes
+        /// or forbids each one per target. Like [`Meta`], attributes do **not**
+        /// participate in structural equality (see the [`Item`] `PartialEq`
+        /// impl), so a compound-assign structural comparison is unaffected.
+        attributes: Vec<TypeAttribute>,
         /// Engine-transparent metadata (see [`Meta`]); default empty.
         meta: Meta,
     },
@@ -149,6 +156,10 @@ pub enum Item {
         visibility: Visibility,
         /// The variants, in declaration order (possibly empty).
         variants: Vec<Variant>,
+        /// The type-level attributes applied to this enum, in source order
+        /// (see [`TypeAttribute`]); default empty. Realized or forbidden per
+        /// target exactly as for a struct; ignored by structural equality.
+        attributes: Vec<TypeAttribute>,
         /// Engine-transparent metadata (see [`Meta`]); default empty.
         meta: Meta,
     },
@@ -241,8 +252,11 @@ impl Item {
     }
 }
 
-/// Structural equality of items **ignores metadata** (see [`Meta`]): two items
-/// are equal iff their structure matches, regardless of what a layer tagged.
+/// Structural equality of items **ignores metadata** (see [`Meta`]) **and
+/// type attributes** (see [`TypeAttribute`]): two items are equal iff their
+/// structure matches, regardless of what a layer tagged or which type-level
+/// attributes were requested. Keeping attributes out of equality preserves the
+/// compound-assign structural predicate exactly as ignoring metadata does.
 impl PartialEq for Item {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -724,6 +738,95 @@ impl Modifier {
             Modifier::Extern,
             Modifier::Inline,
             Modifier::Generator,
+        ]
+    }
+}
+
+/// A type-level attribute applied to a `struct` or `enum`.
+///
+/// This is the type-level analog of [`Modifier`]: the kernel reserves the
+/// *superset* of behavioral capabilities a target may automatically derive for
+/// an aggregate type (equality, ordering, hashing, cloning, a debug rendering,
+/// a default value, iteration). Every target realizes each attribute in its own
+/// way — a language definition maps each one to its target spelling (Rust folds
+/// them into a single `#[derive(…)]` line), realizes it inherently (emitting no
+/// text because the target provides the behavior for free), or forbids it (a
+/// target that cannot realize the attribute as a type-level construct). Like a
+/// callable modifier, a type attribute is semantic metadata first and emitted
+/// text second — it stays attached to the IR node regardless of a target's
+/// spelling.
+///
+/// The realization outcomes mirror the three ways a target answers a modifier:
+/// - **realize** — emit the target's derive/annotation spelling (Rust
+///   `#[derive(Debug)]`);
+/// - **inherent** — emit nothing because the target provides the behavior with
+///   no declaration (the metadata-first principle in action);
+/// - **forbid** — the target cannot realize the attribute as a type attribute,
+///   so a type carrying it cannot target that language (the `forbid` sentinel
+///   surfaces a [`crate::error::EmitError::ForbiddenConstruct`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeAttribute {
+    /// A debug / diagnostic rendering (e.g. Rust `Debug`).
+    Debug,
+    /// Value equality (e.g. Rust `PartialEq`/`Eq`).
+    Eq,
+    /// Total ordering (e.g. Rust `PartialOrd`/`Ord`).
+    Ord,
+    /// Hashability (e.g. Rust `Hash`).
+    Hash,
+    /// A deep copy / clone (e.g. Rust `Clone`).
+    Clone,
+    /// A cheap bitwise copy (e.g. Rust `Copy`).
+    Copy,
+    /// A default value (e.g. Rust `Default`).
+    Default,
+    /// Iterability over the aggregate's elements. Many targets have no single
+    /// type-level derive for this, so it is often `forbid`den or realized by a
+    /// layer; it is retained as metadata regardless.
+    Iterable,
+}
+
+impl TypeAttribute {
+    /// The canonical Lamina spelling of this type attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeAttribute::Debug => "debug",
+            TypeAttribute::Eq => "eq",
+            TypeAttribute::Ord => "ord",
+            TypeAttribute::Hash => "hash",
+            TypeAttribute::Clone => "clone",
+            TypeAttribute::Copy => "copy",
+            TypeAttribute::Default => "default",
+            TypeAttribute::Iterable => "iterable",
+        }
+    }
+
+    /// Resolves a type attribute from its canonical spelling.
+    pub fn from_name(name: &str) -> Option<TypeAttribute> {
+        match name {
+            "debug" => Some(TypeAttribute::Debug),
+            "eq" => Some(TypeAttribute::Eq),
+            "ord" => Some(TypeAttribute::Ord),
+            "hash" => Some(TypeAttribute::Hash),
+            "clone" => Some(TypeAttribute::Clone),
+            "copy" => Some(TypeAttribute::Copy),
+            "default" => Some(TypeAttribute::Default),
+            "iterable" => Some(TypeAttribute::Iterable),
+            _ => None,
+        }
+    }
+
+    /// All type attributes in the reserved kernel superset, in canonical order.
+    pub fn all() -> [TypeAttribute; 8] {
+        [
+            TypeAttribute::Debug,
+            TypeAttribute::Eq,
+            TypeAttribute::Ord,
+            TypeAttribute::Hash,
+            TypeAttribute::Clone,
+            TypeAttribute::Copy,
+            TypeAttribute::Default,
+            TypeAttribute::Iterable,
         ]
     }
 }
@@ -1901,6 +2004,12 @@ pub enum SlotScope {
     /// enum's `variants`). Exposes `name`; loop facts let the item template
     /// supply its own separator.
     Variant,
+    /// Resolving slots of a single type-attribute element (one element of a
+    /// struct's or enum's `attributes`). Exposes `name` — the attribute's
+    /// target spelling — so the item template maps each attribute to its target
+    /// derive/annotation text; loop facts (`first`/`last`) let the item
+    /// template supply its own separator (e.g. Rust's `, ` between derives).
+    Attribute,
     /// Resolving slots of a single tuple-payload type element (one element of a
     /// tuple-style [`Variant`]'s `payload_types`). Exposes `type` (the rendered
     /// payload type); loop facts let the item template supply its own
@@ -2143,12 +2252,16 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             _ => None,
         },
         // A struct declaration: `name` is a scalar leaf; `fields` loops the
-        // `field` item slot.
+        // `field` item slot; `attributes` loops the `attribute` item slot.
         SlotScope::Struct => match name {
             "name" => Some(SlotShape::Scalar),
             "fields" => Some(SlotShape::Sequence {
                 item_slot: "field".to_string(),
                 item_scope: SlotScope::Field,
+            }),
+            "attributes" => Some(SlotShape::Sequence {
+                item_slot: "attribute".to_string(),
+                item_scope: SlotScope::Attribute,
             }),
             _ => None,
         },
@@ -2160,12 +2273,16 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             _ => None,
         },
         // An enum declaration: `name` is a scalar leaf; `variants` loops the
-        // `variant` item slot.
+        // `variant` item slot; `attributes` loops the `attribute` item slot.
         SlotScope::Enum => match name {
             "name" => Some(SlotShape::Scalar),
             "variants" => Some(SlotShape::Sequence {
                 item_slot: "variant".to_string(),
                 item_scope: SlotScope::Variant,
+            }),
+            "attributes" => Some(SlotShape::Sequence {
+                item_slot: "attribute".to_string(),
+                item_scope: SlotScope::Attribute,
             }),
             _ => None,
         },
@@ -2186,6 +2303,13 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
                 item_slot: "payload_field".to_string(),
                 item_scope: SlotScope::Field,
             }),
+            _ => None,
+        },
+        // A single type-attribute element: `name` is the attribute's canonical
+        // spelling (a scalar leaf). The item template maps each spelling to its
+        // target derive/annotation text; loop facts supply the separator.
+        SlotScope::Attribute => match name {
+            "name" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single tuple-payload type element: `type` is the rendered payload
@@ -2588,6 +2712,7 @@ mod tests {
                 name: "S".into(),
                 visibility: Visibility::Public,
                 fields: vec![],
+                attributes: Vec::new(),
                 meta: crate::ast::Meta::new(),
             }
             .kind(),
@@ -2598,6 +2723,7 @@ mod tests {
                 name: "E".into(),
                 visibility: Visibility::Public,
                 variants: vec![],
+                attributes: Vec::new(),
                 meta: crate::ast::Meta::new(),
             }
             .kind(),
@@ -3138,5 +3264,88 @@ mod tests {
             meta: crate::ast::Meta::new(),
         };
         assert_ne!(a, c);
+    }
+
+    // ---- Type attributes -----------------------------------------------
+
+    #[test]
+    fn type_attribute_roundtrips_via_name() {
+        for attr in TypeAttribute::all() {
+            assert_eq!(TypeAttribute::from_name(attr.as_str()), Some(attr));
+            assert!(!attr.as_str().is_empty());
+        }
+        assert_eq!(TypeAttribute::from_name("nope"), None);
+    }
+
+    #[test]
+    fn type_attribute_set_is_the_closed_kernel_superset() {
+        // Exactly 8 attributes, in canonical order with canonical spellings.
+        let all = TypeAttribute::all();
+        assert_eq!(all.len(), 8);
+        assert_eq!(
+            all.map(|a| a.as_str()),
+            ["debug", "eq", "ord", "hash", "clone", "copy", "default", "iterable"]
+        );
+    }
+
+    #[test]
+    fn struct_and_enum_scopes_bind_attributes() {
+        // `attributes` loops the `attribute` item slot in Attribute scope, at
+        // both struct and enum scope.
+        for scope in [SlotScope::Struct, SlotScope::Enum] {
+            match slot_binding("attributes", scope) {
+                Some(SlotShape::Sequence {
+                    item_slot,
+                    item_scope,
+                }) => {
+                    assert_eq!(item_slot, "attribute");
+                    assert_eq!(item_scope, SlotScope::Attribute);
+                }
+                other => panic!("attributes should be an attribute sequence, got {other:?}"),
+            }
+        }
+        // The attribute element exposes only `name`.
+        assert_eq!(
+            slot_binding("name", SlotScope::Attribute),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::Attribute), None);
+    }
+
+    #[test]
+    fn struct_and_enum_equality_ignores_attributes() {
+        // Two structs identical but for their attributes are structurally
+        // equal (attributes are ignored exactly as metadata is).
+        let plain = Item::Struct {
+            name: "P".into(),
+            visibility: Visibility::Public,
+            fields: vec![],
+            attributes: Vec::new(),
+            meta: crate::ast::Meta::new(),
+        };
+        let derived = Item::Struct {
+            name: "P".into(),
+            visibility: Visibility::Public,
+            fields: vec![],
+            attributes: vec![TypeAttribute::Debug, TypeAttribute::Clone],
+            meta: crate::ast::Meta::new(),
+        };
+        assert_eq!(plain, derived);
+
+        let enum_plain = Item::Enum {
+            name: "E".into(),
+            visibility: Visibility::Private,
+            variants: vec![],
+            attributes: Vec::new(),
+            meta: crate::ast::Meta::new(),
+        };
+        let enum_derived = Item::Enum {
+            name: "E".into(),
+            visibility: Visibility::Private,
+            variants: vec![],
+            attributes: vec![TypeAttribute::Debug],
+            meta: crate::ast::Meta::new(),
+        };
+        assert_eq!(enum_plain, enum_derived);
     }
 }

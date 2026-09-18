@@ -83,9 +83,9 @@ fn shipped_defs_load_with_attribute_slots() {
 fn rust_struct_with_debug_clone_eq_emits_exact_derive_line() {
     let item = point_struct(
         vec![
-            TypeAttribute::Debug,
-            TypeAttribute::Clone,
-            TypeAttribute::Eq,
+            TypeAttribute::Displayable,
+            TypeAttribute::Cloneable,
+            TypeAttribute::Equatable,
         ],
         Visibility::Public,
     );
@@ -120,7 +120,7 @@ fn rust_enum_with_debug_emits_derive_debug() {
                 meta: lamina_core::ast::Meta::new(),
             },
         ],
-        attributes: vec![TypeAttribute::Debug],
+        attributes: vec![TypeAttribute::Displayable],
         meta: lamina_core::ast::Meta::new(),
     };
     let out = emit_one(item, &rust()).expect("emit");
@@ -173,13 +173,13 @@ fn rust_all_attribute_spellings_render() {
     // list is comma-joined in canonical order.
     let item = point_struct(
         vec![
-            TypeAttribute::Debug,
-            TypeAttribute::Eq,
-            TypeAttribute::Ord,
-            TypeAttribute::Hash,
-            TypeAttribute::Clone,
-            TypeAttribute::Copy,
-            TypeAttribute::Default,
+            TypeAttribute::Displayable,
+            TypeAttribute::Equatable,
+            TypeAttribute::Comparable,
+            TypeAttribute::Hashable,
+            TypeAttribute::Cloneable,
+            TypeAttribute::Copyable,
+            TypeAttribute::HasDefault,
         ],
         Visibility::Public,
     );
@@ -210,7 +210,7 @@ fn rust_iterable_attribute_is_forbidden() {
 fn ts_struct_with_attributes_is_forbidden() {
     // A TS interface cannot realize a type-level attribute, so a struct that
     // requests any attribute is a clean ForbiddenConstruct.
-    let item = point_struct(vec![TypeAttribute::Debug], Visibility::Public);
+    let item = point_struct(vec![TypeAttribute::Displayable], Visibility::Public);
     let err = emit_one(item, &ts()).expect_err("attributes forbidden on TS");
     assert!(
         matches!(err, EmitError::ForbiddenConstruct { .. }),
@@ -240,7 +240,7 @@ fn ts_enum_with_attributes_is_forbidden() {
             payload: VariantPayload::None,
             meta: lamina_core::ast::Meta::new(),
         }],
-        attributes: vec![TypeAttribute::Debug],
+        attributes: vec![TypeAttribute::Displayable],
         meta: lamina_core::ast::Meta::new(),
     };
     let err = emit_one(item, &ts()).expect_err("enum attributes forbidden on TS");

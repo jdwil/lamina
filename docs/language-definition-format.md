@@ -298,7 +298,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `has_alias` | bool | (`use` import / import item) the module — or a selectively-imported item — carries an alias (`use path as p`, `a as b`) |
 | `has_payload` | bool | (`enum`) at least one variant carries a payload (tuple or struct) — lets a target branch the whole enum to a discriminated-union form |
 | `has_attributes` | bool | (`struct`/`enum`) the type carries at least one type-level attribute — lets a target branch its derive/annotation line |
-| `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`debug` `eq` `ord` `hash` `clone` `copy` `default` `iterable`) |
+| `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`displayable` `equatable` `comparable` `hashable` `cloneable` `copyable` `hasdefault` `iterable`) |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |

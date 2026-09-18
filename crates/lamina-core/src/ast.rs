@@ -795,20 +795,22 @@ impl Modifier {
 ///   surfaces a [`crate::error::EmitError::ForbiddenConstruct`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeAttribute {
-    /// A debug / diagnostic rendering (e.g. Rust `Debug`).
-    Debug,
-    /// Value equality (e.g. Rust `PartialEq`/`Eq`).
-    Eq,
-    /// Total ordering (e.g. Rust `PartialOrd`/`Ord`).
-    Ord,
-    /// Hashability (e.g. Rust `Hash`).
-    Hash,
-    /// A deep copy / clone (e.g. Rust `Clone`).
-    Clone,
-    /// A cheap bitwise copy (e.g. Rust `Copy`).
-    Copy,
-    /// A default value (e.g. Rust `Default`).
-    Default,
+    /// Human-readable / diagnostic rendering (e.g. Rust `Debug`, Python
+    /// `__repr__`, Java `toString`).
+    Displayable,
+    /// Value equality (e.g. Rust `PartialEq`/`Eq`, Python `__eq__`).
+    Equatable,
+    /// Total ordering / comparison (e.g. Rust `Ord`, Python `__lt__`, Java
+    /// `Comparable`).
+    Comparable,
+    /// Hashability (e.g. Rust `Hash`, Python `__hash__`).
+    Hashable,
+    /// Deep duplication (e.g. Rust `Clone`, Python `__copy__`).
+    Cloneable,
+    /// Cheap value copy (e.g. Rust `Copy`; inherent in many targets).
+    Copyable,
+    /// A default / zero value (e.g. Rust `Default`, Go zero value).
+    HasDefault,
     /// Iterability over the aggregate's elements. Many targets have no single
     /// type-level derive for this, so it is often `forbid`den or realized by a
     /// layer; it is retained as metadata regardless.
@@ -819,13 +821,13 @@ impl TypeAttribute {
     /// The canonical Lamina spelling of this type attribute.
     pub fn as_str(self) -> &'static str {
         match self {
-            TypeAttribute::Debug => "debug",
-            TypeAttribute::Eq => "eq",
-            TypeAttribute::Ord => "ord",
-            TypeAttribute::Hash => "hash",
-            TypeAttribute::Clone => "clone",
-            TypeAttribute::Copy => "copy",
-            TypeAttribute::Default => "default",
+            TypeAttribute::Displayable => "displayable",
+            TypeAttribute::Equatable => "equatable",
+            TypeAttribute::Comparable => "comparable",
+            TypeAttribute::Hashable => "hashable",
+            TypeAttribute::Cloneable => "cloneable",
+            TypeAttribute::Copyable => "copyable",
+            TypeAttribute::HasDefault => "hasdefault",
             TypeAttribute::Iterable => "iterable",
         }
     }
@@ -833,13 +835,13 @@ impl TypeAttribute {
     /// Resolves a type attribute from its canonical spelling.
     pub fn from_name(name: &str) -> Option<TypeAttribute> {
         match name {
-            "debug" => Some(TypeAttribute::Debug),
-            "eq" => Some(TypeAttribute::Eq),
-            "ord" => Some(TypeAttribute::Ord),
-            "hash" => Some(TypeAttribute::Hash),
-            "clone" => Some(TypeAttribute::Clone),
-            "copy" => Some(TypeAttribute::Copy),
-            "default" => Some(TypeAttribute::Default),
+            "displayable" => Some(TypeAttribute::Displayable),
+            "equatable" => Some(TypeAttribute::Equatable),
+            "comparable" => Some(TypeAttribute::Comparable),
+            "hashable" => Some(TypeAttribute::Hashable),
+            "cloneable" => Some(TypeAttribute::Cloneable),
+            "copyable" => Some(TypeAttribute::Copyable),
+            "hasdefault" => Some(TypeAttribute::HasDefault),
             "iterable" => Some(TypeAttribute::Iterable),
             _ => None,
         }
@@ -848,13 +850,13 @@ impl TypeAttribute {
     /// All type attributes in the reserved kernel superset, in canonical order.
     pub fn all() -> [TypeAttribute; 8] {
         [
-            TypeAttribute::Debug,
-            TypeAttribute::Eq,
-            TypeAttribute::Ord,
-            TypeAttribute::Hash,
-            TypeAttribute::Clone,
-            TypeAttribute::Copy,
-            TypeAttribute::Default,
+            TypeAttribute::Displayable,
+            TypeAttribute::Equatable,
+            TypeAttribute::Comparable,
+            TypeAttribute::Hashable,
+            TypeAttribute::Cloneable,
+            TypeAttribute::Copyable,
+            TypeAttribute::HasDefault,
             TypeAttribute::Iterable,
         ]
     }
@@ -3497,7 +3499,16 @@ mod tests {
         assert_eq!(all.len(), 8);
         assert_eq!(
             all.map(|a| a.as_str()),
-            ["debug", "eq", "ord", "hash", "clone", "copy", "default", "iterable"]
+            [
+                "displayable",
+                "equatable",
+                "comparable",
+                "hashable",
+                "cloneable",
+                "copyable",
+                "hasdefault",
+                "iterable"
+            ]
         );
     }
 
@@ -3540,7 +3551,7 @@ mod tests {
             name: "P".into(),
             visibility: Visibility::Public,
             fields: vec![],
-            attributes: vec![TypeAttribute::Debug, TypeAttribute::Clone],
+            attributes: vec![TypeAttribute::Displayable, TypeAttribute::Cloneable],
             meta: crate::ast::Meta::new(),
         };
         assert_eq!(plain, derived);
@@ -3556,7 +3567,7 @@ mod tests {
             name: "E".into(),
             visibility: Visibility::Private,
             variants: vec![],
-            attributes: vec![TypeAttribute::Debug],
+            attributes: vec![TypeAttribute::Displayable],
             meta: crate::ast::Meta::new(),
         };
         assert_eq!(enum_plain, enum_derived);

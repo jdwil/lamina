@@ -181,7 +181,7 @@ pub struct RenderContext {
     /// attributes existed.
     pub has_attributes: bool,
     /// Answers `attr is <name>` — the type attribute currently being rendered
-    /// in a per-element `### attribute` item slot (e.g. `attr is debug`).
+    /// in a per-element `### attribute` item slot (e.g. `attr is displayable`).
     /// `None` when the node being rendered is not a single type-attribute
     /// element.
     pub attribute: Option<crate::ast::TypeAttribute>,
@@ -1031,7 +1031,7 @@ impl PredParser {
                             }
                             // `eq` is a reserved token (the structural-equality
                             // operator) but is also a valid enum *value* word —
-                            // notably the `eq` type attribute (`attr is eq`). In
+                            // notably the `equatable` type attribute (`attr is equatable`). In
                             // the value position after `is`, accept it as the
                             // literal word `eq`; the equality operator only ever
                             // appears directly after a key, never after `is`.
@@ -1603,15 +1603,15 @@ mod tests {
 
     #[test]
     fn attr_dispatch_fact_parses_and_evaluates() {
-        let p = parse_predicate("attr is debug").expect("parse");
+        let p = parse_predicate("attr is displayable").expect("parse");
         let c = RenderContext {
-            attribute: Some(crate::ast::TypeAttribute::Debug),
+            attribute: Some(crate::ast::TypeAttribute::Displayable),
             ..Default::default()
         };
         assert!(c.eval(&p));
         // A different attribute does not match.
         let c2 = RenderContext {
-            attribute: Some(crate::ast::TypeAttribute::Clone),
+            attribute: Some(crate::ast::TypeAttribute::Cloneable),
             ..Default::default()
         };
         assert!(!c2.eval(&p));
@@ -1643,15 +1643,15 @@ mod tests {
     #[test]
     fn attr_composes_with_loop_facts() {
         // The Rust derive idiom composes `attr is <name>` with `first`.
-        let p = parse_predicate("attr is debug && first").expect("parse");
+        let p = parse_predicate("attr is displayable && first").expect("parse");
         let c = RenderContext {
-            attribute: Some(crate::ast::TypeAttribute::Debug),
+            attribute: Some(crate::ast::TypeAttribute::Displayable),
             first: true,
             ..Default::default()
         };
         assert!(c.eval(&p));
         let c2 = RenderContext {
-            attribute: Some(crate::ast::TypeAttribute::Debug),
+            attribute: Some(crate::ast::TypeAttribute::Displayable),
             first: false,
             ..Default::default()
         };

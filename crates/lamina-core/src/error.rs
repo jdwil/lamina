@@ -246,6 +246,37 @@ pub enum LangDocError {
         /// The engine's own format version ([`crate::lang::LAMINA_FORMAT_VERSION`]).
         engine: String,
     },
+
+    /// The required `lang-passes` block was absent from a `## Passes` section,
+    /// or a line inside it was not a recognized `key: value` pair.
+    #[error("malformed `lang-passes` block: {detail}")]
+    MalformedPasses {
+        /// A description of the problem.
+        detail: String,
+    },
+
+    /// A rule (slot subsection or `When`-table row) carried a `pass:` / `region:`
+    /// annotation that names a pass/region the `## Passes` section never
+    /// declared (or an annotation was used with no `## Passes` section at all).
+    #[error("annotation names undeclared {kind} {name:?} (declared: {declared})")]
+    UndeclaredAnnotation {
+        /// Either `"pass"` or `"region"`.
+        kind: String,
+        /// The offending name.
+        name: String,
+        /// Comma-separated list of the declared names (empty if none).
+        declared: String,
+    },
+
+    /// The `layout:` in a `## Passes` section named a region that was not
+    /// declared in `regions:`.
+    #[error("layout names undeclared region {region:?} (declared regions: {declared})")]
+    UndeclaredLayoutRegion {
+        /// The offending region name.
+        region: String,
+        /// Comma-separated list of the declared regions.
+        declared: String,
+    },
 }
 
 /// An error produced while parsing or validating a `When` predicate.

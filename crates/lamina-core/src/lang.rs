@@ -176,17 +176,69 @@ pub struct WhenRow {
     pub predicate: Predicate,
     /// The outcome selected when the predicate holds.
     pub outcome: Outcome,
+    /// The optional pass/region annotations scoping this row (see
+    /// [`RuleScope`]). Both are `None` in a definition that declares no
+    /// `## Passes` section, so an unannotated row behaves exactly as before
+    /// (active in the single implicit pass, emitting inline).
+    pub scope: RuleScope,
+}
+
+/// The optional pass/region annotations a slot subsection or `When`-table row
+/// may carry. Both fields default to `None`, which is the legacy behavior: the
+/// rule is active in every pass (the single implicit pass when no `## Passes`
+/// section is declared) and emits into the default/inline output.
+///
+/// The engine attaches NO meaning to a pass or region name — they are opaque
+/// author-chosen identifiers. `pass` scopes *when* a rule is active (only during
+/// the named pass); `region` scopes *where* its rendered output goes (into the
+/// named output buffer instead of inline). See the multi-pass driver in
+/// [`crate::emitter::emit`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleScope {
+    /// The pass this rule is active in, or `None` for "every pass".
+    pub pass: Option<String>,
+    /// The output region this rule's rendered text is routed to, or `None` for
+    /// the default/inline output.
+    pub region: Option<String>,
+}
+
+impl RuleScope {
+    /// An unannotated scope: active in all passes, emitting inline. Equivalent
+    /// to `RuleScope::default()`.
+    pub fn none() -> Self {
+        RuleScope::default()
+    }
+
+    /// Whether this rule is active during `current_pass`. A rule with no `pass`
+    /// annotation is active in every pass; a rule annotated `pass: X` is active
+    /// only when the current pass is `X`. In legacy single-pass mode
+    /// (`current_pass` is `None`), only unannotated rules are active — a
+    /// definition that declares no passes must not carry `pass:` annotations
+    /// (the loader rejects an unknown pass name), so this is vacuously true
+    /// there.
+    pub fn active_in(&self, current_pass: Option<&str>) -> bool {
+        match &self.pass {
+            None => true,
+            Some(p) => current_pass == Some(p.as_str()),
+        }
+    }
 }
 
 impl WhenTable {
-    /// Selects the first row whose predicate holds against `ctx`. Returns the
-    /// row's outcome, or `None` if no row matched (a well-formed table ends in
-    /// an `else` row, so `None` indicates a definition bug).
-    pub fn select(&self, ctx: &RenderContext) -> Option<&Outcome> {
+    /// Selects the first row whose predicate holds against `ctx` **and** whose
+    /// pass annotation is active in `current_pass`. Returns the matched row (so
+    /// the caller can read its [`RuleScope`] for region routing), or `None` if
+    /// no row matched.
+    ///
+    /// A row annotated `pass: X` is only considered during pass `X`; an
+    /// unannotated row is considered in every pass. In legacy single-pass mode
+    /// (`current_pass` is `None`) every row is unannotated (the loader forbids
+    /// `pass:` without a `## Passes` section), so selection is unchanged and a
+    /// well-formed table still ends in an `else` row.
+    pub fn select(&self, ctx: &RenderContext, current_pass: Option<&str>) -> Option<&WhenRow> {
         self.rows
             .iter()
-            .find(|row| ctx.eval(&row.predicate))
-            .map(|row| &row.outcome)
+            .find(|row| row.scope.active_in(current_pass) && ctx.eval(&row.predicate))
     }
 }
 
@@ -195,8 +247,14 @@ impl WhenTable {
 /// is one or the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotDef {
-    /// A single fixed outcome (a template, or `forbid`).
-    Fixed(Outcome),
+    /// A single fixed outcome (a template, or `forbid`), with its optional
+    /// pass/region annotation.
+    Fixed {
+        /// The fixed outcome to render.
+        outcome: Outcome,
+        /// The pass/region annotation scoping this fixed slot.
+        scope: RuleScope,
+    },
     /// A branching decision table.
     Table(WhenTable),
 }
@@ -261,6 +319,44 @@ pub enum OperatorSpelling {
     Forbid,
 }
 
+/// The multi-pass + output-region plan a definition declares in its
+/// `## Passes` section (a ```` ```lang-passes ```` block).
+///
+/// This is the entirety of what the engine knows about passes and regions: an
+/// ordered list of opaque pass names, an ordered list of opaque region names,
+/// and the layout (the order regions concatenate into the final output). The
+/// engine attaches NO semantics — it drives the passes in order and assembles
+/// the region buffers per `layout`; all meaning lives in the definition's
+/// `pass:` / `region:` rule annotations.
+///
+/// An **empty** plan (`passes` empty) is the legacy case: no `## Passes`
+/// section, a single implicit pass, inline output, byte-identical to before
+/// this mechanism existed. [`PassPlan::is_multipass`] distinguishes the two.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassPlan {
+    /// The ordered, author-named passes. The engine renders the whole unit once
+    /// per pass in this order. Empty means "no `## Passes` section" (single
+    /// implicit pass).
+    pub passes: Vec<String>,
+    /// The author-named output regions. A conventional `body` region receives
+    /// inline/unrouted emission; other regions receive rule output annotated
+    /// `region: <name>`.
+    pub regions: Vec<String>,
+    /// The concatenation order of regions in the final assembled output. Every
+    /// name here MUST be a declared region; `body` may appear to position the
+    /// inline output.
+    pub layout: Vec<String>,
+}
+
+impl PassPlan {
+    /// Whether this definition declares any passes (i.e. carries a `## Passes`
+    /// section). When `false`, the emitter uses the legacy single-pass,
+    /// inline-output path — byte-identical to pre-multipass output.
+    pub fn is_multipass(&self) -> bool {
+        !self.passes.is_empty()
+    }
+}
+
 /// A complete language definition for one target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageDef {
@@ -298,6 +394,11 @@ pub struct LanguageDef {
     /// its canonical spelling — this is the common case, so most definitions
     /// leave the map empty or list only their exceptions.
     pub operators: HashMap<String, OperatorSpelling>,
+    /// The multi-pass + output-region plan (from the optional `## Passes`
+    /// section). An empty plan means the definition declares no passes and the
+    /// emitter uses the legacy single-pass, inline-output path (byte-identical
+    /// to pre-multipass output).
+    pub passes: PassPlan,
 }
 
 impl LanguageDef {

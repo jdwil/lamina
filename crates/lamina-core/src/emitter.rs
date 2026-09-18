@@ -34,17 +34,131 @@ pub fn emit(file: &File, lang: &LanguageDef) -> Result<String, EmitError> {
     // Build the per-unit symbol + reference index once; every resolver borrows
     // it so the closed cross-item helpers (`resolve_fnptr`, `fnptr_ref_count`,
     // `type_of`, `resolve`, `field_type`) can answer without the renderer
-    // losing its local character.
+    // losing its local character. It also owns the per-`emit` render state
+    // (current pass + region buffers + fresh-name memo) behind a `RefCell`.
     let index = UnitIndex::build(file);
+    if lang.passes.is_multipass() {
+        emit_multipass(file, lang, &index)
+    } else {
+        emit_single_pass(file, lang, &index)
+    }
+}
+
+/// The legacy single-pass, inline-output path. Renders each item once and
+/// concatenates with a blank line between items. This is BYTE-IDENTICAL to the
+/// pre-multipass emitter: `current_pass` stays `None`, no rule carries a
+/// `pass:`/`region:` annotation (the loader forbids them without a `## Passes`
+/// section), and nothing is ever routed to a region.
+fn emit_single_pass(
+    file: &File,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<String, EmitError> {
     let mut out = String::new();
     for (i, item) in file.items.iter().enumerate() {
         if i > 0 {
             out.push_str("\n\n");
         }
-        let rendered = emit_item(item, lang, &index)?;
+        let rendered = emit_item(item, lang, index)?;
         out.push_str(&rendered.text);
     }
     Ok(out)
+}
+
+/// The multi-pass driver — the whole of what the engine "knows" about passes and
+/// regions, and deliberately DUMB.
+///
+/// It (1) renders the entire unit once per declared pass, in declared order,
+/// setting `current_pass` so each pass's `pass:`-annotated rules become active;
+/// each pass's inline/unrouted item output accumulates into the conventional
+/// `body` region, while rules annotated `region: X` route their output into
+/// region `X` as a side effect. Then it (2) assembles the final output by
+/// concatenating the region buffers in the definition's declared `layout`
+/// order. The engine attaches no meaning to any pass or region name.
+fn emit_multipass(
+    file: &File,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<String, EmitError> {
+    for pass in &lang.passes.passes {
+        index.set_current_pass(Some(pass.clone()));
+        for item in &file.items {
+            let rendered = emit_item(item, lang, index)?;
+            // Unrouted (inline) output for this item goes to the conventional
+            // `body` region; region-annotated rules already routed themselves.
+            if !rendered.text.is_empty() {
+                index.emit_to_region(BODY_REGION, &rendered.text);
+            }
+        }
+    }
+    index.set_current_pass(None);
+
+    // Assemble: concatenate the region buffers in the declared layout order.
+    // A layout entry naming a region that received no emission contributes the
+    // empty string (created-on-first-emission means it is simply absent).
+    let regions = index.take_regions();
+    let mut out = String::new();
+    for region in &lang.passes.layout {
+        if let Some(text) = regions.get(region) {
+            out.push_str(text);
+        }
+    }
+    Ok(out)
+}
+
+/// The conventional default output region: inline/unrouted emission lands here,
+/// and a definition may position it in `layout` like any other region. The
+/// engine treats it as an ordinary region name; the only convention is that
+/// unrouted output is directed to it.
+pub(crate) const BODY_REGION: &str = "body";
+
+/// Selects the outcome and optional target region a [`SlotDef`] yields for the
+/// current pass.
+///
+/// Returns `Ok(None)` when a pass-scoped **fixed** slot is inactive in the
+/// current pass (the caller renders the empty string). For a table, an inactive
+/// (`pass:`-mismatched) row is skipped during selection, so a well-formed table
+/// still resolves via its unannotated `else` row. The returned region (if any)
+/// is where the rendered output should be routed instead of inline.
+#[allow(clippy::type_complexity)]
+fn slot_outcome(
+    slot: &SlotDef,
+    ctx: &RenderContext,
+    current_pass: Option<&str>,
+    lang: &LanguageDef,
+    slot_name: &str,
+) -> Result<Option<(Outcome, Option<String>)>, EmitError> {
+    match slot {
+        SlotDef::Fixed { outcome, scope } => {
+            if !scope.active_in(current_pass) {
+                return Ok(None);
+            }
+            Ok(Some((outcome.clone(), scope.region.clone())))
+        }
+        SlotDef::Table(table) => {
+            let row = table
+                .select(ctx, current_pass)
+                .ok_or_else(|| EmitError::NoMatchingRow {
+                    target: lang.name.clone(),
+                    table: slot_name.to_string(),
+                })?;
+            Ok(Some((row.outcome.clone(), row.scope.region.clone())))
+        }
+    }
+}
+
+/// Routes a rendered fragment: if `region` is set, appends its text to that
+/// region's buffer and returns the empty fragment (nothing lands inline);
+/// otherwise returns the fragment unchanged (inline emission). In legacy
+/// single-pass mode no slot carries a region, so this is always the identity.
+fn route_region(index: &UnitIndex, region: Option<String>, rendered: Rendered) -> Rendered {
+    match region {
+        Some(r) => {
+            index.emit_to_region(&r, &rendered.text);
+            Rendered::empty()
+        }
+        None => rendered,
+    }
 }
 
 /// Renders a single top-level item, dispatching on its [`ItemKind`].
@@ -287,23 +401,29 @@ impl<'a> ItemResolver<'a> {
                 slot: name.to_string(),
             })?;
 
-        let outcome = match &slot {
-            SlotDef::Fixed(outcome) => outcome.clone(),
-            SlotDef::Table(table) => table
-                .select(&self.ctx)
-                .ok_or_else(|| EmitError::NoMatchingRow {
-                    target: self.lang.name.clone(),
-                    table: name.to_string(),
-                })?
-                .clone(),
+        let current_pass = self.index.current_pass();
+        let resolved = slot_outcome(
+            &slot,
+            &self.ctx,
+            current_pass.as_deref(),
+            self.lang,
+            name,
+        )?;
+        let (outcome, region) = match resolved {
+            // A pass-scoped fixed slot inactive in this pass renders empty.
+            None => return Ok(Rendered::empty()),
+            Some(pair) => pair,
         };
 
-        match outcome {
-            Outcome::Render(template) => template.render(self),
-            Outcome::Forbid => Err(EmitError::ForbiddenConstruct {
-                target: self.lang.name.clone(),
-            }),
-        }
+        let rendered = match outcome {
+            Outcome::Render(template) => template.render(self)?,
+            Outcome::Forbid => {
+                return Err(EmitError::ForbiddenConstruct {
+                    target: self.lang.name.clone(),
+                })
+            }
+        };
+        Ok(route_region(self.index, region, rendered))
     }
 
     /// Produces the text of a scalar engine-bound item sub-slot, resolved
@@ -639,8 +759,14 @@ impl<'a> SlotResolver for ItemResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
-            return Ok(render_meta_slot(&self.ctx.meta, key));
+        match parse_special_slot(name) {
+            Some(SpecialSlot::Meta(key)) => return Ok(render_meta_slot(&self.ctx.meta, key)),
+            // `fresh_name` is a pure, node-free unit helper (memoized by
+            // `(prefix, key)`), so it resolves identically in every scope.
+            Some(SpecialSlot::FreshName { prefix, key }) => {
+                return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            _ => {}
         }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
@@ -686,23 +812,29 @@ impl<'a> FunctionResolver<'a> {
                     slot: name.to_string(),
                 })?;
 
-        let outcome = match &slot {
-            SlotDef::Fixed(outcome) => outcome.clone(),
-            SlotDef::Table(table) => table
-                .select(&self.ctx)
-                .ok_or_else(|| EmitError::NoMatchingRow {
-                    target: self.lang.name.clone(),
-                    table: name.to_string(),
-                })?
-                .clone(),
+        let current_pass = self.index.current_pass();
+        let resolved = slot_outcome(
+            &slot,
+            &self.ctx,
+            current_pass.as_deref(),
+            self.lang,
+            name,
+        )?;
+        let (outcome, region) = match resolved {
+            // A pass-scoped fixed slot inactive in this pass renders empty.
+            None => return Ok(Rendered::empty()),
+            Some(pair) => pair,
         };
 
-        match outcome {
-            Outcome::Render(template) => template.render(self),
-            Outcome::Forbid => Err(EmitError::ForbiddenConstruct {
-                target: self.lang.name.clone(),
-            }),
-        }
+        let rendered = match outcome {
+            Outcome::Render(template) => template.render(self)?,
+            Outcome::Forbid => {
+                return Err(EmitError::ForbiddenConstruct {
+                    target: self.lang.name.clone(),
+                })
+            }
+        };
+        Ok(route_region(self.index, region, rendered))
     }
 
     /// Loops an iterable collection, rendering `item_slot` per element with
@@ -773,8 +905,14 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
-            return Ok(render_meta_slot(&self.ctx.meta, key));
+        match parse_special_slot(name) {
+            Some(SpecialSlot::Meta(key)) => return Ok(render_meta_slot(&self.ctx.meta, key)),
+            // `fresh_name` is a pure, node-free unit helper (memoized by
+            // `(prefix, key)`), so it resolves identically in every scope.
+            Some(SpecialSlot::FreshName { prefix, key }) => {
+                return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            _ => {}
         }
         // Cardinality is data-driven: ask the binding table for this slot's
         // shape in the current scope. Scalar -> render directly; Sequence ->
@@ -1018,23 +1156,29 @@ impl<'a> StmtResolver<'a> {
                     slot: name.to_string(),
                 })?;
 
-        let outcome = match &slot {
-            SlotDef::Fixed(outcome) => outcome.clone(),
-            SlotDef::Table(table) => table
-                .select(&self.ctx)
-                .ok_or_else(|| EmitError::NoMatchingRow {
-                    target: self.lang.name.clone(),
-                    table: name.to_string(),
-                })?
-                .clone(),
+        let current_pass = self.index.current_pass();
+        let resolved = slot_outcome(
+            &slot,
+            &self.ctx,
+            current_pass.as_deref(),
+            self.lang,
+            name,
+        )?;
+        let (outcome, region) = match resolved {
+            // A pass-scoped fixed slot inactive in this pass renders empty.
+            None => return Ok(Rendered::empty()),
+            Some(pair) => pair,
         };
 
-        match outcome {
-            Outcome::Render(template) => template.render(self),
-            Outcome::Forbid => Err(EmitError::ForbiddenConstruct {
-                target: self.lang.name.clone(),
-            }),
-        }
+        let rendered = match outcome {
+            Outcome::Render(template) => template.render(self)?,
+            Outcome::Forbid => {
+                return Err(EmitError::ForbiddenConstruct {
+                    target: self.lang.name.clone(),
+                })
+            }
+        };
+        Ok(route_region(self.index, region, rendered))
     }
 
     /// Renders a nested single statement (`else`, `init`, `step`) through the
@@ -1238,8 +1382,14 @@ impl<'a> SlotResolver for StmtResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
-            return Ok(render_meta_slot(&self.ctx.meta, key));
+        match parse_special_slot(name) {
+            Some(SpecialSlot::Meta(key)) => return Ok(render_meta_slot(&self.ctx.meta, key)),
+            // `fresh_name` is a pure, node-free unit helper (memoized by
+            // `(prefix, key)`), so it resolves identically in every scope.
+            Some(SpecialSlot::FreshName { prefix, key }) => {
+                return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            _ => {}
         }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),
@@ -1323,6 +1473,12 @@ enum SpecialSlot<'a> {
     /// on the struct named `<struct>` (a literal item name), via the target's
     /// type machinery. Both arguments are literal names (not sub-slots).
     FieldType { struct_name: &'a str, field: &'a str },
+    /// `{fresh_name(<prefix>, <key>)}` — a unit-stable unique identifier,
+    /// memoized by `(prefix, key)`, so the same `(prefix, key)` renders to the
+    /// same generated name in any pass or region. Both arguments are literal
+    /// strings. This is what lets a hoisted helper (emitted into one region) and
+    /// its inline reference (emitted elsewhere) share one name.
+    FreshName { prefix: &'a str, key: &'a str },
 }
 
 /// Parses a slot `name` as a [`SpecialSlot`], or `None` if it is an ordinary
@@ -1367,6 +1523,18 @@ fn parse_special_slot(name: &str) -> Option<SpecialSlot<'_>> {
         let field = parts.next().map(str::trim).unwrap_or("");
         if !struct_name.is_empty() && !field.is_empty() {
             return Some(SpecialSlot::FieldType { struct_name, field });
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("fresh_name(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut parts = inner.splitn(2, ',');
+        let prefix = parts.next().map(str::trim).unwrap_or("");
+        let key = parts.next().map(str::trim).unwrap_or("");
+        if !prefix.is_empty() && !key.is_empty() {
+            return Some(SpecialSlot::FreshName { prefix, key });
         }
         return None;
     }
@@ -1664,23 +1832,22 @@ impl<'a> ExprResolver<'a> {
                 })?;
 
         let ctx = self.ctx();
-        let outcome = match &slot {
-            SlotDef::Fixed(outcome) => outcome.clone(),
-            SlotDef::Table(table) => table
-                .select(&ctx)
-                .ok_or_else(|| EmitError::NoMatchingRow {
-                    target: self.lang.name.clone(),
-                    table: name.to_string(),
-                })?
-                .clone(),
+        let current_pass = self.index.current_pass();
+        let resolved = slot_outcome(&slot, &ctx, current_pass.as_deref(), self.lang, name)?;
+        let (outcome, region) = match resolved {
+            None => return Ok(Rendered::empty()),
+            Some(pair) => pair,
         };
 
-        match outcome {
-            Outcome::Render(template) => template.render(self),
-            Outcome::Forbid => Err(EmitError::ForbiddenConstruct {
-                target: self.lang.name.clone(),
-            }),
-        }
+        let rendered = match outcome {
+            Outcome::Render(template) => template.render(self)?,
+            Outcome::Forbid => {
+                return Err(EmitError::ForbiddenConstruct {
+                    target: self.lang.name.clone(),
+                })
+            }
+        };
+        Ok(route_region(self.index, region, rendered))
     }
 
     /// Renders a nested child expression, parenthesizing it when it is a
@@ -1843,25 +2010,30 @@ impl<'a> ExprResolver<'a> {
                 helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -1905,25 +2077,30 @@ impl<'a> ExprResolver<'a> {
                 helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -1967,25 +2144,30 @@ impl<'a> ExprResolver<'a> {
                 helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -2030,25 +2212,30 @@ impl<'a> ExprResolver<'a> {
                 helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -2093,25 +2280,30 @@ impl<'a> ExprResolver<'a> {
                 helper_facts: elem_resolver.compute_helper_facts(),
                 ..Default::default()
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -2227,6 +2419,9 @@ impl<'a> ExprResolver<'a> {
                         slot: name.to_string(),
                     }),
                 }
+            }
+            SpecialSlot::FreshName { prefix, key } => {
+                Ok(Rendered::text(self.index.fresh_name(prefix, key)))
             }
         }
     }
@@ -2388,23 +2583,22 @@ impl<'a> TypeResolver<'a> {
                 })?;
 
         let ctx = self.ctx.clone();
-        let outcome = match &slot {
-            SlotDef::Fixed(outcome) => outcome.clone(),
-            SlotDef::Table(table) => table
-                .select(&ctx)
-                .ok_or_else(|| EmitError::NoMatchingRow {
-                    target: self.lang.name.clone(),
-                    table: name.to_string(),
-                })?
-                .clone(),
+        let current_pass = self.index.current_pass();
+        let resolved = slot_outcome(&slot, &ctx, current_pass.as_deref(), self.lang, name)?;
+        let (outcome, region) = match resolved {
+            None => return Ok(Rendered::empty()),
+            Some(pair) => pair,
         };
 
-        match outcome {
-            Outcome::Render(template) => template.render(self),
-            Outcome::Forbid => Err(EmitError::ForbiddenConstruct {
-                target: self.lang.name.clone(),
-            }),
-        }
+        let rendered = match outcome {
+            Outcome::Render(template) => template.render(self)?,
+            Outcome::Forbid => {
+                return Err(EmitError::ForbiddenConstruct {
+                    target: self.lang.name.clone(),
+                })
+            }
+        };
+        Ok(route_region(self.index, region, rendered))
     }
 
     /// Produces the text of a scalar engine-bound type sub-slot.
@@ -2489,25 +2683,30 @@ impl<'a> TypeResolver<'a> {
                 scope: TypeScope::Param(elem),
                 ctx: ctx.clone(),
             };
-            let outcome = match &slot {
-                SlotDef::Fixed(outcome) => outcome.clone(),
-                SlotDef::Table(table) => table
-                    .select(&ctx)
-                    .ok_or_else(|| EmitError::NoMatchingRow {
-                        target: self.lang.name.clone(),
-                        table: item_slot.to_string(),
-                    })?
-                    .clone(),
-            };
-            let rendered = match outcome {
-                Outcome::Render(template) => template.render(&mut elem_resolver)?,
-                Outcome::Forbid => {
-                    return Err(EmitError::ForbiddenConstruct {
-                        target: self.lang.name.clone(),
-                    })
+            let current_pass = self.index.current_pass();
+            let resolved = slot_outcome(
+                &slot,
+                &ctx,
+                current_pass.as_deref(),
+                self.lang,
+                item_slot,
+            )?;
+            match resolved {
+                // A pass-scoped fixed item slot inactive this pass renders empty
+                // for this element (contributes nothing).
+                None => {}
+                Some((outcome, region)) => {
+                    let rendered = match outcome {
+                        Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                        Outcome::Forbid => {
+                            return Err(EmitError::ForbiddenConstruct {
+                                target: self.lang.name.clone(),
+                            })
+                        }
+                    };
+                    out.push(route_region(self.index, region, rendered));
                 }
-            };
-            out.push(rendered);
+            }
         }
         Ok(out)
     }
@@ -2517,10 +2716,17 @@ impl<'a> SlotResolver for TypeResolver<'a> {
     type Error = EmitError;
 
     fn resolve(&mut self, name: &str) -> Result<Rendered, EmitError> {
-        if let Some(SpecialSlot::Meta(key)) = parse_special_slot(name) {
-            // Types carry no metadata in the current kernel, so this renders
-            // empty; the channel is present so a def can reference it uniformly.
-            return Ok(render_meta_slot(self.ty.meta(), key));
+        match parse_special_slot(name) {
+            Some(SpecialSlot::Meta(key)) => {
+                // Types carry no metadata in the current kernel, so this renders
+                // empty; the channel is present so a def can reference it
+                // uniformly.
+                return Ok(render_meta_slot(self.ty.meta(), key));
+            }
+            Some(SpecialSlot::FreshName { prefix, key }) => {
+                return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            _ => {}
         }
         match slot_binding(name, self.scope_kind()) {
             Some(SlotShape::Scalar) => self.scalar(name),

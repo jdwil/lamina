@@ -23,9 +23,40 @@
 //! - Symbol/type resolution (both sides): `resolve(<name>) is <kind>`,
 //!   `field_type(<struct>, <field>)`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::{Expr, File, Item, Statement, Type};
+
+/// The mutable, per-`emit` render state threaded (by shared reference, with
+/// interior mutability) through every resolver: the current pass, the
+/// author-named output-region buffers, and the memoized fresh-name allocations.
+///
+/// This is the ONLY mutable state the otherwise-pure renderer carries, and it
+/// exists solely to serve the two DUMB multi-pass primitives: (1) a
+/// `current_pass` that scopes which rules are active, and (2) a `BTreeMap` of
+/// author-named region buffers assembled into the final output. The engine
+/// attaches no meaning to any pass or region name.
+#[derive(Debug, Clone, Default)]
+pub struct RenderState {
+    /// The pass currently being rendered, or `None` in legacy single-pass mode
+    /// (a definition with no `## Passes` section). Rules annotated `pass: X`
+    /// are active only when this equals `X`.
+    current_pass: Option<String>,
+    /// Author-named output-region buffers, created on first emission to them.
+    /// A `BTreeMap` keeps iteration deterministic; the definition's declared
+    /// `layout` drives the actual assembly order.
+    regions: BTreeMap<String, String>,
+    /// Memoized fresh-name allocations keyed by `(prefix, key)`. The SAME
+    /// `(prefix, key)` returns the SAME identifier no matter which pass or
+    /// region requests it — this is what lets a hoisted definition (emitted in
+    /// one region during one pass) and its inline reference (emitted in another
+    /// region/pass) coordinate on a single generated name.
+    fresh: BTreeMap<(String, String), String>,
+    /// A monotonically-increasing counter making each distinct `(prefix, key)`
+    /// allocation unique within the unit.
+    fresh_counter: usize,
+}
 
 /// A read-only index of one compilation unit ([`File`]): a map of top-level
 /// item names to their definitions, plus a count of how many times each
@@ -34,7 +65,12 @@ use crate::ast::{Expr, File, Item, Statement, Type};
 /// Built once per `emit` and threaded (by shared reference) into every
 /// resolver, so the closed helpers can answer cross-item questions without the
 /// renderer losing its otherwise-local character.
-#[derive(Debug, Clone, Default)]
+///
+/// It also owns the per-`emit` [`RenderState`] behind a [`RefCell`], giving the
+/// otherwise-immutable `&UnitIndex` that every resolver holds the interior
+/// mutability the multi-pass driver and `fresh_name` helper need — without
+/// threading a second mutable reference through every render function.
+#[derive(Debug, Default)]
 pub struct UnitIndex<'a> {
     /// Top-level items by name (functions, structs, enums, typedefs, consts).
     /// A `use` import has no binding name and is omitted.
@@ -44,6 +80,10 @@ pub struct UnitIndex<'a> {
     /// initializer, a returned value, …) rather than the callee of a direct
     /// call. Used by the `fnptr_ref_count(<expr>) is <n>` inlining-policy fact.
     fnptr_ref_counts: HashMap<String, usize>,
+    /// The mutable render state (current pass + region buffers + fresh-name
+    /// memo). Interior-mutable so a shared `&UnitIndex` can drive passes and
+    /// allocate names.
+    state: RefCell<RenderState>,
 }
 
 impl<'a> UnitIndex<'a> {
@@ -73,6 +113,7 @@ impl<'a> UnitIndex<'a> {
         UnitIndex {
             items,
             fnptr_ref_counts,
+            state: RefCell::new(RenderState::default()),
         }
     }
 
@@ -113,6 +154,61 @@ impl<'a> UnitIndex<'a> {
     /// to a top-level item (answers `resolve(<name>) is <kind>`).
     pub fn resolve_kind(&self, name: &str) -> Option<&'static str> {
         self.items.get(name).map(|item| item.kind().as_str())
+    }
+
+    /// Sets the pass currently being rendered (the multi-pass driver calls this
+    /// once per pass before re-rendering the unit). `None` restores legacy
+    /// single-pass mode.
+    pub fn set_current_pass(&self, pass: Option<String>) {
+        self.state.borrow_mut().current_pass = pass;
+    }
+
+    /// The pass currently being rendered, or `None` in legacy single-pass mode.
+    /// Read by the emitter to pass into [`crate::lang::WhenTable::select`] so a
+    /// row's `pass:` annotation gates whether it is considered.
+    pub fn current_pass(&self) -> Option<String> {
+        self.state.borrow().current_pass.clone()
+    }
+
+    /// Appends `text` to the author-named output region `region`, creating the
+    /// buffer on first use. This is how a rule annotated `region: X` routes its
+    /// rendered output away from the inline position and into a named buffer the
+    /// definition later assembles via its declared `layout`.
+    pub fn emit_to_region(&self, region: &str, text: &str) {
+        let mut state = self.state.borrow_mut();
+        state
+            .regions
+            .entry(region.to_string())
+            .or_default()
+            .push_str(text);
+    }
+
+    /// Returns a unit-stable, unique identifier for `(prefix, key)`, MEMOIZED:
+    /// the same `(prefix, key)` always returns the SAME identifier for the whole
+    /// `emit`, regardless of which pass or region requests it. This is the one
+    /// cross-pass/region coordination the mechanism provides — it lets a hoisted
+    /// helper definition (emitted into one region during one pass) and its
+    /// inline reference (emitted elsewhere) agree on a single generated name.
+    ///
+    /// The identifier is `<prefix>_<n>` where `n` is a monotonically-increasing
+    /// per-unit counter, so distinct `(prefix, key)` pairs never collide.
+    pub fn fresh_name(&self, prefix: &str, key: &str) -> String {
+        let mut state = self.state.borrow_mut();
+        let map_key = (prefix.to_string(), key.to_string());
+        if let Some(existing) = state.fresh.get(&map_key) {
+            return existing.clone();
+        }
+        let n = state.fresh_counter;
+        state.fresh_counter += 1;
+        let name = format!("{prefix}_{n}");
+        state.fresh.insert(map_key, name.clone());
+        name
+    }
+
+    /// Consumes and returns the accumulated region buffers (draining the map),
+    /// for final assembly by the multi-pass driver.
+    pub fn take_regions(&self) -> BTreeMap<String, String> {
+        std::mem::take(&mut self.state.borrow_mut().regions)
     }
 }
 
@@ -451,5 +547,50 @@ mod tests {
         assert_eq!(EscapeStyle::Raw.apply("a\nb"), "a\nb");
         assert_eq!(EscapeStyle::from_name("c"), Some(EscapeStyle::C));
         assert_eq!(EscapeStyle::from_name("nope"), None);
+    }
+
+    #[test]
+    fn fresh_name_is_memoized_by_prefix_and_key() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        // Same (prefix, key) -> identical name, no matter how many times or in
+        // what interleaving it is requested (the cross-pass/region contract).
+        let a = idx.fresh_name("loop", "w");
+        let b = idx.fresh_name("loop", "w");
+        assert_eq!(a, b);
+        // A different key under the same prefix is a distinct name.
+        let c = idx.fresh_name("loop", "x");
+        assert_ne!(a, c);
+        // A different prefix is distinct too.
+        let d = idx.fresh_name("go", "w");
+        assert_ne!(a, d);
+        // Re-requesting the first pair STILL returns the original id (memoized),
+        // even after other allocations bumped the counter.
+        assert_eq!(idx.fresh_name("loop", "w"), a);
+    }
+
+    #[test]
+    fn regions_accumulate_and_drain_in_key_order() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        idx.emit_to_region("body", "x");
+        idx.emit_to_region("helpers", "h");
+        idx.emit_to_region("body", "y");
+        let regions = idx.take_regions();
+        assert_eq!(regions.get("body").map(String::as_str), Some("xy"));
+        assert_eq!(regions.get("helpers").map(String::as_str), Some("h"));
+        // Draining empties the state.
+        assert!(idx.take_regions().is_empty());
+    }
+
+    #[test]
+    fn current_pass_round_trips() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        assert_eq!(idx.current_pass(), None);
+        idx.set_current_pass(Some("emit".to_string()));
+        assert_eq!(idx.current_pass().as_deref(), Some("emit"));
+        idx.set_current_pass(None);
+        assert_eq!(idx.current_pass(), None);
     }
 }

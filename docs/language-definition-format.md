@@ -34,6 +34,13 @@ target-version: <opaque target-language version band>
 ### <slot>          (one subsection per non-terminal slot referenced above)
 <a template block OR a When table>
 
+## Passes                (OPTIONAL — see Passes and Output Regions)
+​```lang-passes
+passes: <ordered pass names>
+regions: <output region names>
+layout: <region concatenation order>
+​```
+
 ## Capabilities
 <a markdown table mapping each kernel primitive to an action>
 ```
@@ -679,6 +686,116 @@ The shipped `rust.mdl` reconstructs the anonymous *function* as a closure (and
 keeps a named aggregate for the anonymous class, Rust having no object
 expression); `typescript.mdl` reconstructs the anonymous function as an arrow and
 the anonymous class as an object literal with inlined methods.
+
+## Passes and Output Regions
+
+Some target output cannot be produced by a single in-place render pass: lowering
+an imperative `while` to a functional recursive helper needs the helper
+**hoisted** to the top *and* a call left inline; a C-style declare-at-top layout
+needs locals collected separately from the body; imports/preamble collection
+needs a place to accumulate. Lamina expresses these entirely in the definition
+via two DUMB engine primitives — **multi-pass rendering** and **named output
+regions** — with the engine attaching NO meaning to any pass or region name.
+
+The engine gains exactly two abilities: (1) it renders the whole unit once per
+declared pass, in declared order, and (2) it maintains a set of author-named
+output buffers (regions) and assembles them into the final output per a declared
+layout. Everything else — what a pass *does*, what a region *means* — lives in
+the definition's rule annotations. A definition that declares **no** `## Passes`
+section behaves exactly as before: a single implicit pass, inline output,
+byte-identical to the pre-passes emitter.
+
+### The `## Passes` Section
+
+An OPTIONAL `## Passes` section carries a single ```` ```lang-passes ````
+fenced block with exactly three required `key: value` lines, each a
+comma-separated list of author-named identifiers:
+
+```text
+## Passes
+
+​```lang-passes
+passes: collect, emit
+regions: helpers, body
+layout: helpers, body
+​```
+```
+
+- **`passes`** — the ordered passes. The engine renders the whole unit once per
+  pass, in this order, setting a *current pass* the rule annotations key off.
+- **`regions`** — the author-named output buffers. A conventional region named
+  `body` receives inline/unrouted emission; other regions receive rule output
+  explicitly routed to them.
+- **`layout`** — the order the regions concatenate into the final output. Every
+  layout entry MUST be a declared region; `body` may appear to position the
+  inline output relative to routed regions.
+
+A missing/duplicate/unknown key, an empty list, or a `layout` naming an
+undeclared region is a load-time error. The engine never parses or branches on
+the names — they are opaque identifiers.
+
+### Scoping Rules to a Pass / Region
+
+A slot subsection or a `When`-table **row** may carry two OPTIONAL annotations,
+reusing the existing declarative style:
+
+- **`pass: <name>`** — the rule is active ONLY during that pass. Absent means
+  active in every pass.
+- **`region: <name>`** — the rule's rendered output is routed into that region's
+  buffer instead of the inline/default output. Absent means inline (which, in
+  multi-pass mode, accumulates into the conventional `body` region).
+
+On a **`When`-table row**, annotations are extra trailing pipe cells:
+
+```text
+### statement
+| When          | Template      | (annotations)                  |
+|---------------|---------------|--------------------------------|
+| stmt is while | @while_helper | pass: collect | region: helpers |
+| else          | ""            | pass: collect |                |
+| stmt is while | @while_call   | pass: emit    |                |
+| else          | "{stmt}"      | pass: emit    |                |
+```
+
+Rows whose `pass:` does not match the current pass are skipped during selection,
+so a table's unannotated `else` row still catches every pass. On a **fixed
+`template` slot**, the annotation is a `pass:` / `region:` line placed right
+after the `### <slot>` heading, before the `template` block:
+
+```text
+### pre
+region: helpers
+​```template
+// preamble
+​```
+```
+
+(A slot-level annotation is only meaningful on a fixed `template` slot; annotate
+individual rows of a `When` table instead.) An annotation naming a pass/region
+the `## Passes` section never declared — or ANY annotation in a definition with
+no `## Passes` section — is a load-time error.
+
+### The `fresh_name(prefix, key)` Helper
+
+To coordinate a hoisted definition and its inline reference across passes and
+regions, the engine provides a template-side helper `{fresh_name(<prefix>,
+<key>)}`. It returns a unit-stable unique identifier, **memoized by
+`(prefix, key)`**: the SAME `(prefix, key)` always renders to the SAME name for
+the whole unit, no matter which pass or region requests it. This is what lets a
+`while` rule emit `fn {fresh_name(loop, w)}() { … }` into the `helpers` region
+(during one pass) and `{fresh_name(loop, w)}();` inline (during another) with
+both agreeing on, say, `loop_0`. The generated form is `<prefix>_<n>` where `n`
+is a monotone per-unit counter, so distinct `(prefix, key)` pairs never collide.
+`fresh_name` is a closed helper (only these names exist), called exactly like
+the other render helpers.
+
+### Assembly
+
+After all passes run, the engine concatenates the region buffers in `layout`
+order to form the final output. A layout region that received no emission
+contributes the empty string. Because the whole mechanism is off when no
+`## Passes` section is present, adding it to a definition is purely additive:
+existing definitions are unaffected and their output is byte-identical.
 
 ## Capabilities
 

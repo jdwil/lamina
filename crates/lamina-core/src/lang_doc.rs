@@ -39,17 +39,19 @@ use std::collections::HashMap;
 use crate::ast::{slot_binding, BinaryOp, ItemKind, Primitive, SlotScope, SlotShape, UnaryOp};
 use crate::error::LangDocError;
 use crate::lang::{
-    Capability, FunctionDef, ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef, Version,
-    WhenRow, WhenTable, LAMINA_FORMAT_VERSION,
+    Capability, FunctionDef, ItemDef, LanguageDef, OperatorSpelling, Outcome, PassPlan, RuleScope,
+    SlotDef, Version, WhenRow, WhenTable, LAMINA_FORMAT_VERSION,
 };
 use crate::predicate::parse_predicate;
 use crate::render::Template;
 
 const TITLE_PREFIX: &str = "# Lamina Language Definition:";
 const LANG_META_FENCE: &str = "```lang-meta";
+const LANG_PASSES_FENCE: &str = "```lang-passes";
 const FUNCTION_HEADING: &str = "## Function";
 const CAPABILITIES_HEADING: &str = "## Capabilities";
 const OPERATORS_HEADING: &str = "## Operators";
+const PASSES_HEADING: &str = "## Passes";
 const TREE_HEADING: &str = "## Tree";
 
 /// Parses a rigid template-model `.mdl` language-definition document into a
@@ -176,6 +178,23 @@ pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
         HashMap::new()
     };
 
+    // The `## Passes` section is OPTIONAL. When absent, the definition declares
+    // no passes and the emitter uses the legacy single-pass, inline-output path
+    // (byte-identical to before this mechanism existed). When present, it
+    // carries the ordered passes, the author-named regions, and the assembly
+    // layout, all validated together (see `parse_passes`).
+    let passes = if src.lines().any(|l| l.trim_end() == PASSES_HEADING) {
+        parse_passes(src)?
+    } else {
+        PassPlan::default()
+    };
+
+    // With the pass plan known, validate that every `pass:` / `region:`
+    // annotation across the whole slot/table graph names a DECLARED pass/region
+    // (and that no annotation appears without a `## Passes` section). This is
+    // the single cross-cutting check that keeps annotations honest.
+    validate_annotations(&passes, &function, &items)?;
+
     Ok(LanguageDef {
         name,
         target: meta.target,
@@ -184,6 +203,7 @@ pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
         function,
         items,
         operators,
+        passes,
     })
 }
 
@@ -351,8 +371,184 @@ fn extract_lang_meta_block(src: &str) -> Result<Option<String>, LangDocError> {
     })
 }
 
+/// Parses the `## Passes` section's ```` ```lang-passes ```` block into a
+/// [`PassPlan`].
+///
+/// The block carries exactly three `key: value` lines — `passes:`, `regions:`,
+/// `layout:` — each a comma-separated list of author-named identifiers. All
+/// three keys are required; an unknown key, a missing key, a duplicate key, or
+/// a `layout` naming an undeclared region is a load-time error. The engine
+/// attaches no meaning to the names; they are opaque and only used to scope
+/// rules and order the assembled output.
+fn parse_passes(src: &str) -> Result<PassPlan, LangDocError> {
+    let body = extract_lang_passes_block(src)?.ok_or_else(|| LangDocError::MalformedPasses {
+        detail: "missing required ```lang-passes``` block in the `## Passes` section".to_string(),
+    })?;
+
+    let mut passes: Option<Vec<String>> = None;
+    let mut regions: Option<Vec<String>> = None;
+    let mut layout: Option<Vec<String>> = None;
+
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| LangDocError::MalformedPasses {
+                detail: format!("expected `key: value`, found {raw:?}"),
+            })?;
+        let list: Vec<String> = value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let set_once =
+            |slot: &mut Option<Vec<String>>, key: &str| -> Result<(), LangDocError> {
+                if slot.is_some() {
+                    return Err(LangDocError::MalformedPasses {
+                        detail: format!("duplicate `{key}:` key"),
+                    });
+                }
+                Ok(())
+            };
+        match key.trim() {
+            "passes" => {
+                set_once(&mut passes, "passes")?;
+                passes = Some(list);
+            }
+            "regions" => {
+                set_once(&mut regions, "regions")?;
+                regions = Some(list);
+            }
+            "layout" => {
+                set_once(&mut layout, "layout")?;
+                layout = Some(list);
+            }
+            other => {
+                return Err(LangDocError::MalformedPasses {
+                    detail: format!("unknown key {other:?} (expected passes, regions, or layout)"),
+                })
+            }
+        }
+    }
+
+    let require = |slot: Option<Vec<String>>, key: &str| -> Result<Vec<String>, LangDocError> {
+        match slot {
+            Some(v) if !v.is_empty() => Ok(v),
+            _ => Err(LangDocError::MalformedPasses {
+                detail: format!("missing or empty required `{key}:` key"),
+            }),
+        }
+    };
+    let passes = require(passes, "passes")?;
+    let regions = require(regions, "regions")?;
+    let layout = require(layout, "layout")?;
+
+    // Every layout entry must be a declared region (`body` is a conventional
+    // region a def may name explicitly; if it appears in `layout` it must also
+    // appear in `regions`, keeping the surface fully explicit).
+    for region in &layout {
+        if !regions.contains(region) {
+            return Err(LangDocError::UndeclaredLayoutRegion {
+                region: region.clone(),
+                declared: regions.join(", "),
+            });
+        }
+    }
+
+    Ok(PassPlan {
+        passes,
+        regions,
+        layout,
+    })
+}
+
+/// Extracts the body of the first ```` ```lang-passes ```` fenced block in
+/// `src`, or `None` if there is none.
+fn extract_lang_passes_block(src: &str) -> Result<Option<String>, LangDocError> {
+    let mut lines = src.lines();
+    let mut found = false;
+    for line in lines.by_ref() {
+        if line.trim_end() == LANG_PASSES_FENCE {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    for line in lines.by_ref() {
+        if line.trim_end() == "```" {
+            return Ok(Some(body));
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Err(LangDocError::MalformedPasses {
+        detail: "unterminated ```lang-passes``` block".to_string(),
+    })
+}
+
+/// Validates that every `pass:` / `region:` annotation across the whole slot
+/// graph names a pass/region DECLARED in the `## Passes` section. When there is
+/// no `## Passes` section (an empty [`PassPlan`]), ANY annotation is an error —
+/// annotations are meaningless without declared passes/regions, so a stray one
+/// is caught loudly rather than silently ignored (which would break the
+/// no-pass byte-identity guarantee subtly).
+fn validate_annotations(
+    plan: &PassPlan,
+    function: &FunctionDef,
+    items: &HashMap<ItemKind, ItemDef>,
+) -> Result<(), LangDocError> {
+    let check = |scope: &RuleScope| -> Result<(), LangDocError> {
+        if let Some(pass) = &scope.pass {
+            if !plan.passes.contains(pass) {
+                return Err(LangDocError::UndeclaredAnnotation {
+                    kind: "pass".to_string(),
+                    name: pass.clone(),
+                    declared: plan.passes.join(", "),
+                });
+            }
+        }
+        if let Some(region) = &scope.region {
+            if !plan.regions.contains(region) {
+                return Err(LangDocError::UndeclaredAnnotation {
+                    kind: "region".to_string(),
+                    name: region.clone(),
+                    declared: plan.regions.join(", "),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    let check_slots = |slots: &HashMap<String, SlotDef>| -> Result<(), LangDocError> {
+        for def in slots.values() {
+            match def {
+                SlotDef::Fixed { scope, .. } => check(scope)?,
+                SlotDef::Table(table) => {
+                    for row in &table.rows {
+                        check(&row.scope)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    check_slots(&function.slots)?;
+    for item in items.values() {
+        check_slots(&item.slots)?;
+    }
+    Ok(())
+}
+
 /// Verifies that a required `##` section heading is present.
-fn require_heading(src: &str, heading: &str) -> Result<(), LangDocError> {    if src.lines().any(|line| line.trim_end() == heading) {
+fn require_heading(src: &str, heading: &str) -> Result<(), LangDocError> {
+    if src.lines().any(|line| line.trim_end() == heading) {
         Ok(())
     } else {
         Err(LangDocError::MissingSection {
@@ -451,7 +647,12 @@ fn parse_slot_subsections(function_src: &str) -> Result<HashMap<String, SlotDef>
         body: &mut String,
     ) -> Result<(), LangDocError> {
         if let Some(name) = name {
-            let def = parse_slot_body(name, body)?;
+            // A slot subsection may open with `pass:` / `region:` annotation
+            // lines (before its `template` block or `When` table). Strip and
+            // parse them into the slot-level scope; the remaining body is the
+            // template/table.
+            let (scope, remaining) = split_slot_annotations(name, body)?;
+            let def = parse_slot_body(name, &remaining, scope)?;
             slots.insert(name.clone(), def);
         }
         body.clear();
@@ -476,14 +677,20 @@ fn parse_slot_subsections(function_src: &str) -> Result<HashMap<String, SlotDef>
 }
 
 /// Parses one slot subsection body into a [`SlotDef`]: a `template` block if one
-/// is present (a fixed render outcome), otherwise a `When` table.
-fn parse_slot_body(name: &str, body: &str) -> Result<SlotDef, LangDocError> {
+/// is present (a fixed render outcome, carrying `scope`), otherwise a `When`
+/// table. The `scope` is the slot-level `pass:` / `region:` annotation parsed
+/// from the subsection heading region; it applies to a fixed slot (a `When`
+/// table carries its annotations per row instead).
+fn parse_slot_body(name: &str, body: &str, scope: RuleScope) -> Result<SlotDef, LangDocError> {
     if let Some(template_str) = extract_template_block(body)? {
         let template = Template::parse(&template_str).map_err(|e| LangDocError::BadTemplate {
             table: name.to_string(),
             detail: e.to_string(),
         })?;
-        return Ok(SlotDef::Fixed(Outcome::Render(template)));
+        return Ok(SlotDef::Fixed {
+            outcome: Outcome::Render(template),
+            scope,
+        });
     }
     let rows: Vec<String> = body
         .lines()
@@ -493,6 +700,17 @@ fn parse_slot_body(name: &str, body: &str) -> Result<SlotDef, LangDocError> {
     if rows.is_empty() {
         return Err(LangDocError::MissingTable {
             name: name.to_string(),
+        });
+    }
+    // A slot-level annotation on a `When`-table slot is not meaningful — a table
+    // scopes per row. Reject it explicitly so a misplaced annotation is a loud
+    // load-time error rather than silently ignored.
+    if scope != RuleScope::none() {
+        return Err(LangDocError::MalformedRow {
+            table: name.to_string(),
+            line: "a slot-level `pass:`/`region:` annotation may only appear on a fixed \
+                   `template` slot; annotate individual When-table rows instead"
+                .to_string(),
         });
     }
     let table = build_table(name, &rows)?;
@@ -608,6 +826,7 @@ fn is_special_slot(name: &str) -> bool {
         || (name.starts_with("resolve_fnptr(") && name.ends_with(')'))
         || (name.starts_with("escape(") && name.ends_with(')'))
         || (name.starts_with("field_type(") && name.ends_with(')'))
+        || (name.starts_with("fresh_name(") && name.ends_with(')'))
 }
 
 /// The slot names referenced by a slot definition's template(s).
@@ -619,7 +838,7 @@ fn referenced_by(def: &SlotDef) -> Vec<String> {
         }
     };
     match def {
-        SlotDef::Fixed(outcome) => add(outcome, &mut out),
+        SlotDef::Fixed { outcome, .. } => add(outcome, &mut out),
         SlotDef::Table(table) => {
             for row in &table.rows {
                 add(&row.outcome, &mut out);
@@ -627,6 +846,100 @@ fn referenced_by(def: &SlotDef) -> Vec<String> {
         }
     }
     out
+}
+
+/// Splits a slot subsection `body` into its leading `pass:` / `region:`
+/// annotation lines (parsed into a [`RuleScope`]) and the remaining body (the
+/// `template` block or `When` table).
+///
+/// Annotation lines are the load-bearing lines that appear *before* the first
+/// `template` fence or pipe-table row and match `pass: <name>` or
+/// `region: <name>`. Any other non-blank, non-annotation content before the
+/// body (free prose) is left in the remaining body untouched — it is ignored by
+/// the template/table extractors exactly as today. Only lines that look like an
+/// annotation (`pass:`/`region:` prefix) are consumed and validated.
+fn split_slot_annotations(name: &str, body: &str) -> Result<(RuleScope, String), LangDocError> {
+    let mut scope = RuleScope::none();
+    let mut remaining = String::new();
+    let mut in_body = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Once the template/table body starts, copy everything verbatim (a
+        // later line that happens to read like `pass:` is body content).
+        if !in_body {
+            if trimmed.starts_with("```") || trimmed.starts_with('|') {
+                in_body = true;
+            } else if let Some(kv) = parse_annotation_line(trimmed) {
+                apply_annotation(name, &mut scope, kv)?;
+                continue;
+            }
+        }
+        remaining.push_str(line);
+        remaining.push('\n');
+    }
+    Ok((scope, remaining))
+}
+
+/// Parses a single slot-annotation line `pass: <name>` / `region: <name>` into
+/// a `(key, value)` pair, or `None` if the line is not an annotation.
+fn parse_annotation_line(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    if key == "pass" || key == "region" {
+        Some((key, value.trim()))
+    } else {
+        None
+    }
+}
+
+/// Applies one parsed `(key, value)` annotation to `scope`, rejecting an empty
+/// value or a duplicate key (a loud load-time error, never silently ignored).
+fn apply_annotation(
+    name: &str,
+    scope: &mut RuleScope,
+    (key, value): (&str, &str),
+) -> Result<(), LangDocError> {
+    if value.is_empty() {
+        return Err(LangDocError::MalformedRow {
+            table: name.to_string(),
+            line: format!("empty `{key}:` annotation value"),
+        });
+    }
+    match key {
+        "pass" if scope.pass.is_none() => scope.pass = Some(value.to_string()),
+        "region" if scope.region.is_none() => scope.region = Some(value.to_string()),
+        _ => {
+            return Err(LangDocError::MalformedRow {
+                table: name.to_string(),
+                line: format!("duplicate or unknown `{key}:` annotation"),
+            })
+        }
+    }
+    Ok(())
+}
+
+/// Parses the trailing annotation cells of a `When`-table row (the cells beyond
+/// the predicate and template) into a [`RuleScope`]. Each cell must be a
+/// `pass: <name>` / `region: <name>` annotation; a stray non-annotation cell is
+/// a loud error. An empty slice yields the unannotated scope (legacy behavior).
+fn parse_rule_scope_cells(name: &str, cells: &[String]) -> Result<RuleScope, LangDocError> {
+    let mut scope = RuleScope::none();
+    for cell in cells {
+        let cell = cell.trim();
+        if cell.is_empty() {
+            continue;
+        }
+        match parse_annotation_line(cell) {
+            Some(kv) => apply_annotation(name, &mut scope, kv)?,
+            None => {
+                return Err(LangDocError::MalformedRow {
+                    table: name.to_string(),
+                    line: format!("unexpected trailing cell `{cell}` (expected `pass:`/`region:`)"),
+                })
+            }
+        }
+    }
+    Ok(scope)
 }
 
 /// Builds a [`WhenTable`] from the raw pipe rows of one `### <name>` table.
@@ -664,8 +977,15 @@ fn build_table(name: &str, rows: &[String]) -> Result<WhenTable, LangDocError> {
             detail: e.to_string(),
         })?;
         let outcome = parse_outcome_cell(name, outcome_cell)?;
+        // Any trailing cells carry the optional `pass:` / `region:` annotations
+        // scoping this row. A plain two-cell row has none (legacy behavior).
+        let scope = parse_rule_scope_cells(name, &cells[2..])?;
 
-        parsed.push(WhenRow { predicate, outcome });
+        parsed.push(WhenRow {
+            predicate,
+            outcome,
+            scope,
+        });
     }
 
     // Require a final `else` row (the catch-all).
@@ -1033,7 +1353,7 @@ mod tests {
                     ret: Some(RetKind::Void),
                     ..Default::default()
                 };
-                match table.select(&void_ctx).expect("void row") {
+                match &table.select(&void_ctx, None).expect("void row").outcome {
                     Outcome::Render(t) => assert!(t.slot_names().is_empty()),
                     Outcome::Forbid => panic!("void row should render"),
                 }
@@ -1041,12 +1361,12 @@ mod tests {
                     ret: Some(RetKind::Type),
                     ..Default::default()
                 };
-                match table.select(&type_ctx).expect("else row") {
+                match &table.select(&type_ctx, None).expect("else row").outcome {
                     Outcome::Render(t) => assert!(t.slot_names().contains(&"ret_type")),
                     Outcome::Forbid => panic!("else row should render"),
                 }
             }
-            SlotDef::Fixed(_) => panic!("ret should be a table"),
+            SlotDef::Fixed { .. } => panic!("ret should be a table"),
         }
     }
 
@@ -1061,7 +1381,10 @@ mod tests {
             ```template\nreturn {value};\n```");
         let def = parse_language_def(&doc).expect("parses");
         match def.function.slots.get("prefix").expect("prefix slot") {
-            SlotDef::Fixed(Outcome::Render(_)) => {}
+            SlotDef::Fixed {
+                outcome: Outcome::Render(_),
+                ..
+            } => {}
             _ => panic!("prefix should be a fixed template"),
         }
     }
@@ -1078,9 +1401,12 @@ mod tests {
                     vis: Some(VisKind::Private),
                     ..Default::default()
                 };
-                assert_eq!(table.select(&priv_ctx), Some(&Outcome::Forbid));
+                assert_eq!(
+                    table.select(&priv_ctx, None).map(|r| &r.outcome),
+                    Some(&Outcome::Forbid)
+                );
             }
-            SlotDef::Fixed(_) => panic!("vis should be a table"),
+            SlotDef::Fixed { .. } => panic!("vis should be a table"),
         }
     }
 
@@ -1120,9 +1446,9 @@ mod tests {
                     vis: Some(VisKind::Public),
                     ..Default::default()
                 };
-                assert!(table.select(&pub_ctx).is_some());
+                assert!(table.select(&pub_ctx, None).is_some());
             }
-            SlotDef::Fixed(_) => panic!("vis should be a table"),
+            SlotDef::Fixed { .. } => panic!("vis should be a table"),
         }
     }
 
@@ -1619,5 +1945,188 @@ mod tests {
             Version::parse("2.3.4").unwrap()
         );
         assert!(Version::parse("0.0.0").unwrap() <= Version::parse("0.0.0").unwrap());
+    }
+
+    // ---- passes / regions --------------------------------------------------
+
+    /// A `## Function` body that declares a two-pass, two-region plan and a
+    /// `### statement` slot whose rows carry `pass:` / `region:` annotations.
+    const PASSES_SECTION: &str = "```template\n{body}\n```\n\
+        \n\
+        ### statement\n\
+        | When          | Template      | annotations |\n\
+        |---------------|---------------|-------------|\n\
+        | stmt is while | \"H\"           | pass: collect | region: helpers |\n\
+        | else          | \"\"            | pass: collect |\n\
+        | else          | \"{stmt}\"      | pass: emit |\n\
+        \n\
+        ### stmt\n\
+        | When | Template |\n\
+        |------|----------|\n\
+        | else | \"s\" |\n\
+        \n\
+        ## Passes\n\n\
+        ```lang-passes\n\
+        passes: collect, emit\n\
+        regions: helpers, body\n\
+        layout: helpers, body\n\
+        ```\n";
+
+    #[test]
+    fn passes_section_parses_plan_and_annotations() {
+        let def = parse_language_def(&mk(PASSES_SECTION)).expect("parses with passes");
+        assert!(def.passes.is_multipass());
+        assert_eq!(def.passes.passes, vec!["collect", "emit"]);
+        assert_eq!(def.passes.regions, vec!["helpers", "body"]);
+        assert_eq!(def.passes.layout, vec!["helpers", "body"]);
+
+        // The `### statement` table's rows carry the parsed annotations.
+        match def.function.slots.get("statement").expect("statement slot") {
+            SlotDef::Table(table) => {
+                let first = &table.rows[0];
+                assert_eq!(first.scope.pass.as_deref(), Some("collect"));
+                assert_eq!(first.scope.region.as_deref(), Some("helpers"));
+                let second = &table.rows[1];
+                assert_eq!(second.scope.pass.as_deref(), Some("collect"));
+                assert_eq!(second.scope.region, None);
+                let third = &table.rows[2];
+                assert_eq!(third.scope.pass.as_deref(), Some("emit"));
+            }
+            SlotDef::Fixed { .. } => panic!("statement should be a table"),
+        }
+    }
+
+    #[test]
+    fn absent_passes_section_is_not_multipass() {
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
+        assert!(!def.passes.is_multipass());
+        assert!(def.passes.passes.is_empty());
+    }
+
+    #[test]
+    fn annotation_without_passes_section_is_rejected() {
+        // A `region:` annotation with NO `## Passes` section is a loud error —
+        // annotations are meaningless without declared passes/regions.
+        let section = "```template\n{body}\n```\n\
+            \n\
+            ### statement\n\
+            | When | Template | region |\n\
+            |------|----------|--------|\n\
+            | else | \"{stmt}\" | region: helpers |\n\
+            \n\
+            ### stmt\n\
+            | When | Template |\n\
+            |------|----------|\n\
+            | else | \"s\" |\n";
+        assert!(matches!(
+            parse_language_def(&mk(section)),
+            Err(LangDocError::UndeclaredAnnotation { .. })
+        ));
+    }
+
+    #[test]
+    fn layout_naming_undeclared_region_is_rejected() {
+        let section = "```template\n{body}\n```\n\
+            \n\
+            ### statement\n\
+            ```template\ns\n```\n\
+            \n\
+            ## Passes\n\n\
+            ```lang-passes\n\
+            passes: only\n\
+            regions: a\n\
+            layout: a, ghost\n\
+            ```\n";
+        assert!(matches!(
+            parse_language_def(&mk(section)),
+            Err(LangDocError::UndeclaredLayoutRegion { .. })
+        ));
+    }
+
+    #[test]
+    fn annotation_naming_undeclared_pass_is_rejected() {
+        let section = "```template\n{body}\n```\n\
+            \n\
+            ### statement\n\
+            | When | Template | pass |\n\
+            |------|----------|------|\n\
+            | else | \"s\" | pass: nope |\n\
+            \n\
+            ## Passes\n\n\
+            ```lang-passes\n\
+            passes: only\n\
+            regions: body\n\
+            layout: body\n\
+            ```\n";
+        assert!(matches!(
+            parse_language_def(&mk(section)),
+            Err(LangDocError::UndeclaredAnnotation { .. })
+        ));
+    }
+
+    #[test]
+    fn passes_block_missing_key_is_rejected() {
+        let section = "```template\n{body}\n```\n\
+            \n\
+            ### statement\n\
+            ```template\ns\n```\n\
+            \n\
+            ## Passes\n\n\
+            ```lang-passes\n\
+            passes: only\n\
+            regions: body\n\
+            ```\n";
+        assert!(matches!(
+            parse_language_def(&mk(section)),
+            Err(LangDocError::MalformedPasses { .. })
+        ));
+    }
+
+    #[test]
+    fn passes_block_unknown_key_is_rejected() {
+        let section = "```template\n{body}\n```\n\
+            \n\
+            ### statement\n\
+            ```template\ns\n```\n\
+            \n\
+            ## Passes\n\n\
+            ```lang-passes\n\
+            passes: only\n\
+            regions: body\n\
+            layout: body\n\
+            phases: x\n\
+            ```\n";
+        assert!(matches!(
+            parse_language_def(&mk(section)),
+            Err(LangDocError::MalformedPasses { .. })
+        ));
+    }
+
+    #[test]
+    fn slot_level_annotation_on_fixed_template_parses() {
+        // A slot subsection may carry a slot-level `region:` annotation before
+        // its `template` block; it attaches to the fixed slot.
+        let section = "```template\n{pre}{body}\n```\n\
+            \n\
+            ### pre\n\
+            region: helpers\n\
+            ```template\nP\n```\n\
+            \n\
+            ### statement\n\
+            ```template\ns\n```\n\
+            \n\
+            ## Passes\n\n\
+            ```lang-passes\n\
+            passes: only\n\
+            regions: helpers, body\n\
+            layout: helpers, body\n\
+            ```\n";
+        let def = parse_language_def(&mk(section)).expect("parses");
+        match def.function.slots.get("pre").expect("pre slot") {
+            SlotDef::Fixed { scope, .. } => {
+                assert_eq!(scope.region.as_deref(), Some("helpers"));
+            }
+            SlotDef::Table(_) => panic!("pre should be a fixed slot"),
+        }
     }
 }

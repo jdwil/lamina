@@ -299,6 +299,8 @@ pub enum ExprKind {
     Text,
     /// An array-literal construction expression (`expr is array`).
     ArrayLit,
+    /// A raw / verbatim expression fragment (`expr is raw`).
+    Raw,
 }
 
 impl ExprKind {
@@ -322,6 +324,7 @@ impl ExprKind {
             ExprKind::Node => "node",
             ExprKind::Text => "text",
             ExprKind::ArrayLit => "array",
+            ExprKind::Raw => "raw",
         }
     }
 }
@@ -358,6 +361,8 @@ pub enum StmtKind {
     Assign,
     /// An expression-statement (`stmt is expr`).
     Expr,
+    /// A raw / verbatim statement (`stmt is raw`).
+    Raw,
 }
 
 impl StmtKind {
@@ -376,6 +381,7 @@ impl StmtKind {
             StmtKind::Continue => "continue",
             StmtKind::Assign => "assign",
             StmtKind::Expr => "expr",
+            StmtKind::Raw => "raw",
         }
     }
 }
@@ -402,6 +408,8 @@ pub enum ItemKind {
     Use,
     /// A top-level tree value (`item is tree`).
     Tree,
+    /// A raw / verbatim top-level item (`item is raw`).
+    Raw,
 }
 
 impl ItemKind {
@@ -415,6 +423,7 @@ impl ItemKind {
             ItemKind::Const => "const",
             ItemKind::Use => "use",
             ItemKind::Tree => "tree",
+            ItemKind::Raw => "raw",
         }
     }
 }
@@ -606,6 +615,7 @@ fn expr_kind_is_known(kind: &str) -> bool {
             | "node"
             | "text"
             | "array"
+            | "raw"
     )
 }
 
@@ -634,6 +644,7 @@ fn stmt_kind_is_known(kind: &str) -> bool {
             | "continue"
             | "assign"
             | "expr"
+            | "raw"
     )
 }
 
@@ -643,7 +654,7 @@ fn stmt_kind_is_known(kind: &str) -> bool {
 fn item_kind_is_known(kind: &str) -> bool {
     matches!(
         kind,
-        "function" | "struct" | "enum" | "typedef" | "const" | "use" | "tree"
+        "function" | "struct" | "enum" | "typedef" | "const" | "use" | "tree" | "raw"
     )
 }
 

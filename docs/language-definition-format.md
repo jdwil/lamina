@@ -521,6 +521,59 @@ required (the matrix must cover every primitive); a definition must have at
 least one of `## Function` or `## Tree`. See `lamina-defs/languages/html.mdl`
 and `json.mdl` for complete declarative-only examples.
 
+## The Raw / Verbatim Pass-Through Node (layer escape hatch)
+
+Lamina provides an ultimate escape hatch: a **raw** node holds a string of
+verbatim target code the engine emits **UNCHANGED**. It exists at all three
+levels — an `expr is raw` expression fragment, a `stmt is raw` statement, and an
+`item is raw` top-level item — so a *layer* can always produce the exact correct
+output even when the kernel vocabulary plus the definition cannot express it.
+
+The design is deliberately simple: a raw node is **not target-keyed**. Layers
+lower differently per target, so a raw node only ever exists in the AST when the
+layer lowered *for the current target* — by the time the engine sees it, it is
+already correct target code by construction. The engine therefore does **no**
+target check, variant selection, capability gating, or error path; it simply
+passes the string through at the slot position. Do NOT add capability-matrix
+gating for raw nodes — a raw node is, by definition, already correct.
+
+A raw node also carries the standard [metadata](#construct-metadata) channel and
+is **raiseable like any other node** (no special raise path); structural
+equality compares the verbatim string and, as everywhere, ignores metadata.
+
+**Rendering.** The verbatim string is exposed through the ordinary `value`
+scalar slot, so a target needs only a trivial pass-through:
+
+- **`### expr`** — add a row `| expr is raw | "{value}" |`.
+- **`### statement`** — add a row `| stmt is raw | "{value}" |` (the raw string
+  supplies its own terminator; the engine appends nothing).
+- **Top-level items** dispatch to `## <Item>` sections, so add a **`## Raw`**
+  section whose entry template is simply `{value}`:
+
+  ```text
+  ## Raw
+
+  ​```template
+  {value}
+  ​```
+  ```
+
+  Like every `## <Item>` section, `## Raw` is **optional**: a definition that
+  omits it simply cannot emit a raw item (using one becomes an emit-time
+  `UnknownItem` error), so existing definitions are unaffected.
+
+**Indentation of multi-line raw code.** A raw string is inserted at its slot
+position and re-indented by the renderer's ordinary [column-derived
+continuation-line rule](#indentation) — the SAME rule applied to every
+multi-line rendered fragment: the leading whitespace of the current template
+line is prepended to every line *after the first* of the raw string. So a
+multi-line raw statement placed in a body whose `{body}` slot sits at column 4
+has its second and later lines indented by 4 spaces; the first line's indent is
+the literal template text preceding the slot; blank lines get no trailing
+whitespace. The engine never re-flows, trims, or otherwise transforms the raw
+text beyond this uniform continuation-line indentation. The shipped `rust.mdl`
+and `typescript.mdl` both carry the three pass-through rows/section above.
+
 ## Construct Metadata
 
 Every kernel construct carries an open, engine-**transparent** metadata channel:

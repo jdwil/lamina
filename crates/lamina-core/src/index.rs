@@ -128,6 +128,9 @@ fn item_name(item: &Item) -> Option<&str> {
         Item::Use { .. } => None,
         // A top-level tree value binds no name the index can key on.
         Item::Tree(_) => None,
+        // A raw / verbatim item is an opaque code string — it binds no name the
+        // index can key on.
+        Item::Raw { .. } => None,
     }
 }
 
@@ -217,6 +220,8 @@ fn count_fnptr_refs_in_stmt(
         }
         Statement::Expr(e) => count_fnptr_refs_in_expr(e, items, counts),
         Statement::Break | Statement::Continue => {}
+        // A raw statement is an opaque verbatim code string — nothing to walk.
+        Statement::Raw { .. } => {}
     }
 }
 
@@ -290,6 +295,8 @@ fn count_fnptr_refs_in_expr(
         | Expr::StringLiteral(_)
         | Expr::CharLiteral(_)
         | Expr::NullLiteral => {}
+        // A raw expression is an opaque verbatim code string — nothing to walk.
+        Expr::Raw { .. } => {}
     }
 }
 

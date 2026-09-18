@@ -150,6 +150,7 @@ fn pred_item_kind(kind: ItemKind) -> PredItemKind {
         ItemKind::Const => PredItemKind::Const,
         ItemKind::Use => PredItemKind::Use,
         ItemKind::Tree => PredItemKind::Tree,
+        ItemKind::Raw => PredItemKind::Raw,
     }
 }
 
@@ -226,6 +227,7 @@ fn item_visibility(item: &Item) -> Option<Visibility> {
         | Item::Const { visibility, .. } => Some(*visibility),
         Item::TypeDef { .. } | Item::Use { .. } => None,
         Item::Tree(_) => None,
+        Item::Raw { .. } => None,
     }
 }
 
@@ -354,6 +356,9 @@ impl<'a> ItemResolver<'a> {
             (Item::Use { alias, .. }, "alias") => {
                 Ok(Rendered::text(alias.clone().unwrap_or_default()))
             }
+            // A raw top-level item's verbatim code, exposed as `value` and
+            // emitted UNCHANGED (the layer escape hatch).
+            (Item::Raw { code, .. }, "value") => Ok(Rendered::text(code.clone())),
             _ => self.unknown_slot(name),
         }
     }
@@ -825,6 +830,7 @@ fn pred_stmt_kind(kind: StatementKind) -> PredStmtKind {
         StatementKind::Continue => PredStmtKind::Continue,
         StatementKind::Assign => PredStmtKind::Assign,
         StatementKind::Expr => PredStmtKind::Expr,
+        StatementKind::Raw => PredStmtKind::Raw,
     }
 }
 
@@ -1078,6 +1084,11 @@ impl<'a> StmtResolver<'a> {
             (Statement::Let { value: Some(v), .. }, "value") => emit_expr(v, self.lang, self.index),
             (Statement::Return(Some(v)), "value") => emit_expr(v, self.lang, self.index),
             (Statement::Expr(v), "value") => emit_expr(v, self.lang, self.index),
+            // A raw statement's verbatim code, exposed as `value` and emitted
+            // UNCHANGED. The renderer's ordinary column-derived indentation
+            // re-indents continuation lines of a multi-line raw string, exactly
+            // as for any other multi-line rendered fragment.
+            (Statement::Raw { code, .. }, "value") => Ok(Rendered::text(code.clone())),
             (Statement::If { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
             (Statement::While { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
             (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang, self.index),
@@ -1485,6 +1496,7 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
         ExprKind::Node => PredExprKind::Node,
         ExprKind::Text => PredExprKind::Text,
         ExprKind::ArrayLit => PredExprKind::ArrayLit,
+        ExprKind::Raw => PredExprKind::Raw,
     }
 }
 
@@ -1505,6 +1517,10 @@ fn literal_value(expr: &Expr) -> Option<String> {
             "false".to_string()
         }),
         Expr::NullLiteral => Some("null".to_string()),
+        // A raw expression fragment: its verbatim code is exposed as `value`
+        // and emitted UNCHANGED (the layer escape hatch — no quoting, no
+        // transformation).
+        Expr::Raw { code, .. } => Some(code.clone()),
         _ => None,
     }
 }

@@ -218,6 +218,24 @@ pub enum Item {
     /// `### expr` dispatch, exactly as a tree expression embedded in imperative
     /// code would.
     Tree(Expr),
+    /// A **raw / verbatim top-level item**: a string of literal target code the
+    /// engine emits UNCHANGED (the ultimate layer escape hatch).
+    ///
+    /// Like [`Expr::Raw`] and [`Statement::Raw`], a raw item is NOT
+    /// target-keyed: it exists in the AST only when a layer lowered it *for the
+    /// current target*, so the engine passes the string through with no target
+    /// check, capability gating, or error path. It renders through the target's
+    /// `## Raw` item section (a trivial pass-through entry template that emits
+    /// the `value` scalar slot), consistent with how every other item kind
+    /// dispatches to its own `## <Item>` section. Structural equality compares
+    /// the string and ignores `meta`.
+    Raw {
+        /// The verbatim target-code fragment, emitted unchanged.
+        code: String,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
+        /// item is raiseable like any other node.
+        meta: Meta,
+    },
 }
 
 impl Item {
@@ -232,6 +250,7 @@ impl Item {
             Item::Const { .. } => ItemKind::Const,
             Item::Use { .. } => ItemKind::Use,
             Item::Tree(_) => ItemKind::Tree,
+            Item::Raw { .. } => ItemKind::Raw,
         }
     }
 
@@ -248,6 +267,7 @@ impl Item {
             | Item::Use { meta, .. } => meta,
             // A tree item's metadata is the tree expression's own metadata.
             Item::Tree(expr) => expr.meta(),
+            Item::Raw { meta, .. } => meta,
         }
     }
 }
@@ -332,6 +352,9 @@ impl PartialEq for Item {
                 },
             ) => ap == bp && ai == bi && aa == ba,
             (Item::Tree(a), Item::Tree(b)) => a == b,
+            // A raw item's structural identity is its verbatim string; metadata
+            // is ignored (consistent with every other node).
+            (Item::Raw { code: a, .. }, Item::Raw { code: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -497,6 +520,8 @@ pub enum ItemKind {
     Use,
     /// A top-level tree value (the tree core).
     Tree,
+    /// A raw / verbatim top-level item (the layer escape hatch).
+    Raw,
 }
 
 impl ItemKind {
@@ -512,6 +537,7 @@ impl ItemKind {
             ItemKind::Const => "const",
             ItemKind::Use => "use",
             ItemKind::Tree => "tree",
+            ItemKind::Raw => "raw",
         }
     }
 
@@ -527,6 +553,7 @@ impl ItemKind {
             ItemKind::Const => "Const",
             ItemKind::Use => "Use",
             ItemKind::Tree => "Tree",
+            ItemKind::Raw => "Raw",
         }
     }
 
@@ -540,13 +567,14 @@ impl ItemKind {
             ItemKind::Const => SlotScope::Const,
             ItemKind::Use => SlotScope::Use,
             ItemKind::Tree => SlotScope::Node,
+            ItemKind::Raw => SlotScope::Raw,
         }
     }
 
     /// Every item kind, in canonical order. Keeps the closed `item` vocabulary
     /// in one place, shared by the predicate registry and the language-def
     /// parser (which parses one `## <Item>` section per kind).
-    pub fn all() -> [ItemKind; 7] {
+    pub fn all() -> [ItemKind; 8] {
         [
             ItemKind::Function,
             ItemKind::Struct,
@@ -555,6 +583,7 @@ impl ItemKind {
             ItemKind::Const,
             ItemKind::Use,
             ItemKind::Tree,
+            ItemKind::Raw,
         ]
     }
 }
@@ -1050,7 +1079,12 @@ impl Primitive {
 /// which dispatches on the [`StatementKind`] (the `stmt is <kind>` fact) and
 /// fills that row's scoped sub-slots (`cond`, `then`, `else`, `body`, `name`,
 /// `let_type`, `value`, `binding`, `iterable`, `scrutinee`, `cases`, …).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Structural equality **ignores** any metadata a variant carries (see
+/// [`Meta`]); it is hand-implemented to compare structure only (the
+/// [`Statement::Raw`] escape hatch carries a metadata channel like every other
+/// node, so a derived `PartialEq` would wrongly compare it).
+#[derive(Debug, Clone)]
 pub enum Statement {
     /// A scoped sequence of statements (`{ … }`). First-class; used as the body
     /// of nested scopes. (A function's own body is a `Vec<Statement>` with block
@@ -1141,7 +1175,126 @@ pub enum Statement {
     },
     /// An expression-statement (e.g. a bare function call `f();`).
     Expr(Expr),
+    /// A **raw / verbatim statement**: a string of literal target code the
+    /// engine emits UNCHANGED at the slot position (the ultimate layer escape
+    /// hatch).
+    ///
+    /// Like [`Expr::Raw`], a raw statement is NOT target-keyed: it exists in
+    /// the AST only when a layer lowered it *for the current target*, so the
+    /// engine passes the string through with no target check, capability
+    /// gating, or error path. The verbatim string is exposed to the target's
+    /// `### statement` `stmt is raw` row via the `value` scalar slot; a
+    /// multi-line raw statement in an indented body is re-indented by the
+    /// renderer's ordinary column-derived continuation-line indentation, exactly
+    /// as any other multi-line rendered fragment (see the emitter's indentation
+    /// docs). Structural equality compares the string and ignores `meta`.
+    Raw {
+        /// The verbatim target-code fragment, emitted unchanged.
+        code: String,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
+        /// statement is raiseable like any other node.
+        meta: Meta,
+    },
 }
+
+/// Structural equality of statements **ignores metadata** (see [`Meta`]): two
+/// statements are equal iff their structure matches. It is hand-implemented
+/// because [`Statement::Raw`] carries a metadata channel that must not
+/// participate in equality (consistent with the rest of the AST). Every other
+/// variant compares its structural fields as a derived `PartialEq` would.
+impl PartialEq for Statement {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Statement::Block(a), Statement::Block(b)) => a == b,
+            (
+                Statement::Let {
+                    name: an,
+                    ty: at,
+                    value: av,
+                },
+                Statement::Let {
+                    name: bn,
+                    ty: bt,
+                    value: bv,
+                },
+            ) => an == bn && at == bt && av == bv,
+            (Statement::Return(a), Statement::Return(b)) => a == b,
+            (
+                Statement::If {
+                    cond: ac,
+                    then_block: at,
+                    else_block: ae,
+                },
+                Statement::If {
+                    cond: bc,
+                    then_block: bt,
+                    else_block: be,
+                },
+            ) => ac == bc && at == bt && ae == be,
+            (
+                Statement::While { cond: ac, body: ab },
+                Statement::While { cond: bc, body: bb },
+            ) => ac == bc && ab == bb,
+            (
+                Statement::For {
+                    init: ai,
+                    cond: ac,
+                    step: as_,
+                    body: ab,
+                },
+                Statement::For {
+                    init: bi,
+                    cond: bc,
+                    step: bs,
+                    body: bb,
+                },
+            ) => ai == bi && ac == bc && as_ == bs && ab == bb,
+            (
+                Statement::ForEach {
+                    binding: ab,
+                    iterable: ai,
+                    body: abd,
+                },
+                Statement::ForEach {
+                    binding: bb,
+                    iterable: bi,
+                    body: bbd,
+                },
+            ) => ab == bb && ai == bi && abd == bbd,
+            (
+                Statement::Switch {
+                    scrutinee: asc,
+                    cases: ac,
+                    default: ad,
+                },
+                Statement::Switch {
+                    scrutinee: bsc,
+                    cases: bc,
+                    default: bd,
+                },
+            ) => asc == bsc && ac == bc && ad == bd,
+            (Statement::Break, Statement::Break) => true,
+            (Statement::Continue, Statement::Continue) => true,
+            (
+                Statement::Assign {
+                    target: at,
+                    value: av,
+                },
+                Statement::Assign {
+                    target: bt,
+                    value: bv,
+                },
+            ) => at == bt && av == bv,
+            (Statement::Expr(a), Statement::Expr(b)) => a == b,
+            // A raw statement's structural identity is its verbatim string;
+            // metadata is ignored (consistent with every other node).
+            (Statement::Raw { code: a, .. }, Statement::Raw { code: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Statement {}
 
 /// Returns `true` if `expr` is a valid *lvalue* — a place an assignment can
 /// name. The kernel lvalues are a variable [`Expr::Ref`], a field access
@@ -1207,16 +1360,23 @@ impl Statement {
     /// This statement's engine-transparent [`Meta`] (see [`Meta`]).
     ///
     /// Metadata is exposed uniformly so the `has_meta` / `meta.<key>` facts and
-    /// the `{meta.<key>}` slot are answerable in statement scope. No layer in
-    /// the current kernel tags a bare [`Statement`] node — the Part 3 anonymous
-    /// forms tag functions, fields, structs, and expressions (see
-    /// [`Function::meta`], [`Field::meta`], [`Item::meta`], and [`Expr::meta`]),
-    /// not statements — so this is always the empty map today. It exists so the
-    /// channel is present at every scope; a future layer that tags a statement
-    /// has a place to read it without a breaking change.
+    /// the `{meta.<key>}` slot are answerable in statement scope. The only
+    /// statement variant that carries an inline metadata channel is
+    /// [`Statement::Raw`] (a raw statement is raiseable like any other node);
+    /// every other kind exposes the empty map — no layer in the current kernel
+    /// tags them (the Part 3 anonymous forms tag functions, fields, structs,
+    /// and expressions — see [`Function::meta`], [`Field::meta`],
+    /// [`Item::meta`], and [`Expr::meta`] — not statements). The channel is
+    /// present at every scope so a future layer that tags a statement has a
+    /// place to read it without a breaking change.
     pub fn meta(&self) -> &Meta {
-        static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(Meta::new)
+        match self {
+            Statement::Raw { meta, .. } => meta,
+            _ => {
+                static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(Meta::new)
+            }
+        }
     }
 }
 
@@ -1237,6 +1397,7 @@ impl Statement {
             Statement::Continue => StatementKind::Continue,
             Statement::Assign { .. } => StatementKind::Assign,
             Statement::Expr(_) => StatementKind::Expr,
+            Statement::Raw { .. } => StatementKind::Raw,
         }
     }
 }
@@ -1272,6 +1433,8 @@ pub enum StatementKind {
     Assign,
     /// An expression-statement.
     Expr,
+    /// A raw / verbatim statement (the layer escape hatch).
+    Raw,
 }
 
 impl StatementKind {
@@ -1290,12 +1453,13 @@ impl StatementKind {
             StatementKind::Continue => "continue",
             StatementKind::Assign => "assign",
             StatementKind::Expr => "expr",
+            StatementKind::Raw => "raw",
         }
     }
 
     /// Every statement kind, in canonical order. Keeps the closed `stmt`
     /// vocabulary in one place, shared by the predicate registry.
-    pub fn all() -> [StatementKind; 12] {
+    pub fn all() -> [StatementKind; 13] {
         [
             StatementKind::Block,
             StatementKind::Let,
@@ -1309,6 +1473,7 @@ impl StatementKind {
             StatementKind::Continue,
             StatementKind::Assign,
             StatementKind::Expr,
+            StatementKind::Raw,
         ]
     }
 }
@@ -1480,6 +1645,31 @@ pub enum Expr {
     /// distinctly from element children — e.g. HTML escapes text content but
     /// not element markup, and JSON quotes a string scalar.
     Text(Box<Expr>),
+    /// A **raw / verbatim expression fragment**: a string of literal target
+    /// code the engine emits UNCHANGED at the slot position (the ultimate
+    /// layer escape hatch).
+    ///
+    /// A raw node lets a *layer* lower an expression that Lamina's kernel
+    /// vocabulary plus the language definition cannot otherwise express,
+    /// guaranteeing the layer can always produce the exact target code. It is
+    /// deliberately **not** target-keyed: a layer lowers differently per
+    /// target, so a raw node only ever exists in the AST when the layer lowered
+    /// *for the current target* — by the time the engine sees it, it is always
+    /// correct target code by construction. The engine therefore performs NO
+    /// target check, variant selection, capability gating, or error path; it
+    /// simply passes the string through.
+    ///
+    /// The verbatim string is exposed to the target's `### expr` `expr is raw`
+    /// row via the `value` scalar slot. Structural equality compares the string
+    /// and (like every other node) **ignores** the `meta` field.
+    Raw {
+        /// The verbatim target-code fragment, emitted unchanged.
+        code: String,
+        /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
+        /// node is raiseable like any other node — it carries the standard
+        /// metadata channel with no special-casing.
+        meta: Meta,
+    },
 }
 
 /// An **attribute** on a tree [`Expr::Node`]: a name and a value expression.
@@ -1616,6 +1806,9 @@ impl PartialEq for Expr {
                 },
             ) => an == bn && aa == ba && ac == bc,
             (Expr::Text(a), Expr::Text(b)) => a == b,
+            // A raw node's structural identity is its verbatim string; metadata
+            // is ignored (consistent with every other node).
+            (Expr::Raw { code: a, .. }, Expr::Raw { code: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -1638,6 +1831,7 @@ impl Expr {
             Expr::StructLit { meta, .. } => meta,
             Expr::Node { meta, .. } => meta,
             Expr::ArrayLit { meta, .. } => meta,
+            Expr::Raw { meta, .. } => meta,
             _ => {
                 static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Meta::new)
@@ -1666,6 +1860,7 @@ impl Expr {
             Expr::Node { .. } => ExprKind::Node,
             Expr::Text(_) => ExprKind::Text,
             Expr::ArrayLit { .. } => ExprKind::ArrayLit,
+            Expr::Raw { .. } => ExprKind::Raw,
         }
     }
 }
@@ -1711,6 +1906,8 @@ pub enum ExprKind {
     Text,
     /// An array-literal (construction) expression.
     ArrayLit,
+    /// A raw / verbatim expression fragment (the layer escape hatch).
+    Raw,
 }
 
 impl ExprKind {
@@ -1734,6 +1931,7 @@ impl ExprKind {
             ExprKind::Node => "node",
             ExprKind::Text => "text",
             ExprKind::ArrayLit => "array",
+            ExprKind::Raw => "raw",
         }
     }
 }
@@ -2048,6 +2246,12 @@ pub enum SlotScope {
     /// expression (dispatching through the `### expr` table); loop facts
     /// (`first`/`last`) let the item template supply its own separator.
     ArrayElem,
+    /// Resolving slots of a raw / verbatim top-level [`Item::Raw`]. Exposes a
+    /// single `value` scalar leaf: the verbatim code string, emitted unchanged.
+    /// (The `expr is raw` / `stmt is raw` forms reuse the [`SlotScope::Expr`] /
+    /// [`SlotScope::Statement`] `value` slot, so no separate scope is needed for
+    /// them.)
+    Raw,
 }
 
 /// The shape of an engine-bound slot: how the AST field it maps to is rendered.
@@ -2392,6 +2596,12 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "value" => Some(SlotShape::Scalar),
             _ => None,
         },
+        // A raw / verbatim top-level item: `value` is the verbatim code string
+        // (a scalar leaf), emitted unchanged.
+        SlotScope::Raw => match name {
+            "value" => Some(SlotShape::Scalar),
+            _ => None,
+        },
     }
 }
 
@@ -2617,12 +2827,13 @@ mod tests {
 
     #[test]
     fn statement_kind_set_is_closed() {
-        // Exactly 12 statement kinds; guard against accidental drift.
-        assert_eq!(StatementKind::all().len(), 12);
+        // Exactly 13 statement kinds; guard against accidental drift.
+        assert_eq!(StatementKind::all().len(), 13);
         // Spot-check the kind spellings used by the `stmt is <kind>` fact.
         assert_eq!(StatementKind::ForEach.as_str(), "foreach");
         assert_eq!(StatementKind::Switch.as_str(), "switch");
         assert_eq!(StatementKind::Expr.as_str(), "expr");
+        assert_eq!(StatementKind::Raw.as_str(), "raw");
     }
 
     #[test]
@@ -2763,7 +2974,7 @@ mod tests {
 
     #[test]
     fn item_kind_set_is_closed_and_spellings_match_headings() {
-        assert_eq!(ItemKind::all().len(), 7);
+        assert_eq!(ItemKind::all().len(), 8);
         // Each `item is <kind>` spelling and its `## <Heading>` are consistent.
         for kind in ItemKind::all() {
             assert!(!kind.as_str().is_empty());
@@ -2772,6 +2983,8 @@ mod tests {
         }
         assert_eq!(ItemKind::TypeDef.heading(), "TypeDef");
         assert_eq!(ItemKind::TypeDef.as_str(), "typedef");
+        assert_eq!(ItemKind::Raw.heading(), "Raw");
+        assert_eq!(ItemKind::Raw.as_str(), "raw");
     }
 
     #[test]

@@ -342,6 +342,32 @@ fn shift_offset(offset_map: &[(usize, usize)], old: usize, text: &str, indent: u
     old + added
 }
 
+/// Splits a slot reference into its base name and an optional projected item
+/// slot, on the FIRST `:`.
+///
+/// A slot reference in a template is either:
+/// - `name` — no `:` — returns `("name", None)`. This is the existing form and
+///   MUST keep behaving byte-identically (the backward-compat guarantee).
+/// - `name:item` — a **projected collection slot** — returns
+///   `("name", Some("item"))`. It loops the SAME collection as `name` but
+///   renders each element through the `### item` subsection instead of the
+///   collection's default item slot.
+///
+/// The split is on the first `:` only; both sides are slot identifiers. A slot
+/// name that contains no `:` (the overwhelming common case, including every
+/// special-slot form such as `meta.key`, `resolve_fnptr(x)`, and
+/// `fresh_name(a, b)` — none of which contain `:`) returns `None`, so those
+/// paths are entirely unaffected.
+///
+/// Whether the projection is *valid* (the base must be a collection, the item
+/// slot must exist) is decided by the caller — this function only splits.
+pub fn parse_slot_projection(name: &str) -> (&str, Option<&str>) {
+    match name.split_once(':') {
+        Some((base, item)) => (base, Some(item)),
+        None => (name, None),
+    }
+}
+
 /// Fills template slots. Implementors decide what each named slot renders to,
 /// which is where recursion into child constructs occurs.
 pub trait SlotResolver {
@@ -475,5 +501,31 @@ mod tests {
         let mut r = resolver(&[("body", "a\nb")]);
         let out = t.render(&mut r).expect("render");
         assert_eq!(out.text, "a\nb");
+    }
+
+    #[test]
+    fn slot_projection_splits_on_first_colon() {
+        assert_eq!(parse_slot_projection("params"), ("params", None));
+        assert_eq!(
+            parse_slot_projection("params:param_type"),
+            ("params", Some("param_type"))
+        );
+        // Split on the FIRST colon only; a stray colon in the item is kept.
+        assert_eq!(parse_slot_projection("a:b:c"), ("a", Some("b:c")));
+    }
+
+    #[test]
+    fn no_colon_forms_return_none_projection() {
+        // Special-slot forms contain no `:`, so they are never treated as
+        // projections (backward-compat guarantee).
+        assert_eq!(parse_slot_projection("meta.key"), ("meta.key", None));
+        assert_eq!(
+            parse_slot_projection("resolve_fnptr(value)"),
+            ("resolve_fnptr(value)", None)
+        );
+        assert_eq!(
+            parse_slot_projection("fresh_name(loop, w)"),
+            ("fresh_name(loop, w)", None)
+        );
     }
 }

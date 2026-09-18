@@ -169,6 +169,35 @@ pub enum LangDocError {
         item: String,
     },
 
+    /// A projected collection slot `{collection:item_slot}` named an item slot
+    /// that has no `### <item_slot>` subsection. Detected at load time.
+    #[error(
+        "projected collection slot {collection:?} references item slot {item:?}, \
+         but no ### {item} subsection exists"
+    )]
+    MissingProjectionItemSlot {
+        /// The collection slot being projected (e.g. `params`).
+        collection: String,
+        /// The projected item slot subsection that is missing (e.g.
+        /// `param_type`).
+        item: String,
+    },
+
+    /// A slot projection `{name:item_slot}` was applied to a slot that is not a
+    /// collection (Sequence-bound). Projection only selects which item template
+    /// a collection loops with, so it is meaningless on a scalar or a named
+    /// helper slot. Detected at load time.
+    #[error(
+        "slot projection {slot:?} (:{item}) is only valid on a collection slot; \
+         {slot} is not a collection"
+    )]
+    ProjectionOnNonCollection {
+        /// The (non-collection) slot the projection was applied to.
+        slot: String,
+        /// The projected item slot name that followed the `:`.
+        item: String,
+    },
+
     /// An operator table row was malformed (fewer than two columns).
     #[error("malformed operator row: {line:?}")]
     MalformedOperatorRow {
@@ -346,6 +375,23 @@ pub enum EmitError {
         target: String,
         /// The unresolved slot name.
         slot: String,
+    },
+
+    /// A slot projection `{name:item_slot}` was applied to a slot that is not a
+    /// collection at render time. Load-time validation normally rejects this,
+    /// so reaching it means an unvalidated definition; surfaced as a loud error
+    /// rather than silent wrong output.
+    #[error(
+        "target {target:?}: slot projection {slot:?} (:{item}) applied to a \
+         non-collection slot"
+    )]
+    ProjectionOnNonCollection {
+        /// The name of the target language definition.
+        target: String,
+        /// The (non-collection) slot the projection was applied to.
+        slot: String,
+        /// The projected item slot name that followed the `:`.
+        item: String,
     },
 
     /// The program contains a top-level item kind the target language

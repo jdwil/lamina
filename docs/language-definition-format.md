@@ -166,6 +166,56 @@ Within an item slot, `{name}` / `{type}` refer to the *element* (the param's
 name/type); `{value}` refers to a statement's value. An empty collection renders
 to the empty string.
 
+### Projected Collection Slots (`{collection:item_slot}`)
+
+A collection slot may be rendered through a **chosen** item template instead of
+its default one, using a projection: `{collection:item_slot}`. It loops the SAME
+collection as `{collection}` but renders each element through the named
+`### item_slot` subsection rather than the collection's default item slot (from
+its binding). The chosen item slot resolves in the **same element scope** as the
+default, so it sees the same per-element sub-slots (a `params` projection's item
+slot can use `{name}` and `{type}`).
+
+This exists because one collection sometimes needs *two* projections. Haskell's
+function is the motivating case: the same `params` list must render as **types**
+in the signature and as **names** in the equation:
+
+```text
+## Function
+​```template
+{name} :: {params:param_type}{ret_type}
+{name}{params:param_name} = {body}
+​```
+
+### param_type
+| When  | Template     |
+|-------|--------------|
+| first | "{type} -> " |
+| else  | "{type} -> " |
+
+### param_name
+| When  | Template  |
+|-------|-----------|
+| first | " {name}" |
+| else  | " {name}" |
+```
+
+`{params}` with **no** `:` is unchanged — it loops the binding's default item
+slot exactly as before (the backward-compat guarantee; a slot reference without
+`:` behaves byte-identically to a definition written before projections
+existed).
+
+**Parsing.** A slot reference is `{name}` or `{name:item}`, split on the FIRST
+`:`; both sides are slot identifiers. A `:` is meaningful only on a **collection
+slot** (one whose binding is a Sequence). Projecting a non-collection slot
+(`{name:foo}` where `name` is a scalar or a named helper slot) is a load-time
+error (`ProjectionOnNonCollection`), and a projection naming a missing
+subsection (`{params:param_type}` with no `### param_type`) is a load-time error
+(`MissingProjectionItemSlot`). `{{` / `}}` literal-brace handling is unchanged.
+The engine stays dumb: a projection only selects *which* item template a
+collection loops with — it adds no scripting and no per-element logic beyond the
+usual `When`-table dispatch.
+
 ### Slot Subsections
 
 Each `### <slot>` is one of two forms:

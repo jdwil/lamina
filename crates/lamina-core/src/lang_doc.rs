@@ -43,7 +43,7 @@ use crate::lang::{
     SlotDef, Version, WhenRow, WhenTable, LAMINA_FORMAT_VERSION,
 };
 use crate::predicate::parse_predicate;
-use crate::render::Template;
+use crate::render::{parse_slot_projection, Template};
 
 const TITLE_PREFIX: &str = "# Lamina Language Definition:";
 const LANG_META_FENCE: &str = "```lang-meta";
@@ -774,6 +774,38 @@ fn validate_slots_from(
         // engine sub-slot resolved within the current scope, so nothing further
         // is added to the work list.
         if is_special_slot(&name) {
+            continue;
+        }
+
+        // A `{collection:item_slot}` projection: the base must be a Sequence
+        // (collection) slot, the projected item slot must exist as a `### item`
+        // subsection, and its references are validated in the collection's
+        // element scope — exactly like the default item slot, only through the
+        // chosen subsection. A `{name}` with no `:` returns `None` here and
+        // falls through to the unchanged path below (byte-identical behavior).
+        let (base, projection) = parse_slot_projection(&name);
+        if let Some(item) = projection {
+            match slot_binding(base, scope) {
+                Some(SlotShape::Sequence { item_scope, .. }) => {
+                    let def = slots.get(item).ok_or_else(|| {
+                        LangDocError::MissingProjectionItemSlot {
+                            collection: base.to_string(),
+                            item: item.to_string(),
+                        }
+                    })?;
+                    for r in referenced_by(def) {
+                        work.push((r, item_scope));
+                    }
+                }
+                // Projection is only meaningful on a collection: a scalar
+                // engine-bound slot, or a named helper slot, cannot be looped.
+                _ => {
+                    return Err(LangDocError::ProjectionOnNonCollection {
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    })
+                }
+            }
             continue;
         }
 
@@ -1543,6 +1575,70 @@ mod tests {
             Err(LangDocError::MissingItemSlot {
                 collection: "body".to_string(),
                 item: "statement".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn projected_collection_slot_validates_through_named_item_slot() {
+        // `{params:param_type}` loops the `params` collection through the
+        // author-named `### param_type` subsection (in Param scope, so it may
+        // use `{type}`). A default `### param` still satisfies the plain
+        // `{params}` reference. Both projections must validate.
+        let doc = mk("```template\n\
+            fn {name}({params}) sig({params:param_type})\n\
+            ```\n\
+            \n\
+            ### param\n\
+            | When  | Template |\n\
+            |-------|----------|\n\
+            | first | \"{name}\" |\n\
+            | else  | \", {name}\" |\n\
+            \n\
+            ### param_type\n\
+            | When  | Template |\n\
+            |-------|----------|\n\
+            | first | \"{type}\" |\n\
+            | else  | \" -> {type}\" |");
+        assert!(
+            parse_language_def(&doc).is_ok(),
+            "a projection through an existing item slot must validate"
+        );
+    }
+
+    #[test]
+    fn projection_naming_missing_item_slot_is_load_error() {
+        // `{params:param_type}` with no `### param_type` subsection is a
+        // load-time error naming the collection and the missing item slot.
+        let doc = mk("```template\n\
+            fn {name}({params}) sig({params:param_type})\n\
+            ```\n\
+            \n\
+            ### param\n\
+            | When  | Template |\n\
+            |-------|----------|\n\
+            | first | \"{name}\" |\n\
+            | else  | \", {name}\" |");
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::MissingProjectionItemSlot {
+                collection: "params".to_string(),
+                item: "param_type".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn projection_on_non_collection_slot_is_load_error() {
+        // `{name:foo}` projects a SCALAR slot (`name`), which is not a
+        // collection — a load-time error. Projection only selects which item
+        // template a collection loops with.
+        let doc = mk("```template\nfn {name:foo}()\n```");
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::ProjectionOnNonCollection {
+                slot: "name".to_string(),
+                item: "foo".to_string(),
             })
         );
     }

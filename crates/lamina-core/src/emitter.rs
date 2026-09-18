@@ -20,7 +20,7 @@ use crate::predicate::{
     CallerKind, ExprKind as PredExprKind, ItemKind as PredItemKind, RenderContext, RetKind,
     StmtKind as PredStmtKind, VariantKind as PredVariantKind, VisKind,
 };
-use crate::render::{Rendered, SlotResolver};
+use crate::render::{parse_slot_projection, Rendered, SlotResolver};
 
 /// Transpiles `file` to the target described by `lang`.
 ///
@@ -768,10 +768,31 @@ impl<'a> SlotResolver for ItemResolver<'a> {
             }
             _ => {}
         }
-        match slot_binding(name, self.scope_kind()) {
-            Some(SlotShape::Scalar) => self.scalar(name),
-            Some(SlotShape::Sequence { item_slot, .. }) => self.sequence(name, &item_slot),
-            None => self.render_named_slot(name),
+        let (base, projection) = parse_slot_projection(name);
+        match slot_binding(base, self.scope_kind()) {
+            Some(SlotShape::Scalar) => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.scalar(base)
+            }
+            Some(SlotShape::Sequence { item_slot, .. }) => {
+                self.sequence(base, projection.unwrap_or(&item_slot))
+            }
+            None => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.render_named_slot(base)
+            }
         }
     }
 }
@@ -917,11 +938,26 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
         // Cardinality is data-driven: ask the binding table for this slot's
         // shape in the current scope. Scalar -> render directly; Sequence ->
         // loop the item slot; not engine-bound -> a named slot definition.
-        match slot_binding(name, self.scope_kind()) {
-            Some(SlotShape::Scalar) => self.scalar(name),
+        //
+        // A `{collection:item_slot}` projection selects WHICH item template the
+        // collection loops with; `{collection}` with no `:` keeps the binding's
+        // default item slot, byte-identically to before.
+        let (base, projection) = parse_slot_projection(name);
+        match slot_binding(base, self.scope_kind()) {
+            Some(SlotShape::Scalar) => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.scalar(base)
+            }
             Some(SlotShape::Sequence { item_slot, .. }) => {
+                let item_slot = projection.unwrap_or(&item_slot).to_string();
                 // Loop the matching AST sequence for this bound name.
-                match (self.scope_kind(), name) {
+                match (self.scope_kind(), base) {
                     (SlotScope::Function, "params") => {
                         let params: &'a [Param] = &self.function.params;
                         let len = params.len();
@@ -947,7 +983,16 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
                     }),
                 }
             }
-            None => self.render_named_slot(name),
+            None => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.render_named_slot(base)
+            }
         }
     }
 }
@@ -1391,10 +1436,31 @@ impl<'a> SlotResolver for StmtResolver<'a> {
             }
             _ => {}
         }
-        match slot_binding(name, self.scope_kind()) {
-            Some(SlotShape::Scalar) => self.scalar(name),
-            Some(SlotShape::Sequence { item_slot, .. }) => self.sequence(name, &item_slot),
-            None => self.render_named_slot(name),
+        let (base, projection) = parse_slot_projection(name);
+        match slot_binding(base, self.scope_kind()) {
+            Some(SlotShape::Scalar) => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.scalar(base)
+            }
+            Some(SlotShape::Sequence { item_slot, .. }) => {
+                self.sequence(base, projection.unwrap_or(&item_slot))
+            }
+            None => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.render_named_slot(base)
+            }
         }
     }
 }
@@ -2423,43 +2489,62 @@ impl<'a> SlotResolver for ExprResolver<'a> {
         if let Some(special) = parse_special_slot(name) {
             return self.render_special(name, special);
         }
-        match slot_binding(name, self.scope_kind()) {
-            Some(SlotShape::Scalar) => self.scalar(name),
-            // Route the sequence to the matching AST collection: a call's
-            // `args` loop the `expr_arg` item slot; a struct literal's `fields`
-            // loop the `field_init` item slot.
+        let (base, projection) = parse_slot_projection(name);
+        match slot_binding(base, self.scope_kind()) {
+            Some(SlotShape::Scalar) => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.scalar(base)
+            }
+            // Route the sequence to the matching AST collection by its BASE
+            // slot name (a call's `args`, a struct literal's `fields`, …),
+            // rendering each element through the effective item slot: the
+            // projection override when present, otherwise the binding default.
             Some(SlotShape::Sequence { item_slot, .. }) => {
-                if item_slot == "field_init" {
-                    self.render_fields(&item_slot)
-                } else if item_slot == "attr" {
-                    self.render_attrs(&item_slot)
-                } else if item_slot == "child" {
-                    self.render_children(&item_slot)
-                } else if item_slot == "array_elem" {
-                    self.render_elems(&item_slot)
-                } else if item_slot == "param" {
+                let effective = projection.unwrap_or(&item_slot);
+                match base {
+                    "fields" => self.render_fields(effective),
+                    "attrs" => self.render_attrs(effective),
+                    "children" => self.render_children(effective),
+                    "elems" => self.render_elems(effective),
                     // A lambda's parameters loop the shared `param` item slot.
-                    self.render_lambda_params(&item_slot)
-                } else if item_slot == "statement" {
+                    "params" => self.render_lambda_params(effective),
                     // A lambda's body is a statement sequence, rendered through
                     // the dedicated statement machinery (recursive `statement`
                     // item slot). A lambda has no enclosing-callable synchrony
                     // of its own, so `caller` is threaded as `None`.
-                    let body: &'a [Statement] = match self.expr {
-                        Expr::Lambda { body, .. } => body,
-                        _ => {
-                            return Err(EmitError::UnknownSlot {
-                                target: self.lang.name.clone(),
-                                slot: "body".to_string(),
-                            })
-                        }
-                    };
-                    render_statement_sequence(body, &item_slot, self.lang, self.index, None)
-                } else {
-                    self.render_args(&item_slot)
+                    "body" => {
+                        let body: &'a [Statement] = match self.expr {
+                            Expr::Lambda { body, .. } => body,
+                            _ => {
+                                return Err(EmitError::UnknownSlot {
+                                    target: self.lang.name.clone(),
+                                    slot: "body".to_string(),
+                                })
+                            }
+                        };
+                        render_statement_sequence(body, effective, self.lang, self.index, None)
+                    }
+                    // A call's `args` (and any other expression sequence) loop
+                    // through the argument machinery.
+                    _ => self.render_args(effective),
                 }
             }
-            None => self.render_named_slot(name),
+            None => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.render_named_slot(base)
+            }
         }
     }
 }
@@ -2852,10 +2937,31 @@ impl<'a> SlotResolver for TypeResolver<'a> {
             }
             _ => {}
         }
-        match slot_binding(name, self.scope_kind()) {
-            Some(SlotShape::Scalar) => self.scalar(name),
-            Some(SlotShape::Sequence { item_slot, .. }) => self.render_params(&item_slot),
-            None => self.render_named_slot(name),
+        let (base, projection) = parse_slot_projection(name);
+        match slot_binding(base, self.scope_kind()) {
+            Some(SlotShape::Scalar) => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.scalar(base)
+            }
+            Some(SlotShape::Sequence { item_slot, .. }) => {
+                self.render_params(projection.unwrap_or(&item_slot))
+            }
+            None => {
+                if let Some(item) = projection {
+                    return Err(EmitError::ProjectionOnNonCollection {
+                        target: self.lang.name.clone(),
+                        slot: base.to_string(),
+                        item: item.to_string(),
+                    });
+                }
+                self.render_named_slot(base)
+            }
         }
     }
 }

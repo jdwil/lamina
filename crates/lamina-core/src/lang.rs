@@ -21,8 +21,82 @@
 use std::collections::HashMap;
 
 use crate::ast::{ItemKind, Primitive};
+use crate::error::LangDocError;
 use crate::predicate::{Predicate, RenderContext};
 use crate::render::Template;
+
+/// The `.mdl` **format** version this engine understands, as a `major.minor.patch`
+/// semver string. A language definition declares (in its `lang-meta` header) the
+/// MINIMUM format version it requires via `lamina-format:`; the engine refuses to
+/// load a definition whose required version is NEWER than this constant, and loads
+/// any definition requiring an equal or older version (the engine is
+/// backward-compatible).
+///
+/// It starts at `0.0.0` (alpha): the format is not yet stabilized. Bump it when a
+/// backward-incompatible or additive change to the `.mdl` format is made, so older
+/// engines correctly refuse definitions that rely on the newer format.
+pub const LAMINA_FORMAT_VERSION: &str = "0.0.0";
+
+/// A parsed 3-integer semantic version (`major.minor.patch`).
+///
+/// This is a deliberately tiny, dependency-free comparator: the engine only needs
+/// to answer "is version A newer than version B?" for the format-version gate, so a
+/// full semver crate (with pre-release/build metadata, ranges, etc.) is unwarranted.
+/// Ordering is the natural lexicographic order over the `(major, minor, patch)`
+/// tuple, which is exactly semver's precedence for release versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    /// The major component.
+    pub major: u64,
+    /// The minor component.
+    pub minor: u64,
+    /// The patch component.
+    pub patch: u64,
+}
+
+impl Version {
+    /// Parses a `major.minor.patch` string into a [`Version`].
+    ///
+    /// The string MUST have exactly three dot-separated non-negative integer
+    /// components (no pre-release/build suffixes, no missing or extra parts). This
+    /// is intentionally strict: a malformed version is a load-time error, never a
+    /// silently-tolerated default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LangDocError::MalformedFormatVersion`] if the string does not have
+    /// exactly three components or any component is not a non-negative integer.
+    pub fn parse(s: &str) -> Result<Version, LangDocError> {
+        let bad = || LangDocError::MalformedFormatVersion {
+            value: s.to_string(),
+        };
+        let mut parts = s.split('.');
+        let major = parts.next().ok_or_else(bad)?;
+        let minor = parts.next().ok_or_else(bad)?;
+        let patch = parts.next().ok_or_else(bad)?;
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        // Reject empty components and any non-digit (e.g. `1.2.x`, `1..3`, `-1.0.0`).
+        let parse_component = |c: &str| -> Result<u64, LangDocError> {
+            if c.is_empty() || !c.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            c.parse::<u64>().map_err(|_| bad())
+        };
+        Ok(Version {
+            major: parse_component(major)?,
+            minor: parse_component(minor)?,
+            patch: parse_component(patch)?,
+        })
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 /// How a target language realizes a given Lamina primitive.
 ///
@@ -192,6 +266,23 @@ pub enum OperatorSpelling {
 pub struct LanguageDef {
     /// Human-readable target name, used in diagnostics (e.g. `"rust"`).
     pub name: String,
+    /// The target language this definition emits (from the `lang-meta` header's
+    /// `target:` field). Usually the same as [`LanguageDef::name`], but declared
+    /// explicitly so the engine carries an authoritative language identity for
+    /// future registry/resolution. Stored verbatim; the engine never parses it.
+    pub target: String,
+    /// The target-language version band this definition emits for (from the
+    /// `lang-meta` header's `target-version:` field) — e.g. Rust edition `2021`,
+    /// `>=3.0` for Python, `>=5.0` for TypeScript.
+    ///
+    /// This is an **opaque** string: the engine stores it verbatim and NEVER
+    /// parses, compares, or branches on it. Version-specific behavior lives in
+    /// SEPARATE definitions (a conservative `python` def and a permissive
+    /// `python3.13` def are two distinct files), not in engine conditionals or
+    /// `When`-language predicates. A future registry/resolution layer may filter
+    /// candidate definitions by this band; the engine itself performs no version
+    /// logic on it.
+    pub target_version: String,
     /// The capability matrix: one entry per supported primitive.
     pub capabilities: HashMap<Primitive, Capability>,
     /// How this target renders a function.
@@ -230,5 +321,12 @@ impl LanguageDef {
     /// kind (using such an item is then an emit-time error).
     pub fn item_def(&self, kind: ItemKind) -> Option<&ItemDef> {
         self.items.get(&kind)
+    }
+
+    /// Returns the opaque target-language version band this definition declares
+    /// (the `lang-meta` header's `target-version:`). The engine never acts on
+    /// this value; it is carried verbatim for a future registry/resolution layer.
+    pub fn target_version(&self) -> &str {
+        &self.target_version
     }
 }

@@ -2523,6 +2523,8 @@ mod tests {
     const RUST_DEF: &str = concat!(
         "# Lamina Language Definition: rust\n",
         "\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: rust\ntarget-version: 2021\n```\n",
+        "\n",
         "## Function\n",
         "\n",
         "```template\n",
@@ -2728,6 +2730,7 @@ mod tests {
     /// AST variant), so they are load-valid without extra graph edges.
     const RUST_TYPES_DEF: &str = concat!(
         "# Lamina Language Definition: rust\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: rust\ntarget-version: 2021\n```\n\n",
         "## Function\n\n",
         "```template\n",
         "fn {name}({params}){ret} {{\n",
@@ -3168,6 +3171,7 @@ mod tests {
     /// rest are placeholders.
     const STMT_DEF: &str = concat!(
         "# Lamina Language Definition: cish\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: cish\ntarget-version: test\n```\n\n",
         "## Function\n\n",
         "```template\n",
         "fn {name}({params}){ret} {{\n",
@@ -3397,6 +3401,7 @@ mod tests {
     /// hosts the shared `### statement`/`### expr` helpers a `const` value needs.
     const ITEM_DEF: &str = concat!(
         "# Lamina Language Definition: itemish\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: itemish\ntarget-version: test\n```\n\n",
         "## Function\n\n",
         "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
         "### statement\n```template\nreturn {value};\n```\n\n",

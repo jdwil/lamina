@@ -15,6 +15,8 @@ const SOURCE: &str = "fn answer() -> i32 { return 42; }";
 const RUST_DEF: &str = concat!(
     "# Lamina Language Definition: rust\n",
     "\n",
+    "```lang-meta\nlamina-format: 0.0.0\ntarget: rust\ntarget-version: 2021\n```\n",
+    "\n",
     "## Function\n",
     "\n",
     "```template\n",
@@ -90,6 +92,8 @@ const RUST_DEF: &str = concat!(
 
 const TS_DEF: &str = concat!(
     "# Lamina Language Definition: typescript\n",
+    "\n",
+    "```lang-meta\nlamina-format: 0.0.0\ntarget: typescript\ntarget-version: >=5.0\n```\n",
     "\n",
     "## Function\n",
     "\n",

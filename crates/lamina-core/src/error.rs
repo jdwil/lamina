@@ -196,6 +196,56 @@ pub enum LangDocError {
         /// The operator the action applied to.
         operator: String,
     },
+
+    /// The required `lang-meta` header block (a ```` ```lang-meta ```` fenced
+    /// block near the title) was absent. Every definition MUST declare one.
+    #[error("missing required `lang-meta` header block (near the title)")]
+    MissingLangMeta,
+
+    /// A line inside the `lang-meta` block was not a `key: value` pair.
+    #[error("malformed `lang-meta` line {line:?} (expected `key: value`)")]
+    MalformedLangMetaLine {
+        /// The offending line.
+        line: String,
+    },
+
+    /// The `lang-meta` block used a key the engine does not recognize. The key
+    /// set is closed: `lamina-format`, `target`, `target-version`.
+    #[error("unknown `lang-meta` key {key:?} (expected lamina-format, target, or target-version)")]
+    UnknownLangMetaKey {
+        /// The unrecognized key.
+        key: String,
+    },
+
+    /// A required `lang-meta` key was absent. All three (`lamina-format`,
+    /// `target`, `target-version`) are required on every definition.
+    #[error("missing required `lang-meta` key {key:?}")]
+    MissingLangMetaKey {
+        /// The absent key.
+        key: String,
+    },
+
+    /// The `lamina-format` version string was not a well-formed
+    /// `major.minor.patch` semver.
+    #[error("malformed `lamina-format` version {value:?} (expected major.minor.patch)")]
+    MalformedFormatVersion {
+        /// The offending version string.
+        value: String,
+    },
+
+    /// The definition requires a `.mdl` format version NEWER than the engine
+    /// understands. The engine is backward-compatible (loads equal/older
+    /// versions) but refuses to load a definition that needs a newer format.
+    #[error(
+        "definition requires Lamina format version {required} but this engine is {engine} \
+         (upgrade the engine, or use a definition written for an older format)"
+    )]
+    FormatVersionTooNew {
+        /// The minimum format version the definition declared.
+        required: String,
+        /// The engine's own format version ([`crate::lang::LAMINA_FORMAT_VERSION`]).
+        engine: String,
+    },
 }
 
 /// An error produced while parsing or validating a `When` predicate.

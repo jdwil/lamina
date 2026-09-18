@@ -17,6 +17,12 @@ document is for).
 ```text
 # Lamina Language Definition: <name>
 
+​```lang-meta
+lamina-format: <min format version — semver>
+target: <target language name>
+target-version: <opaque target-language version band>
+​```
+
 <optional prose about this target>
 
 ## Function
@@ -42,6 +48,56 @@ The document MUST begin (first non-blank line) with:
 
 The `<name>` (e.g. `rust`) is captured as the target's identity. Anything else
 on the first line is an error.
+
+## The `lang-meta` Header Block
+
+Immediately near the title, every definition MUST carry a ```` ```lang-meta ````
+fenced block declaring its two independent kinds of versioning. It is a
+load-bearing, strictly-parsed block of `key: value` lines; all three keys are
+**required** and are the only keys allowed:
+
+```text
+​```lang-meta
+lamina-format: 0.0.0
+target: rust
+target-version: 2021
+​```
+```
+
+- **`lamina-format`** — the **minimum** Lamina `.mdl` FORMAT version this
+  definition requires, as a `major.minor.patch` semver. The engine carries a
+  format-version constant (`LAMINA_FORMAT_VERSION`, currently `0.0.0`). On load
+  the engine compares (a hand-rolled 3-integer compare — no semver dependency):
+  if the declared minimum is **newer** than the engine's constant, the load is
+  refused with `FormatVersionTooNew`; if **equal or older**, it loads (the engine
+  is backward-compatible). A malformed version string is a load-time error, and a
+  missing `lamina-format` is a load-time error — explicit is better.
+
+- **`target`** — the target language name. Usually mirrors the title `<name>`,
+  but is declared explicitly so the engine carries an authoritative language
+  identity. Stored verbatim; the engine never parses it.
+
+- **`target-version`** — the target-language version **band** this definition
+  emits for (a sensible commonly-grouped band, e.g. Rust edition `2021`, `>=3.0`
+  for Python, `>=5.0` for TypeScript, `html5`, `rfc8259`). This is an **opaque**
+  string: the engine stores it verbatim on the parsed `LanguageDef` and **never**
+  parses, compares, or branches on it. A future registry/resolution layer may
+  filter candidate definitions by this band; the engine itself performs no
+  version logic on it.
+
+Missing block → load-time error; a non-`key: value` line, an empty value, an
+unknown key, or a missing required key → load-time error.
+
+### Version-specific behavior lives in SEPARATE definitions, not conditionals
+
+The target-version band is a **selector/badge**, not a switch. Version-specific
+behavior is expressed by shipping **distinct, self-contained definitions** — a
+conservative `python` def (`target-version: >=3.0`) and a permissive
+`python3.13` def (`target-version: >=3.13`, emitting newer syntax) are two
+separate `.mdl` files with their own capability matrices and rendering. There is
+deliberately **no** version-comparison predicate in the `When` language: the
+engine must never branch on a target version, keeping it dumb and every target
+concern in the (single-version) definition it belongs to.
 
 ## The Function Section
 

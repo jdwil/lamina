@@ -71,6 +71,7 @@ fn meta_fn_def() -> LanguageDef {
     lang(&[
         concat!(
             "# Lamina Language Definition: metafn\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: metafn\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\n{origin_tag}fn {name}() {{\n    {body}\n}}\n```\n\n",
             "### origin_tag\n",
@@ -154,6 +155,7 @@ fn escape_def() -> LanguageDef {
     lang(&[
         concat!(
             "# Lamina Language Definition: esc\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: esc\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             "### statement\n```template\nreturn {value};\n```\n\n",
@@ -191,6 +193,7 @@ fn anon_fn_def() -> LanguageDef {
     lang(&[
         concat!(
             "# Lamina Language Definition: anonfn\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: anonfn\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             // The anonymous-function spelling used when a fnptr value is
@@ -318,6 +321,7 @@ fn resolve_and_type_of_facts_via_helpers() {
     let def = lang(&[
         concat!(
             "# Lamina Language Definition: resolvefacts\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: resolvefacts\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             "### statement\n```template\n{value}\n```\n\n",
@@ -368,6 +372,7 @@ fn anon_class_def() -> LanguageDef {
     lang(&[
         concat!(
             "# Lamina Language Definition: anonclass\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: anonclass\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             // Object-literal method spelling for an inlined method fnptr.
@@ -478,6 +483,7 @@ fn closure_captures_are_known_from_metadata_not_structure() {
     let def = lang(&[
         concat!(
             "# Lamina Language Definition: closureenv\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: closureenv\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{}}\n```\n\n",
             "### statement\n```template\n{value}\n```\n\n",
@@ -508,6 +514,7 @@ fn c_style_target_keeps_fnptr_and_hoisted_fn() {
     let def = lang(&[
         concat!(
             "# Lamina Language Definition: cish\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: cish\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             "### statement\n```template\n{value}\n```\n\n",
@@ -557,6 +564,7 @@ fn field_type_helper_renders_declared_field_type() {
     let def = lang(&[
         concat!(
             "# Lamina Language Definition: ftype\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: ftype\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             "### statement\n```template\n{value}\n```\n\n",
@@ -734,6 +742,7 @@ fn escape_unknown_style_errors() {
     let def = lang(&[
         concat!(
             "# Lamina Language Definition: badesc\n\n",
+            "```lang-meta\nlamina-format: 0.0.0\ntarget: badesc\ntarget-version: test\n```\n\n",
             "## Function\n\n",
             "```template\nfn {name}() {{\n    {body}\n}}\n```\n\n",
             "### statement\n```template\nreturn {value};\n```\n\n",

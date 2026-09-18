@@ -39,13 +39,14 @@ use std::collections::HashMap;
 use crate::ast::{slot_binding, BinaryOp, ItemKind, Primitive, SlotScope, SlotShape, UnaryOp};
 use crate::error::LangDocError;
 use crate::lang::{
-    Capability, FunctionDef, ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef, WhenRow,
-    WhenTable,
+    Capability, FunctionDef, ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef, Version,
+    WhenRow, WhenTable, LAMINA_FORMAT_VERSION,
 };
 use crate::predicate::parse_predicate;
 use crate::render::Template;
 
 const TITLE_PREFIX: &str = "# Lamina Language Definition:";
+const LANG_META_FENCE: &str = "```lang-meta";
 const FUNCTION_HEADING: &str = "## Function";
 const CAPABILITIES_HEADING: &str = "## Capabilities";
 const OPERATORS_HEADING: &str = "## Operators";
@@ -65,6 +66,13 @@ const TREE_HEADING: &str = "## Tree";
 /// table/template/predicate is malformed, or a referenced slot is unresolved.
 pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
     let name = parse_title(src)?;
+
+    // The required `lang-meta` header block declares the versioning contract:
+    // the MINIMUM `.mdl` format version the definition needs (engine-actionable
+    // at load time) plus the opaque target/target-version selector the engine
+    // carries verbatim. Parsed and enforced before any section work, so a
+    // format-incompatible definition is refused early.
+    let meta = parse_lang_meta(src)?;
 
     // `## Capabilities` is always required (the capability matrix gates every
     // primitive, declarative or imperative). `## Function` is OPTIONAL: a
@@ -170,6 +178,8 @@ pub fn parse_language_def(src: &str) -> Result<LanguageDef, LangDocError> {
 
     Ok(LanguageDef {
         name,
+        target: meta.target,
+        target_version: meta.target_version,
         capabilities,
         function,
         items,
@@ -222,9 +232,127 @@ fn parse_title(src: &str) -> Result<String, LangDocError> {
     }
 }
 
+/// The parsed, validated contents of a definition's `lang-meta` header block.
+struct LangMeta {
+    /// The target language name (`target:`), carried verbatim.
+    target: String,
+    /// The opaque target-language version band (`target-version:`), carried
+    /// verbatim (never parsed or compared by the engine).
+    target_version: String,
+}
+
+/// Parses and validates the required `lang-meta` header block.
+///
+/// The block is a ```` ```lang-meta ```` fenced block near the title carrying
+/// `key: value` lines. Three keys are required (and are the only ones allowed):
+///
+/// - `lamina-format` — the MINIMUM `.mdl` format version required (semver). The
+///   engine refuses the definition if this is NEWER than
+///   [`LAMINA_FORMAT_VERSION`], and loads it otherwise (backward-compatible).
+/// - `target` — the target language name (carried verbatim).
+/// - `target-version` — the opaque target-language version band (carried
+///   verbatim; never parsed or branched on by the engine).
+///
+/// # Errors
+///
+/// Returns a [`LangDocError`] if the block is absent, a line is not `key: value`,
+/// a key is unknown, a required key is missing, the format version is malformed,
+/// or the required format version is newer than the engine's.
+fn parse_lang_meta(src: &str) -> Result<LangMeta, LangDocError> {
+    let body = extract_lang_meta_block(src)?.ok_or(LangDocError::MissingLangMeta)?;
+
+    let mut lamina_format: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut target_version: Option<String> = None;
+
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| LangDocError::MalformedLangMetaLine {
+                line: raw.to_string(),
+            })?;
+        let key = key.trim();
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(LangDocError::MalformedLangMetaLine {
+                line: raw.to_string(),
+            });
+        }
+        match key {
+            "lamina-format" => lamina_format = Some(value),
+            "target" => target = Some(value),
+            "target-version" => target_version = Some(value),
+            other => {
+                return Err(LangDocError::UnknownLangMetaKey {
+                    key: other.to_string(),
+                })
+            }
+        }
+    }
+
+    let lamina_format = lamina_format.ok_or_else(|| LangDocError::MissingLangMetaKey {
+        key: "lamina-format".to_string(),
+    })?;
+    let target = target.ok_or_else(|| LangDocError::MissingLangMetaKey {
+        key: "target".to_string(),
+    })?;
+    let target_version = target_version.ok_or_else(|| LangDocError::MissingLangMetaKey {
+        key: "target-version".to_string(),
+    })?;
+
+    // The ONLY engine-actionable version logic: refuse a definition whose
+    // required (minimum) format version is newer than the engine's. Equal or
+    // older loads (the engine is backward-compatible). The target-version above
+    // is opaque and gets NO such treatment.
+    let required = Version::parse(&lamina_format)?;
+    let engine = Version::parse(LAMINA_FORMAT_VERSION)?;
+    if required > engine {
+        return Err(LangDocError::FormatVersionTooNew {
+            required: required.to_string(),
+            engine: engine.to_string(),
+        });
+    }
+
+    Ok(LangMeta {
+        target,
+        target_version,
+    })
+}
+
+/// Extracts the body (inner lines) of the first ```` ```lang-meta ```` fenced
+/// block in `src`, or `None` if there is none. The block sits near the title;
+/// its contents are `key: value` lines parsed by [`parse_lang_meta`].
+fn extract_lang_meta_block(src: &str) -> Result<Option<String>, LangDocError> {
+    let mut lines = src.lines();
+    let mut found = false;
+    for line in lines.by_ref() {
+        if line.trim_end() == LANG_META_FENCE {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    for line in lines.by_ref() {
+        if line.trim_end() == "```" {
+            return Ok(Some(body));
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Err(LangDocError::MalformedLangMetaLine {
+        line: "unterminated ```lang-meta``` block".to_string(),
+    })
+}
+
 /// Verifies that a required `##` section heading is present.
-fn require_heading(src: &str, heading: &str) -> Result<(), LangDocError> {
-    if src.lines().any(|line| line.trim_end() == heading) {
+fn require_heading(src: &str, heading: &str) -> Result<(), LangDocError> {    if src.lines().any(|line| line.trim_end() == heading) {
         Ok(())
     } else {
         Err(LangDocError::MissingSection {
@@ -804,6 +932,11 @@ mod tests {
     use crate::lang::{Outcome, SlotDef};
     use crate::predicate::{RenderContext, RetKind, VisKind};
 
+    /// A minimal valid `lang-meta` header block for building standalone test
+    /// docs that must parse past the (now required) versioning header.
+    const META: &str =
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: x\ntarget-version: test\n```\n\n";
+
     /// A complete 26-primitive capability table (every kernel primitive gets a
     /// row), so load-time completeness enforcement passes. Mappings here are
     /// only for test purposes.
@@ -841,7 +974,9 @@ mod tests {
     /// complete capability matrix so completeness enforcement passes.
     fn mk(function_section: &str) -> String {
         format!(
-            "# Lamina Language Definition: rust\n\n## Function\n\n{function_section}\n{FULL_CAPS}"
+            "# Lamina Language Definition: rust\n\n\
+             ```lang-meta\nlamina-format: 0.0.0\ntarget: rust\ntarget-version: 2021\n```\n\n\
+             ## Function\n\n{function_section}\n{FULL_CAPS}"
         )
     }
 
@@ -995,10 +1130,12 @@ mod tests {
     fn rejects_incomplete_capability_matrix() {
         // Only i32 present -> 25 missing. Entry uses only scalar terminals so
         // slot-graph validation passes and the completeness check is reached.
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
-            ```template\nfn {name}()\n```\n\n\
-            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
-        match parse_language_def(doc) {
+        let doc = format!(
+            "# Lamina Language Definition: x\n\n{META}## Function\n\n\
+            ```template\nfn {{name}}()\n```\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n"
+        );
+        match parse_language_def(&doc) {
             Err(LangDocError::IncompleteCapabilityMatrix { missing }) => {
                 assert!(missing.contains("i8"));
                 assert!(missing.contains("fnptr"));
@@ -1028,9 +1165,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_entry_template() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n### ret\n| When | Template |\n| else | \"\" |\n\n## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        let doc = format!("# Lamina Language Definition: x\n\n{META}## Function\n\n### ret\n| When | Template |\n| else | \"\" |\n\n## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n");
         assert!(matches!(
-            parse_language_def(doc),
+            parse_language_def(&doc),
             Err(LangDocError::MissingTable { .. })
         ));
     }
@@ -1039,11 +1176,11 @@ mod tests {
     fn rejects_dangling_slot_reference() {
         // Entry references {ret} but there is no ### ret subsection and `ret`
         // is not a terminal slot.
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
-            ```template\nfn {name}(){ret}\n```\n\n\
-            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+        let doc = format!("# Lamina Language Definition: x\n\n{META}## Function\n\n\
+            ```template\nfn {{name}}(){{ret}}\n```\n\n\
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n");
         assert_eq!(
-            parse_language_def(doc),
+            parse_language_def(&doc),
             Err(LangDocError::UnknownSlotReference {
                 slot: "ret".to_string()
             })
@@ -1086,12 +1223,12 @@ mod tests {
 
     #[test]
     fn rejects_table_without_else() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
-            ```template\nfn {name}(){ret}\n```\n\n\
+        let doc = format!("# Lamina Language Definition: x\n\n{META}## Function\n\n\
+            ```template\nfn {{name}}(){{ret}}\n```\n\n\
             ### ret\n| When | Template |\n|------|----------|\n| ret is void | \"\" |\n\n\
-            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n");
         assert_eq!(
-            parse_language_def(doc),
+            parse_language_def(&doc),
             Err(LangDocError::MissingElseRow {
                 table: "ret".to_string()
             })
@@ -1100,24 +1237,24 @@ mod tests {
 
     #[test]
     fn rejects_unquoted_template_in_table() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
-            ```template\nfn {name}(){ret}\n```\n\n\
+        let doc = format!("# Lamina Language Definition: x\n\n{META}## Function\n\n\
+            ```template\nfn {{name}}(){{ret}}\n```\n\n\
             ### ret\n| When | Template |\n|------|----------|\n| else | bare |\n\n\
-            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n");
         assert!(matches!(
-            parse_language_def(doc),
+            parse_language_def(&doc),
             Err(LangDocError::UnquotedTemplate { .. })
         ));
     }
 
     #[test]
     fn rejects_bad_predicate() {
-        let doc = "# Lamina Language Definition: x\n\n## Function\n\n\
-            ```template\nfn {name}(){ret}\n```\n\n\
+        let doc = format!("# Lamina Language Definition: x\n\n{META}## Function\n\n\
+            ```template\nfn {{name}}(){{ret}}\n```\n\n\
             ### ret\n| When | Template |\n|------|----------|\n| frobnicate | \"x\" |\n| else | \"y\" |\n\n\
-            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n";
+            ## Capabilities\n| Primitive | Action | Target |\n| i32 | identity | i32 |\n");
         assert!(matches!(
-            parse_language_def(doc),
+            parse_language_def(&doc),
             Err(LangDocError::BadPredicate { .. })
         ));
     }
@@ -1256,7 +1393,7 @@ mod tests {
         // helper slots are merged into the function slot map (which the
         // expression resolver reads), and the entry template is empty.
         let doc = format!(
-            "# Lamina Language Definition: html\n\n\
+            "# Lamina Language Definition: html\n\n{META}\
              ## Tree\n\n\
              ### expr\n\
              | When         | Template |\n\
@@ -1292,7 +1429,7 @@ mod tests {
     #[test]
     fn def_with_neither_function_nor_tree_is_rejected() {
         let doc = format!(
-            "# Lamina Language Definition: empty\n\n{FULL_CAPS}"
+            "# Lamina Language Definition: empty\n\n{META}{FULL_CAPS}"
         );
         assert!(matches!(
             parse_language_def(&doc),
@@ -1305,7 +1442,7 @@ mod tests {
         // A `### expr` node row references `@element` but there is no
         // `### element` subsection -> load-time dangling-reference error.
         let doc = format!(
-            "# Lamina Language Definition: html\n\n\
+            "# Lamina Language Definition: html\n\n{META}\
              ## Tree\n\n\
              ### expr\n\
              | When         | Template |\n\
@@ -1320,5 +1457,167 @@ mod tests {
                 slot: "element".to_string()
             })
         );
+    }
+
+    // ---- lang-meta versioning ------------------------------------------
+
+    #[test]
+    fn parses_target_and_target_version_verbatim() {
+        // The `target` / `target-version` are carried verbatim onto the def; the
+        // engine performs no logic on them. `mk` uses target `rust` / `2021`.
+        let def = parse_language_def(&mk(FN_SECTION)).expect("parses");
+        assert_eq!(def.target, "rust");
+        assert_eq!(def.target_version, "2021");
+        assert_eq!(def.target_version(), "2021");
+    }
+
+    #[test]
+    fn opaque_target_version_is_not_parsed() {
+        // An arbitrary, non-semver band string is accepted verbatim: the engine
+        // never parses or validates `target-version`.
+        let doc = format!(
+            "# Lamina Language Definition: py\n\n\
+             ```lang-meta\nlamina-format: 0.0.0\ntarget: python\ntarget-version: >=3.0 (cpython)\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        let def = parse_language_def(&doc).expect("opaque band parses");
+        assert_eq!(def.target_version, ">=3.0 (cpython)");
+    }
+
+    #[test]
+    fn missing_lang_meta_block_is_a_load_error() {
+        // A def with a title but no `lang-meta` block is refused.
+        let doc = format!(
+            "# Lamina Language Definition: x\n\n## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert_eq!(parse_language_def(&doc), Err(LangDocError::MissingLangMeta));
+    }
+
+    #[test]
+    fn missing_lamina_format_key_is_a_load_error() {
+        let doc = format!(
+            "# Lamina Language Definition: x\n\n\
+             ```lang-meta\ntarget: x\ntarget-version: test\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::MissingLangMetaKey {
+                key: "lamina-format".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn missing_target_keys_are_load_errors() {
+        let no_target = format!(
+            "# Lamina Language Definition: x\n\n\
+             ```lang-meta\nlamina-format: 0.0.0\ntarget-version: test\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert_eq!(
+            parse_language_def(&no_target),
+            Err(LangDocError::MissingLangMetaKey {
+                key: "target".to_string()
+            })
+        );
+        let no_version = format!(
+            "# Lamina Language Definition: x\n\n\
+             ```lang-meta\nlamina-format: 0.0.0\ntarget: x\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert_eq!(
+            parse_language_def(&no_version),
+            Err(LangDocError::MissingLangMetaKey {
+                key: "target-version".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_lang_meta_key_is_a_load_error() {
+        let doc = format!(
+            "# Lamina Language Definition: x\n\n\
+             ```lang-meta\nlamina-format: 0.0.0\ntarget: x\ntarget-version: t\nfrobnicate: y\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::UnknownLangMetaKey {
+                key: "frobnicate".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_format_version_is_a_load_error() {
+        for bad in ["1.2", "1.2.x", "1.2.3.4", "1..3", "v1.2.3"] {
+            let doc = format!(
+                "# Lamina Language Definition: x\n\n\
+                 ```lang-meta\nlamina-format: {bad}\ntarget: x\ntarget-version: t\n```\n\n\
+                 ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+            );
+            assert!(
+                matches!(
+                    parse_language_def(&doc),
+                    Err(LangDocError::MalformedFormatVersion { .. })
+                ),
+                "expected malformed-version error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_lang_meta_value_is_a_malformed_line() {
+        // An empty value (`lamina-format:` with nothing after) is a malformed
+        // header line, caught before version parsing.
+        let doc = format!(
+            "# Lamina Language Definition: x\n\n\
+             ```lang-meta\nlamina-format:\ntarget: x\ntarget-version: t\n```\n\n\
+             ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+        );
+        assert!(matches!(
+            parse_language_def(&doc),
+            Err(LangDocError::MalformedLangMetaLine { .. })
+        ));
+    }
+
+    #[test]
+    fn format_version_newer_than_engine_is_refused() {
+        // Engine is 0.0.0, so any strictly-newer minimum is refused.
+        for newer in ["0.0.1", "0.1.0", "1.0.0"] {
+            let doc = format!(
+                "# Lamina Language Definition: x\n\n\
+                 ```lang-meta\nlamina-format: {newer}\ntarget: x\ntarget-version: t\n```\n\n\
+                 ## Function\n\n{FN_SECTION}\n{FULL_CAPS}"
+            );
+            match parse_language_def(&doc) {
+                Err(LangDocError::FormatVersionTooNew { required, engine }) => {
+                    assert_eq!(required, newer);
+                    assert_eq!(engine, LAMINA_FORMAT_VERSION);
+                }
+                other => panic!("expected FormatVersionTooNew for {newer:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_version_equal_to_engine_loads() {
+        // Equal (0.0.0) is backward-compatible and loads.
+        let def = parse_language_def(&mk(FN_SECTION)).expect("equal version loads");
+        assert_eq!(def.name, "rust");
+    }
+
+    #[test]
+    fn version_compare_orders_by_tuple() {
+        use crate::lang::Version;
+        assert!(Version::parse("1.0.0").unwrap() > Version::parse("0.9.9").unwrap());
+        assert!(Version::parse("0.1.0").unwrap() > Version::parse("0.0.9").unwrap());
+        assert!(Version::parse("0.0.2").unwrap() > Version::parse("0.0.1").unwrap());
+        assert_eq!(
+            Version::parse("2.3.4").unwrap(),
+            Version::parse("2.3.4").unwrap()
+        );
+        assert!(Version::parse("0.0.0").unwrap() <= Version::parse("0.0.0").unwrap());
     }
 }

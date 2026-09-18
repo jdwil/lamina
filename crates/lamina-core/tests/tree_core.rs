@@ -166,6 +166,7 @@ fn function_returning_a_node_renders_the_tree() {
 /// expressed as a `Named` type (`Node`), reusing the existing type machinery.
 const FN_RETURNS_NODE_DEF: &str = concat!(
     "# Lamina Language Definition: htmlfn\n\n",
+    "```lang-meta\nlamina-format: 0.0.0\ntarget: htmlfn\ntarget-version: test\n```\n\n",
     "## Function\n\n",
     "```template\n",
     "fn {name}({params}){ret} {{\n",

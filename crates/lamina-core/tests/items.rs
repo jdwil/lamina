@@ -273,6 +273,7 @@ fn item_without_section_errors_cleanly() {
     // panic.
     let def = concat!(
         "# Lamina Language Definition: tiny\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: tiny\ntarget-version: test\n```\n\n",
         "## Function\n\n",
         "```template\nfn {name}() {{ {body} }}\n```\n\n",
         "### statement\n```template\nreturn;\n```\n\n",

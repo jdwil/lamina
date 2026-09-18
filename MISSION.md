@@ -11,6 +11,15 @@ ProductHost and commercial licenses: same address.
 
 The engine has a finite set of primitives and keywords it understands. In order for the engine to produce raw code during transpilation, it must be provided a language file. Each language file provides a capability matrix, which lets the engine know which of its primitives and keywords the target language supports. Layers may only lower to Lamina code utilizing constructs that are supported by the capability matrix of the given language file. This means a given Lamina project may transpile to multiple languages, but not all languages. Here is a list of keywords and primitives that are supported.
 
+### Language-definition versioning
+
+Every language definition (`.mdl`) carries a required `lang-meta` header block near its title declaring **two independent** kinds of versioning:
+
+- **Format min-version (`lamina-format`)** — the minimum Lamina `.mdl` *format* version the definition requires, as a `major.minor.patch` semver. The engine carries a format-version constant (`LAMINA_FORMAT_VERSION`, currently `0.0.0`) and, at load time, **refuses** any definition whose required minimum is *newer* than that constant (a clear `FormatVersionTooNew` error), while loading any equal-or-older definition (the engine is backward-compatible). The comparison is a hand-rolled 3-integer compare — no semver dependency. A missing or malformed `lamina-format` is a load-time error.
+- **Target-language version band (`target` + `target-version`)** — which version(s) of the *target language* the definition emits for (e.g. Rust edition `2021`, `>=3.0` for Python, `>=5.0` for TypeScript, `html5`, `rfc8259`). This is an **opaque selector/badge**: the engine stores it verbatim on the parsed `LanguageDef` and performs **no** version logic on it. A future registry/resolution layer may filter candidate definitions by this band.
+
+**Version-specific target behavior lives in SEPARATE definitions, not conditionals.** A conservative `python` def (`target-version: >=3.0`) and a permissive `python3.13` def (`target-version: >=3.13`, emitting newer syntax) are two distinct self-contained `.mdl` files with their own capability matrices and rendering. The engine never branches on a target version, and the `.mdl` `When` predicate language has no version-comparison predicate — keeping the engine dumb and every target concern in the single-version definition it belongs to.
+
 ## Out-of-the-Gate Target Languages
 
 Lamina commits to supporting a **deliberately diverse** set of targets from the start — chosen both for practical use and to stress-test the kernel. If a demanding target (notably Haskell) requires kernel keywords we lack, that is a signal to add them *now*, before layers, parser, and downstream tooling calcify. Everything built in Lamina core must support these targets:

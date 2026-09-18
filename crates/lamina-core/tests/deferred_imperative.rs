@@ -233,6 +233,7 @@ fn c_style_target_forbids_payload_variant() {
     // tuple/struct payloads (C's plain integer enumerators carry no data).
     let def = concat!(
         "# Lamina Language Definition: clike\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: clike\ntarget-version: test\n```\n\n",
         "## Function\n\n",
         "```template\nfn {name}() {{ {body} }}\n```\n\n",
         "### statement\n```template\nreturn;\n```\n\n",

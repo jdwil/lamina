@@ -232,10 +232,15 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `vis is public` / `vis is protected` / `vis is private` | enum | the visibility level |
 | `caller is async` / `caller is sync` | enum | the enclosing callable's synchrony (inherited) |
 | `first` / `last` | bool | this element is the first / last in the collection being looped (only meaningful inside an item slot) |
-| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit` `node` `text`) |
+| `expr is <kind>` | enum | the expression being rendered is that kind (`int` `float` `bool` `string` `char` `null` `ref` `field` `index` `call` `unary` `binary` `cast` `struct_lit` `node` `text` `array`) |
 | `stmt is <kind>` | enum | the statement being rendered is that kind (`block` `let` `return` `if` `while` `for` `foreach` `switch` `break` `continue` `assign` `expr`) |
 | `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use` `tree`) |
+| `variant is <kind>` | enum | the enum variant being rendered has that payload shape (`unit` `tuple` `struct`) |
 | `has_value` `has_type` `has_else` `has_init` `has_cond` `has_step` `has_default` | bool | the statement carries that optional sub-part |
+| `has_len` | bool | (array type) the array being rendered carries an explicit length (sized `[T; N]` vs unsized `[T]`) |
+| `has_items` | bool | (`use` import) the import carries a selective item list (`use path::{a, b}`) |
+| `has_alias` | bool | (`use` import / import item) the module — or a selectively-imported item — carries an alias (`use path as p`, `a as b`) |
+| `has_payload` | bool | (`enum`) at least one variant carries a payload (tuple or struct) — lets a target branch the whole enum to a discriminated-union form |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
@@ -300,6 +305,44 @@ increment (`i = i + 1` → `i++`).
   `fnptr`-typed field is gated *transitively* by that field's declared `fnptr`
   type: a target whose capability matrix forbids `fnptr` cannot declare the
   field, so it cannot construct the aggregate either.
+
+### Arrays, Enum Payloads, and Structured `use`
+
+Three constructs complete the imperative kernel vocabulary. Richer/growable
+collections (lists, maps, sets) are **layer** concerns, not kernel — only a
+fixed array lives in the kernel.
+
+- **Array type** (`### array`, resolved in type scope). Exposes `{elem}` (the
+  element type, rendered recursively so nested arrays compose) and `{len}` (the
+  textual length). The `has_len` fact picks the sized vs unsized form: Rust
+  `[T; N]` / `[T]`, TypeScript `T[]` (which ignores the length). There is no
+  `array` primitive; the `### array` slot **is** the capability escape hatch — a
+  target with no array type forbids that slot.
+- **Array literal** (`expr is array`). Exposes the `{elems}` collection (item
+  slot `### array_elem`, with `first`/`last` loop facts for the comma
+  separator). Both shipped targets spell it `[a, b, c]`. Indexing reuses the
+  existing `expr is index` (`{obj}[{index}]`).
+- **Enum payloads.** A variant dispatches on `variant is unit|tuple|struct` in
+  its `### variant` item slot. A **unit** variant is a plain name; a **tuple**
+  variant exposes the `{payload_types}` collection (item slot `### payload_type`,
+  each element's `{type}` rendered through the type machinery); a **struct**
+  variant exposes the `{payload_fields}` collection (item slot
+  `### payload_field`, reusing the struct-field `{name}`/`{type}` sub-slots).
+  Payloads are **capability-gated**: a C-style target with no tagged unions
+  writes `forbid` in the tuple/struct rows of `### variant`, so a payload-bearing
+  variant surfaces a forbidden-construct error while a unit variant still
+  renders. A target with no native payload-carrying `enum` (TypeScript) branches
+  the whole declaration on the enum-level `has_payload` fact to a discriminated
+  union `type Name = … | …`. **Construction** of a payload variant reuses
+  existing expressions — a tuple variant `Circle(5)` is an `expr is call`, a
+  struct variant is an `expr is struct_lit` — so no new construction node exists.
+- **Structured `use`.** The `## Use` entry branches on `has_items` (a selective
+  list) and `has_alias` (a module alias): `use path;` (bare, byte-identical to
+  before), `use path as p;` (alias), `use path::{a, b as c};` (selective).
+  A selective import exposes the `{items}` collection (item slot `### use_item`,
+  each with its own `has_alias` fact for the `name as alias` form) and `{alias}`;
+  TypeScript spells the three forms `import path;`, `import * as p from path;`,
+  `import { a, b as c } from path;`.
 
 ## The Declarative Tree Core (`node` / `attr` / `text`)
 

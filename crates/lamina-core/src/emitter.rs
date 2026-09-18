@@ -11,14 +11,14 @@
 use crate::ast::{
     slot_binding, Attr, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
     Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type,
-    UnaryOp, Variant, Visibility,
+    UnaryOp, Variant, VariantKind as AstVariantKind, VariantPayload, Visibility,
 };
 use crate::error::EmitError;
 use crate::index::{EscapeStyle, UnitIndex};
 use crate::lang::{ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef};
 use crate::predicate::{
     CallerKind, ExprKind as PredExprKind, ItemKind as PredItemKind, RenderContext, RetKind,
-    StmtKind as PredStmtKind, VisKind,
+    StmtKind as PredStmtKind, VariantKind as PredVariantKind, VisKind,
 };
 use crate::render::{Rendered, SlotResolver};
 
@@ -108,6 +108,7 @@ fn context_for(function: &Function) -> RenderContext {
         Type::Primitive(_) | Type::Named(_) | Type::Pointer(_) | Type::FnPtr { .. } => {
             RetKind::Type
         }
+        Type::Array { .. } => RetKind::Type,
     };
     RenderContext {
         export: function.visibility == Visibility::Public,
@@ -161,6 +162,16 @@ fn vis_kind(visibility: Visibility) -> VisKind {
     }
 }
 
+/// Maps an AST [`VariantKind`] to the predicate registry's `VariantKind`, so
+/// the engine can set the `variant is <kind>` fact when rendering a variant.
+fn variant_kind(kind: AstVariantKind) -> PredVariantKind {
+    match kind {
+        AstVariantKind::Unit => PredVariantKind::Unit,
+        AstVariantKind::Tuple => PredVariantKind::Tuple,
+        AstVariantKind::Struct => PredVariantKind::Struct,
+    }
+}
+
 /// Builds the fact context for rendering a top-level item: the `item is <kind>`
 /// dispatch fact, plus the `export`/`vis` facts for items that carry a
 /// visibility (`struct`, `enum`, `const`). A `typedef` and a `use` carry no
@@ -174,6 +185,23 @@ fn item_context(item: &Item) -> RenderContext {
     if let Some(visibility) = item_visibility(item) {
         ctx.export = visibility == Visibility::Public;
         ctx.vis = Some(vis_kind(visibility));
+    }
+    // A `use` import surfaces its shape via `has_items` (a selective list) and
+    // `has_alias` (a module alias) so the entry template can pick the bare /
+    // selective / aliased form. A bare import leaves both false, so its output
+    // is byte-identical to the pre-structured form.
+    if let Item::Use { items, alias, .. } = item {
+        ctx.has_items = !items.is_empty();
+        ctx.has_alias = alias.is_some();
+    }
+    // An `enum` surfaces whether any variant carries a payload so a target
+    // lacking native tagged-union enums (e.g. TypeScript) can branch the whole
+    // declaration to a discriminated-union form; a payloadless enum leaves this
+    // false and renders as a plain enum (byte-identical to before).
+    if let Item::Enum { variants, .. } = item {
+        ctx.has_payload = variants
+            .iter()
+            .any(|v| !matches!(v.payload, VariantPayload::None));
     }
     ctx
 }
@@ -200,6 +228,10 @@ enum ItemScope<'a> {
     Field(&'a Field),
     /// Rendering one enum-variant element.
     Variant(&'a Variant),
+    /// Rendering one tuple-payload type element of an enum variant.
+    PayloadType(&'a Type),
+    /// Rendering one selectively-imported `use` item element.
+    UseItem(&'a crate::ast::UseItem),
 }
 
 /// Resolves the slots of a non-function top-level item (its `## <Item>` entry
@@ -222,6 +254,8 @@ impl<'a> ItemResolver<'a> {
             ItemScope::Node => self.item.kind().scope(),
             ItemScope::Field(_) => SlotScope::Field,
             ItemScope::Variant(_) => SlotScope::Variant,
+            ItemScope::PayloadType(_) => SlotScope::PayloadType,
+            ItemScope::UseItem(_) => SlotScope::UseItem,
         }
     }
 
@@ -272,6 +306,19 @@ impl<'a> ItemResolver<'a> {
                 "name" => Ok(Rendered::text(variant.name.clone())),
                 _ => self.unknown_slot(name),
             },
+            ItemScope::PayloadType(ty) => match name {
+                "type" => resolve_type(ty, self.lang, self.index),
+                _ => self.unknown_slot(name),
+            },
+            ItemScope::UseItem(use_item) => match name {
+                "name" => Ok(Rendered::text(use_item.name.clone())),
+                // The alias renders when present; an unaliased item renders
+                // empty (the `has_alias` fact guards its use in the template).
+                "alias" => Ok(Rendered::text(
+                    use_item.alias.clone().unwrap_or_default(),
+                )),
+                _ => self.unknown_slot(name),
+            },
             ItemScope::Node => self.scalar_node(name),
         }
     }
@@ -287,6 +334,9 @@ impl<'a> ItemResolver<'a> {
             (Item::Const { ty, .. }, "type") => resolve_type(ty, self.lang, self.index),
             (Item::Const { value, .. }, "value") => emit_expr(value, self.lang, self.index),
             (Item::Use { path, .. }, "path") => Ok(Rendered::text(path.clone())),
+            (Item::Use { alias, .. }, "alias") => {
+                Ok(Rendered::text(alias.clone().unwrap_or_default()))
+            }
             _ => self.unknown_slot(name),
         }
     }
@@ -297,8 +347,142 @@ impl<'a> ItemResolver<'a> {
         match (self.item, name) {
             (Item::Struct { fields, .. }, "fields") => self.render_fields(fields, item_slot),
             (Item::Enum { variants, .. }, "variants") => self.render_variants(variants, item_slot),
+            (Item::Use { items, .. }, "items") => self.render_use_items(items, item_slot),
+            _ => self.render_variant_payload(name, item_slot),
+        }
+    }
+
+    /// Loops a `use` import's selective items, rendering the `use_item` item
+    /// slot per item with `first`/`last` loop facts and each item's own
+    /// `has_alias` fact.
+    fn render_use_items(
+        &self,
+        items: &[crate::ast::UseItem],
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        if item_slot != "use_item" {
+            return self.unknown_slot(item_slot);
+        }
+        let len = items.len();
+        let mut out = Rendered::empty();
+        for (i, use_item) in items.iter().enumerate() {
+            let ctx = RenderContext {
+                item: self.ctx.item,
+                first: i == 0,
+                last: i + 1 == len,
+                has_alias: use_item.alias.is_some(),
+                meta: use_item.meta.clone(),
+                ..Default::default()
+            };
+            let mut elem = ItemResolver {
+                item: self.item,
+                def: self.def,
+                lang: self.lang,
+                index: self.index,
+                ctx,
+                scope: ItemScope::UseItem(use_item),
+            };
+            out.push(elem.render_named_slot(item_slot)?);
+        }
+        Ok(out)
+    }
+
+    /// Loops a variant's payload collection sub-slot (`payload_types` /
+    /// `payload_fields`), rendering each element via its item slot with
+    /// `first`/`last` loop facts. Only meaningful in [`ItemScope::Variant`]; a
+    /// payload slot referenced elsewhere is an unknown-slot error.
+    fn render_variant_payload(
+        &self,
+        name: &str,
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        let variant = match &self.scope {
+            ItemScope::Variant(v) => v,
+            _ => return self.unknown_slot(name),
+        };
+        match (name, &variant.payload) {
+            ("payload_types", VariantPayload::Tuple(types)) => {
+                self.render_payload_types(types, item_slot)
+            }
+            ("payload_fields", VariantPayload::Struct(fields)) => {
+                self.render_payload_fields(fields, item_slot)
+            }
+            // A payload sequence referenced on a variant whose shape does not
+            // carry it (e.g. `payload_types` on a unit variant) renders empty —
+            // the `variant is <kind>` dispatch guards which sequence a row uses,
+            // so this is a defensive no-op rather than an error.
+            ("payload_types", _) | ("payload_fields", _) => Ok(Rendered::empty()),
             _ => self.unknown_slot(name),
         }
+    }
+
+    /// Loops a tuple variant's payload types, rendering the `payload_type` item
+    /// slot per type with `first`/`last` loop facts.
+    fn render_payload_types(
+        &self,
+        types: &[Type],
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        if item_slot != "payload_type" {
+            return self.unknown_slot(item_slot);
+        }
+        let len = types.len();
+        let mut out = Rendered::empty();
+        for (i, ty) in types.iter().enumerate() {
+            let ctx = RenderContext {
+                item: self.ctx.item,
+                first: i == 0,
+                last: i + 1 == len,
+                ..Default::default()
+            };
+            let mut elem = ItemResolver {
+                item: self.item,
+                def: self.def,
+                lang: self.lang,
+                index: self.index,
+                ctx,
+                scope: ItemScope::PayloadType(ty),
+            };
+            out.push(elem.render_named_slot(item_slot)?);
+        }
+        Ok(out)
+    }
+
+    /// Loops a struct variant's payload fields, rendering the `payload_field`
+    /// item slot per field with `first`/`last` loop facts and each field's own
+    /// `vis`/`export` facts. Payload fields resolve in [`SlotScope::Field`],
+    /// reusing the struct-field `name`/`type` sub-slots.
+    fn render_payload_fields(
+        &self,
+        fields: &[Field],
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        if item_slot != "payload_field" {
+            return self.unknown_slot(item_slot);
+        }
+        let len = fields.len();
+        let mut out = Rendered::empty();
+        for (i, field) in fields.iter().enumerate() {
+            let ctx = RenderContext {
+                item: self.ctx.item,
+                export: field.visibility == Visibility::Public,
+                vis: Some(vis_kind(field.visibility)),
+                first: i == 0,
+                last: i + 1 == len,
+                meta: field.meta.clone(),
+                ..Default::default()
+            };
+            let mut elem = ItemResolver {
+                item: self.item,
+                def: self.def,
+                lang: self.lang,
+                index: self.index,
+                ctx,
+                scope: ItemScope::Field(field),
+            };
+            out.push(elem.render_named_slot(item_slot)?);
+        }
+        Ok(out)
     }
 
     /// Loops a struct's fields, rendering the `field` item slot per field with
@@ -355,6 +539,11 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                variant: Some(variant_kind(variant.payload.kind())),
+                // Propagate the enum-level `has_payload` so a target that
+                // renders payload-bearing enums as a discriminated union (e.g.
+                // TypeScript) can switch each variant to its union-member form.
+                has_payload: self.ctx.has_payload,
                 meta: variant.meta.clone(),
                 ..Default::default()
             };
@@ -1210,6 +1399,7 @@ fn type_of_type_name(ty: &Type) -> Option<String> {
         Type::Named(name) => Some(name.clone()),
         Type::Primitive(p) => Some(p.as_str().to_string()),
         Type::Pointer(_) | Type::FnPtr { .. } => None,
+        Type::Array { .. } => None,
     }
 }
 
@@ -1233,6 +1423,7 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
         ExprKind::StructLit => PredExprKind::StructLit,
         ExprKind::Node => PredExprKind::Node,
         ExprKind::Text => PredExprKind::Text,
+        ExprKind::ArrayLit => PredExprKind::ArrayLit,
     }
 }
 
@@ -1281,6 +1472,8 @@ enum ExprScope<'a> {
     Attr(&'a Attr),
     /// Rendering one tree-node child element.
     Child(&'a Expr),
+    /// Rendering one array-literal element.
+    ArrayElem(&'a Expr),
 }
 
 /// Resolves the slots of an expression (the `### expr` table and its sub-slots),
@@ -1302,6 +1495,7 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Field(_) => SlotScope::FieldInit,
             ExprScope::Attr(_) => SlotScope::Attr,
             ExprScope::Child(_) => SlotScope::Child,
+            ExprScope::ArrayElem(_) => SlotScope::ArrayElem,
         }
     }
 
@@ -1331,6 +1525,7 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Arg(e) => args.push(("value", e)),
             ExprScope::Attr(a) => args.push(("value", &a.value)),
             ExprScope::Child(e) => args.push(("value", e)),
+            ExprScope::ArrayElem(e) => args.push(("value", e)),
             ExprScope::Node => {}
         }
         for (arg, expr) in args {
@@ -1448,6 +1643,9 @@ impl<'a> ExprResolver<'a> {
             // A tree-node child element: its child expression (dispatched
             // through the `### expr` table).
             (ExprScope::Child(child), "value") => emit_expr(child, self.lang, self.index),
+            // An array-literal element: its element expression (dispatched
+            // through the `### expr` table).
+            (ExprScope::ArrayElem(elem), "value") => emit_expr(elem, self.lang, self.index),
             // A tree node's own name.
             (ExprScope::Node, "node_name") => match self.expr {
                 Expr::Node { name, .. } => Ok(Rendered::text(name.clone())),
@@ -1777,6 +1975,69 @@ impl<'a> ExprResolver<'a> {
         }
         Ok(out)
     }
+
+    /// Loops an array literal's elements, rendering `item_slot` (`array_elem`)
+    /// per element with `first`/`last` loop facts, concatenating (each element
+    /// renders its own separators — no engine join). Each element is an
+    /// arbitrary expression.
+    fn render_elems(&mut self, item_slot: &str) -> Result<Rendered, EmitError> {
+        let elems: &'a [Expr] = match self.expr {
+            Expr::ArrayLit { elems, .. } => elems,
+            _ => {
+                return Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: "elems".to_string(),
+                })
+            }
+        };
+        let len = elems.len();
+        let mut out = Rendered::empty();
+        for (i, elem) in elems.iter().enumerate() {
+            let mut elem_resolver = ExprResolver {
+                expr: self.expr,
+                lang: self.lang,
+                index: self.index,
+                scope: ExprScope::ArrayElem(elem),
+            };
+            let slot = self
+                .lang
+                .function
+                .slots
+                .get(item_slot)
+                .cloned()
+                .ok_or_else(|| EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: item_slot.to_string(),
+                })?;
+            let ctx = RenderContext {
+                first: i == 0,
+                last: i + 1 == len,
+                meta: elem.meta().clone(),
+                helper_facts: elem_resolver.compute_helper_facts(),
+                ..Default::default()
+            };
+            let outcome = match &slot {
+                SlotDef::Fixed(outcome) => outcome.clone(),
+                SlotDef::Table(table) => table
+                    .select(&ctx)
+                    .ok_or_else(|| EmitError::NoMatchingRow {
+                        target: self.lang.name.clone(),
+                        table: item_slot.to_string(),
+                    })?
+                    .clone(),
+            };
+            let rendered = match outcome {
+                Outcome::Render(template) => template.render(&mut elem_resolver)?,
+                Outcome::Forbid => {
+                    return Err(EmitError::ForbiddenConstruct {
+                        target: self.lang.name.clone(),
+                    })
+                }
+            };
+            out.push(rendered);
+        }
+        Ok(out)
+    }
 }
 
 impl<'a> SlotResolver for ExprResolver<'a> {
@@ -1800,6 +2061,8 @@ impl<'a> SlotResolver for ExprResolver<'a> {
                     self.render_attrs(&item_slot)
                 } else if item_slot == "child" {
                     self.render_children(&item_slot)
+                } else if item_slot == "array_elem" {
+                    self.render_elems(&item_slot)
                 } else {
                     self.render_args(&item_slot)
                 }
@@ -1824,6 +2087,8 @@ impl<'a> ExprResolver<'a> {
             (ExprScope::Attr(a), "value") => Some(&a.value),
             // A tree-node child element's value (the child expression).
             (ExprScope::Child(e), "value") => Some(e),
+            // An array-literal element's value.
+            (ExprScope::ArrayElem(e), "value") => Some(e),
             // The expression node's own single sub-expressions.
             (ExprScope::Node, "value") => match self.expr {
                 Expr::Cast { value, .. } => Some(value),
@@ -1898,6 +2163,7 @@ impl<'a> ExprResolver<'a> {
             ExprScope::Arg(e) => e.meta(),
             ExprScope::Attr(a) => &a.meta,
             ExprScope::Child(e) => e.meta(),
+            ExprScope::ArrayElem(e) => e.meta(),
             ExprScope::Node => self.expr.meta(),
         }
     }
@@ -1925,6 +2191,15 @@ fn resolve_type(ty: &Type, lang: &LanguageDef, index: &UnitIndex) -> Result<Rend
         Type::FnPtr { .. } => {
             gate_primitive(Primitive::Fnptr, lang)?;
             render_type_slot("fnptr", ty, lang, index)
+        }
+        // An array type renders via the target's `### array` type slot. There
+        // is no `array` primitive to gate on; the slot itself is the escape
+        // hatch — a target with no array type forbids the slot (or omits it,
+        // which is an unknown-slot error). The `has_len` fact lets the slot
+        // branch between the sized `[T; N]` and unsized `[T]` forms.
+        Type::Array { len, .. } => {
+            let has_len = len.is_some();
+            render_array_type(ty, has_len, lang, index)
         }
     }
 }
@@ -1961,8 +2236,32 @@ fn render_type_slot(
         lang,
         index,
         scope: TypeScope::Compound,
+        ctx: RenderContext::default(),
     };
     resolver.render_named_slot(slot)
+}
+
+/// Renders an array type via the language definition's `### array` type slot,
+/// threading the `has_len` fact so the slot can branch between the sized
+/// `[T; N]` and unsized `[T]` forms. The element type resolves recursively via
+/// the `{elem}` sub-slot; the textual length (when present) via `{len}`.
+fn render_array_type(
+    ty: &Type,
+    has_len: bool,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<Rendered, EmitError> {
+    let mut resolver = TypeResolver {
+        ty,
+        lang,
+        index,
+        scope: TypeScope::Compound,
+        ctx: RenderContext {
+            has_len,
+            ..Default::default()
+        },
+    };
+    resolver.render_named_slot("array")
 }
 
 /// What a [`TypeResolver`] is currently rendering: a compound type as a whole,
@@ -1982,6 +2281,10 @@ struct TypeResolver<'a> {
     lang: &'a LanguageDef,
     index: &'a UnitIndex<'a>,
     scope: TypeScope<'a>,
+    /// The fact context for this type's slots. Empty for `### pointer` /
+    /// `### fnptr` (they do not branch on facts), but carries `has_len` for the
+    /// `### array` slot so it can pick the sized vs unsized form.
+    ctx: RenderContext,
 }
 
 impl<'a> TypeResolver<'a> {
@@ -2007,7 +2310,7 @@ impl<'a> TypeResolver<'a> {
                     slot: name.to_string(),
                 })?;
 
-        let ctx = RenderContext::default();
+        let ctx = self.ctx.clone();
         let outcome = match &slot {
             SlotDef::Fixed(outcome) => outcome.clone(),
             SlotDef::Table(table) => table
@@ -2044,6 +2347,25 @@ impl<'a> TypeResolver<'a> {
                     slot: name.to_string(),
                 }),
             },
+            // An array type's element type and its textual length.
+            (TypeScope::Compound, "elem") => match self.ty {
+                Type::Array { elem, .. } => resolve_type(elem, self.lang, self.index),
+                _ => Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                }),
+            },
+            (TypeScope::Compound, "len") => match self.ty {
+                Type::Array { len: Some(len), .. } => Ok(Rendered::text(len.clone())),
+                // An unsized array has no length text; the slot renders empty so
+                // a def that references `{len}` unguarded still produces the
+                // slice form's body without a spurious length.
+                Type::Array { len: None, .. } => Ok(Rendered::empty()),
+                _ => Err(EmitError::UnknownSlot {
+                    target: self.lang.name.clone(),
+                    slot: name.to_string(),
+                }),
+            },
             (TypeScope::Param(elem), "type") => resolve_type(elem, self.lang, self.index),
             _ => Err(EmitError::UnknownSlot {
                 target: self.lang.name.clone(),
@@ -2068,12 +2390,6 @@ impl<'a> TypeResolver<'a> {
         let len = params.len();
         let mut out = Rendered::empty();
         for (i, elem) in params.iter().enumerate() {
-            let mut elem_resolver = TypeResolver {
-                ty: self.ty,
-                lang: self.lang,
-                index: self.index,
-                scope: TypeScope::Param(elem),
-            };
             let slot = self
                 .lang
                 .function
@@ -2088,6 +2404,13 @@ impl<'a> TypeResolver<'a> {
                 first: i == 0,
                 last: i + 1 == len,
                 ..Default::default()
+            };
+            let mut elem_resolver = TypeResolver {
+                ty: self.ty,
+                lang: self.lang,
+                index: self.index,
+                scope: TypeScope::Param(elem),
+                ctx: ctx.clone(),
             };
             let outcome = match &slot {
                 SlotDef::Fixed(outcome) => outcome.clone(),
@@ -3116,7 +3439,7 @@ mod tests {
         let out = emit_one(Item::Enum {
             name: "E".into(),
             visibility: Visibility::Private,
-            variants: vec![Variant { name: "A".into() , meta: crate::ast::Meta::new() }, Variant { name: "B".into() , meta: crate::ast::Meta::new() }],
+            variants: vec![Variant { name: "A".into() , payload: crate::ast::VariantPayload::None, meta: crate::ast::Meta::new() }, Variant { name: "B".into() , payload: crate::ast::VariantPayload::None, meta: crate::ast::Meta::new() }],
             meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "enum E {\n    A,\n    B\n}", "got: {out}");
@@ -3148,6 +3471,8 @@ mod tests {
     fn use_renders_path_verbatim() {
         let out = emit_one(Item::Use {
             path: "a::b::c".into(),
+            items: vec![],
+            alias: None,
             meta: crate::ast::Meta::new(),
         });
         assert_eq!(out, "use a::b::c;");
@@ -3156,7 +3481,7 @@ mod tests {
     #[test]
     fn mixed_file_renders_items_in_order() {
         let items = vec![
-            Item::Use { path: "std".into() , meta: crate::ast::Meta::new() },
+            Item::Use { path: "std".into() , items: vec![], alias: None, meta: crate::ast::Meta::new() },
             Item::Function(Function {
                 name: "f".into(),
                 visibility: Visibility::Private,
@@ -3176,7 +3501,7 @@ mod tests {
         // The rust `RUST_DEF` in this module has no item sections at all, so
         // emitting any non-function item is a clean UnknownItem error.
         let file = File {
-            items: vec![Item::Use { path: "x".into() , meta: crate::ast::Meta::new() }],
+            items: vec![Item::Use { path: "x".into() , items: vec![], alias: None, meta: crate::ast::Meta::new() }],
         };
         let err = emit(&file, &rust()).expect_err("no item sections");
         assert!(

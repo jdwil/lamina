@@ -134,6 +134,10 @@ pub struct RenderContext {
     /// kind of the top-level item being rendered. `None` when the node being
     /// rendered is not a top-level item.
     pub item: Option<ItemKind>,
+    /// Answers `variant is unit|tuple|struct` — the payload shape of the enum
+    /// variant being rendered. `None` when the node being rendered is not an
+    /// enum variant.
+    pub variant: Option<VariantKind>,
     /// `has_value` — the statement being rendered has a value sub-part (a `let`
     /// with an initializer, or a `return` with a returned expression). Lets the
     /// `### statement` row for `let`/`return` render `{value}` conditionally.
@@ -150,6 +154,25 @@ pub struct RenderContext {
     pub has_step: bool,
     /// `has_default` — a `switch` carries a `default` branch.
     pub has_default: bool,
+    /// `has_len` — an array type carries an explicit length (rendering the
+    /// sized form `[T; N]` rather than the unsized/slice form `[T]`). Set when
+    /// rendering a [`Type::Array`](crate::ast::Type::Array) with `len: Some(_)`.
+    pub has_len: bool,
+    /// `has_items` — a `use` import carries a selective item list
+    /// (`use path::{a, b}`). Set on the `## Use` entry template when the import
+    /// has one or more [`UseItem`](crate::ast::UseItem)s.
+    pub has_items: bool,
+    /// `has_alias` — a `use` import carries a module alias (`use path as p`) or,
+    /// per selectively-imported item, that item carries a local alias
+    /// (`a as b`). Set on the `## Use` entry template for a module alias, and on
+    /// each `### use_item` element that is aliased.
+    pub has_alias: bool,
+    /// `has_payload` — an `enum` has at least one variant carrying a payload
+    /// (tuple or struct). Set on the `## Enum` entry template so a target with
+    /// no native tagged-union `enum` (e.g. TypeScript) can branch the whole
+    /// declaration to a discriminated-union form, while a payloadless enum
+    /// still renders as a plain enum.
+    pub has_payload: bool,
     /// Answers `value is <kind>` — the [`ExprKind`] of the current node's
     /// direct `value` sub-part (Part 2, one-level structural predicate). Set
     /// when the node being rendered has a `value` sub-expression (an `assign`'s
@@ -262,6 +285,8 @@ pub enum ExprKind {
     Node,
     /// A declarative tree text-content node (`expr is text`).
     Text,
+    /// An array-literal construction expression (`expr is array`).
+    ArrayLit,
 }
 
 impl ExprKind {
@@ -284,6 +309,7 @@ impl ExprKind {
             ExprKind::StructLit => "struct_lit",
             ExprKind::Node => "node",
             ExprKind::Text => "text",
+            ExprKind::ArrayLit => "array",
         }
     }
 }
@@ -381,6 +407,33 @@ impl ItemKind {
     }
 }
 
+/// The payload shape of an enum variant, for `variant is ...` queries.
+///
+/// This is the closed set of variant shapes a language definition may branch on
+/// in its `### variant` item slot. It mirrors the engine's
+/// [`VariantPayload`](crate::ast::VariantPayload); the emitter maps each variant
+/// to its kind when building the per-variant context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantKind {
+    /// A unit variant, no payload (`variant is unit`).
+    Unit,
+    /// A tuple-style payload (`variant is tuple`).
+    Tuple,
+    /// A struct-style payload (`variant is struct`).
+    Struct,
+}
+
+impl VariantKind {
+    /// The `variant is <kind>` value spelling for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VariantKind::Unit => "unit",
+            VariantKind::Tuple => "tuple",
+            VariantKind::Struct => "struct",
+        }
+    }
+}
+
 impl RenderContext {
     /// Evaluates a predicate against this context.
     pub fn eval(&self, predicate: &Predicate) -> bool {
@@ -423,6 +476,10 @@ impl RenderContext {
             ("has_cond", None) => self.has_cond,
             ("has_step", None) => self.has_step,
             ("has_default", None) => self.has_default,
+            ("has_len", None) => self.has_len,
+            ("has_items", None) => self.has_items,
+            ("has_alias", None) => self.has_alias,
+            ("has_payload", None) => self.has_payload,
             // Enum queries.
             ("ret", Some("void")) => self.ret == Some(RetKind::Void),
             ("ret", Some("never")) => self.ret == Some(RetKind::Never),
@@ -446,6 +503,15 @@ impl RenderContext {
             // spelling and match the item currently being rendered.
             ("item", Some(kind)) => {
                 self.item.map(|k| k.as_str() == kind).unwrap_or(false) && item_kind_is_known(kind)
+            }
+            // Variant dispatch: `variant is <kind>`. The value must be a known
+            // variant-shape spelling and match the variant currently being
+            // rendered.
+            ("variant", Some(kind)) => {
+                self.variant
+                    .map(|k| k.as_str() == kind)
+                    .unwrap_or(false)
+                    && variant_kind_is_known(kind)
             }
             // One-level structural sub-part kind query: `value is <kind>` — the
             // dispatch kind of the current node's direct `value` sub-part.
@@ -517,6 +583,7 @@ fn expr_kind_is_known(kind: &str) -> bool {
             | "struct_lit"
             | "node"
             | "text"
+            | "array"
     )
 }
 
@@ -558,6 +625,13 @@ fn item_kind_is_known(kind: &str) -> bool {
     )
 }
 
+/// Returns `true` if `kind` is a known `variant is <kind>` value spelling.
+/// Keeps the closed `variant` fact vocabulary in one place, shared by
+/// [`RenderContext::eval_fact`] and [`validate_fact`].
+fn variant_kind_is_known(kind: &str) -> bool {
+    matches!(kind, "unit" | "tuple" | "struct")
+}
+
 /// Validates that a fact is part of the closed registry. Used at parse time so
 /// a malformed `When` predicate fails loudly rather than silently evaluating to
 /// `false`.
@@ -581,6 +655,10 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_cond", None)
             | ("has_step", None)
             | ("has_default", None)
+            | ("has_len", None)
+            | ("has_items", None)
+            | ("has_alias", None)
+            | ("has_payload", None)
             | ("ret", Some("void"))
             | ("ret", Some("never"))
             | ("ret", Some("type"))
@@ -599,6 +677,10 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // `item is <kind>` is validated against the closed item vocabulary.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("item", Some(k)) if item_kind_is_known(k));
+    // `variant is <kind>` is validated against the closed variant-shape
+    // vocabulary.
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("variant", Some(k)) if variant_kind_is_known(k));
     // `value is <kind>` — one-level sub-part kind query — is validated against
     // the closed expression-kind vocabulary (and must not be an `eq` query).
     let known = known

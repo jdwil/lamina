@@ -174,11 +174,27 @@ pub enum Item {
         /// Engine-transparent metadata (see [`Meta`]); default empty.
         meta: Meta,
     },
-    /// An import (`use path;`). The `path` is a single string for now
-    /// (structured import lists are deferred — see [`Item`]).
+    /// An import (`use path;`).
+    ///
+    /// The `path` is the module path, always present. Two optional refinements
+    /// layer on top:
+    /// - **selective import** (`use path::{a, b as c}`): `items` is populated
+    ///   with the imported [`UseItem`]s (each optionally aliased);
+    /// - **module alias** (`use path as p`): `alias` is set.
+    ///
+    /// A bare module import (`items` empty, `alias` `None`) renders exactly as
+    /// before — the `has_items` / `has_alias` facts are both false, so the
+    /// target's `### use` (or entry) dispatch picks the plain `use {path};`
+    /// form and the output is byte-identical to the pre-structured form.
     Use {
-        /// The imported path, verbatim.
+        /// The imported module path, verbatim.
         path: String,
+        /// The selectively-imported items (`use path::{a, b as c}`); empty for a
+        /// bare or module-aliased import.
+        items: Vec<UseItem>,
+        /// A module alias (`use path as p`); `None` for a bare or selective
+        /// import.
+        alias: Option<String>,
         /// Engine-transparent metadata (see [`Meta`]); default empty.
         meta: Meta,
     },
@@ -287,7 +303,20 @@ impl PartialEq for Item {
                     ..
                 },
             ) => an == bn && at == bt && aval == bval && av == bv,
-            (Item::Use { path: a, .. }, Item::Use { path: b, .. }) => a == b,
+            (
+                Item::Use {
+                    path: ap,
+                    items: ai,
+                    alias: aa,
+                    ..
+                },
+                Item::Use {
+                    path: bp,
+                    items: bi,
+                    alias: ba,
+                    ..
+                },
+            ) => ap == bp && ai == bi && aa == ba,
             (Item::Tree(a), Item::Tree(b)) => a == b,
             _ => false,
         }
@@ -321,25 +350,117 @@ impl PartialEq for Field {
 
 impl Eq for Field {}
 
-/// An `enum` variant. Carries only a name for now; associated data / payloads
-/// are deferred (see [`Item`]).
+/// One imported item of a selective [`Item::Use`] (`use path::{name, name as
+/// alias}`): a name and an optional local alias.
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+#[derive(Debug, Clone)]
+pub struct UseItem {
+    /// The imported item's name (as it appears in the source module).
+    pub name: String,
+    /// An optional local alias (`name as alias`); `None` imports the item under
+    /// its own name.
+    pub alias: Option<String>,
+    /// Engine-transparent metadata (see [`Meta`]); default empty.
+    pub meta: Meta,
+}
+
+impl PartialEq for UseItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.alias == other.alias
+    }
+}
+
+impl Eq for UseItem {}
+
+/// An `enum` variant: a name and an optional payload (associated data).
+///
+/// A variant may be **unit** (no payload, a plain named enumerator — the C-like
+/// form that renders everywhere), **tuple**-style (an ordered list of unnamed
+/// payload types, e.g. Rust `Some(T)`), or **struct**-style (named payload
+/// fields, e.g. Rust `Point { x: i32, y: i32 }`). See [`VariantPayload`].
+///
+/// Payloads are **capability-gated** in the language definition: a target that
+/// lacks tagged unions (a C-style enum) forbids the tuple/struct rows of its
+/// `### variant` slot, so a payload-bearing variant surfaces a clear
+/// forbidden-construct error there while a unit variant still renders.
 ///
 /// Structural equality **ignores** the `meta` field (see [`Meta`]).
 #[derive(Debug, Clone)]
 pub struct Variant {
     /// The variant's identifier.
     pub name: String,
+    /// The variant's payload (associated data), or [`VariantPayload::None`] for
+    /// a plain unit variant.
+    pub payload: VariantPayload,
     /// Engine-transparent metadata (see [`Meta`]); default empty.
     pub meta: Meta,
 }
 
 impl PartialEq for Variant {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        self.name == other.name && self.payload == other.payload
     }
 }
 
 impl Eq for Variant {}
+
+/// The payload (associated data) carried by an [`Variant`].
+///
+/// This is the closed kernel set of variant shapes. A target's `### variant`
+/// slot dispatches on the shape via the `variant is unit|tuple|struct` fact:
+/// - [`VariantPayload::None`] — a plain unit variant (`variant is unit`);
+/// - [`VariantPayload::Tuple`] — ordered unnamed payload types
+///   (`variant is tuple`), rendered via the `payload_types` sequence slot
+///   (item slot `payload_type`);
+/// - [`VariantPayload::Struct`] — named payload fields (`variant is struct`),
+///   rendered via the `payload_fields` sequence slot (item slot
+///   `payload_field`).
+///
+/// Structural equality is derived (the contained [`Field`]/[`Type`] both
+/// already ignore metadata in their own equality).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantPayload {
+    /// No payload — a plain unit variant (the C-like enumerator form).
+    None,
+    /// A tuple-style payload: an ordered list of unnamed types.
+    Tuple(Vec<Type>),
+    /// A struct-style payload: named fields.
+    Struct(Vec<Field>),
+}
+
+impl VariantPayload {
+    /// The dispatch kind of this payload, for the `variant is <kind>` fact.
+    pub fn kind(&self) -> VariantKind {
+        match self {
+            VariantPayload::None => VariantKind::Unit,
+            VariantPayload::Tuple(_) => VariantKind::Tuple,
+            VariantPayload::Struct(_) => VariantKind::Struct,
+        }
+    }
+}
+
+/// The dispatch kind of a [`Variant`]'s payload, answering `variant is <kind>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantKind {
+    /// A unit variant (no payload).
+    Unit,
+    /// A tuple-style payload.
+    Tuple,
+    /// A struct-style payload.
+    Struct,
+}
+
+impl VariantKind {
+    /// The canonical `variant is <kind>` value spelling for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VariantKind::Unit => "unit",
+            VariantKind::Tuple => "tuple",
+            VariantKind::Struct => "struct",
+        }
+    }
+}
 
 /// The dispatch kind of an [`Item`], answering the `item is <kind>` fact.
 ///
@@ -641,6 +762,25 @@ pub enum Type {
         params: Vec<Type>,
         /// The return type.
         ret: Box<Type>,
+    },
+    /// A fixed **array type** (kernel `array`): an element type plus an optional
+    /// length. Rendering is target-specific (Rust `[T; N]` when a length is
+    /// given, `[T]` when it is not; TypeScript `T[]`) and supplied by the
+    /// language definition's `### array` type slot via the `elem` sub-slot (the
+    /// element type) and the `len` sub-slot (the textual length, guarded by the
+    /// `has_len` fact). Gated by the `### array` slot itself: a target with no
+    /// array type forbids that slot.
+    ///
+    /// The length is kept **textual** (like an integer literal) so width /
+    /// const-expression concerns stay a target matter. Richer/growable
+    /// collections (lists, maps, sets) are LAYER concerns, not kernel — only a
+    /// fixed array lives here.
+    Array {
+        /// The element type.
+        elem: Box<Type>,
+        /// The optional array length, preserved textually. `None` renders the
+        /// unsized/slice form.
+        len: Option<String>,
     },
 }
 
@@ -1182,6 +1322,22 @@ pub enum Expr {
         /// idiomatic inline object/closure form.
         meta: Meta,
     },
+    /// An **array literal** (`[a, b, c]`): an ordered list of element
+    /// expressions.
+    ///
+    /// This is the kernel array *construction* expression, the value-level
+    /// companion to [`Type::Array`]. The target spells it per its `### expr`
+    /// `array` row (Rust / TypeScript both `[a, b, c]`); the elements render as
+    /// a sequence slot (item slot `array_elem`, with `first`/`last` loop facts),
+    /// mirroring the existing collection mechanism — a non-first element renders
+    /// its own `, ` separator via the `!first` idiom. Indexing an array uses the
+    /// existing [`Expr::Index`].
+    ArrayLit {
+        /// The element expressions, in order (possibly empty).
+        elems: Vec<Expr>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
+    },
     /// A **declarative tree node** (the tree core): a named node with
     /// attributes and children.
     ///
@@ -1339,6 +1495,10 @@ impl PartialEq for Expr {
                 },
             ) => at == bt && af == bf,
             (
+                Expr::ArrayLit { elems: ae, .. },
+                Expr::ArrayLit { elems: be, .. },
+            ) => ae == be,
+            (
                 Expr::Node {
                     name: an,
                     attrs: aa,
@@ -1374,6 +1534,7 @@ impl Expr {
         match self {
             Expr::StructLit { meta, .. } => meta,
             Expr::Node { meta, .. } => meta,
+            Expr::ArrayLit { meta, .. } => meta,
             _ => {
                 static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Meta::new)
@@ -1401,6 +1562,7 @@ impl Expr {
             Expr::StructLit { .. } => ExprKind::StructLit,
             Expr::Node { .. } => ExprKind::Node,
             Expr::Text(_) => ExprKind::Text,
+            Expr::ArrayLit { .. } => ExprKind::ArrayLit,
         }
     }
 }
@@ -1444,6 +1606,8 @@ pub enum ExprKind {
     Node,
     /// A declarative tree text-content node (the tree core).
     Text,
+    /// An array-literal (construction) expression.
+    ArrayLit,
 }
 
 impl ExprKind {
@@ -1466,6 +1630,7 @@ impl ExprKind {
             ExprKind::StructLit => "struct_lit",
             ExprKind::Node => "node",
             ExprKind::Text => "text",
+            ExprKind::ArrayLit => "array",
         }
     }
 }
@@ -1736,6 +1901,11 @@ pub enum SlotScope {
     /// enum's `variants`). Exposes `name`; loop facts let the item template
     /// supply its own separator.
     Variant,
+    /// Resolving slots of a single tuple-payload type element (one element of a
+    /// tuple-style [`Variant`]'s `payload_types`). Exposes `type` (the rendered
+    /// payload type); loop facts let the item template supply its own
+    /// separator.
+    PayloadType,
     /// Resolving slots of a [`Item::TypeDef`] declaration: its `name` and
     /// `target` (the aliased type, rendered as a scalar).
     TypeDef,
@@ -1744,6 +1914,11 @@ pub enum SlotScope {
     Const,
     /// Resolving slots of a [`Item::Use`] declaration: its `path` (scalar).
     Use,
+    /// Resolving slots of a single [`UseItem`] element (one element of a
+    /// selective [`Item::Use`]'s `items`). Exposes `name` (the imported item's
+    /// name) and, when aliased, `alias`; the `has_alias` fact guards the alias.
+    /// Loop facts let the item template supply its own separator.
+    UseItem,
     /// Resolving slots of a tree [`Expr::Node`]: its `name` (scalar), and its
     /// `attrs` / `children` sequences (which loop the `attr` / `child` item
     /// slots).
@@ -1759,6 +1934,11 @@ pub enum SlotScope {
     /// (dispatching through the `### expr` table); loop facts (`first`/`last`)
     /// let the item template supply its own separator.
     Child,
+    /// Resolving slots of a single array-literal element (one element of an
+    /// [`Expr::ArrayLit`]'s `elems`). Its `value` sub-slot renders the element
+    /// expression (dispatching through the `### expr` table); loop facts
+    /// (`first`/`last`) let the item template supply its own separator.
+    ArrayElem,
 }
 
 /// The shape of an engine-bound slot: how the AST field it maps to is rendered.
@@ -1885,6 +2065,11 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::Type => match name {
             "pointee" => Some(SlotShape::Scalar),
             "ret" => Some(SlotShape::Scalar),
+            // An array type's element type (scalar, dispatched through the type
+            // machinery) and its optional textual length (scalar leaf, guarded
+            // by the `has_len` fact).
+            "elem" => Some(SlotShape::Scalar),
+            "len" => Some(SlotShape::Scalar),
             "params" => Some(SlotShape::Sequence {
                 item_slot: "type_param".to_string(),
                 item_scope: SlotScope::TypeParam,
@@ -1925,6 +2110,12 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "fields" => Some(SlotShape::Sequence {
                 item_slot: "field_init".to_string(),
                 item_scope: SlotScope::FieldInit,
+            }),
+            // An array literal's element expressions loop the `array_elem` item
+            // slot.
+            "elems" => Some(SlotShape::Sequence {
+                item_slot: "array_elem".to_string(),
+                item_scope: SlotScope::ArrayElem,
             }),
             // A tree node's attributes and children loop their own item slots.
             "attrs" => Some(SlotShape::Sequence {
@@ -1978,10 +2169,29 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             }),
             _ => None,
         },
-        // A single enum-variant element: `name` is a scalar leaf. (Payloads are
-        // deferred, so a variant exposes only its name for now.)
+        // A single enum-variant element: `name` is a scalar leaf. A payload-
+        // bearing variant also exposes its payload as a sequence: a tuple
+        // variant's `payload_types` loop the `payload_type` item slot; a struct
+        // variant's `payload_fields` loop the `payload_field` item slot (which
+        // resolves in [`SlotScope::Field`], reusing the struct-field `name`/
+        // `type` sub-slots). Which sequence is meaningful depends on the
+        // variant's shape (the `variant is tuple|struct` dispatch fact).
         SlotScope::Variant => match name {
             "name" => Some(SlotShape::Scalar),
+            "payload_types" => Some(SlotShape::Sequence {
+                item_slot: "payload_type".to_string(),
+                item_scope: SlotScope::PayloadType,
+            }),
+            "payload_fields" => Some(SlotShape::Sequence {
+                item_slot: "payload_field".to_string(),
+                item_scope: SlotScope::Field,
+            }),
+            _ => None,
+        },
+        // A single tuple-payload type element: `type` is the rendered payload
+        // type (dispatched through the type machinery).
+        SlotScope::PayloadType => match name {
+            "type" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A type alias: `name` is a scalar leaf; `target` renders the aliased
@@ -2000,9 +2210,25 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "value" => Some(SlotShape::Scalar),
             _ => None,
         },
-        // A `use` import: `path` is a scalar leaf rendered verbatim.
+        // A `use` import: `path` is a scalar leaf rendered verbatim. A module
+        // alias (`use path as p`) exposes `alias` (scalar leaf, guarded by the
+        // `has_alias` fact); a selective import exposes `items` (a sequence
+        // looping the `use_item` item slot, guarded by the `has_items` fact).
         SlotScope::Use => match name {
             "path" => Some(SlotShape::Scalar),
+            "alias" => Some(SlotShape::Scalar),
+            "items" => Some(SlotShape::Sequence {
+                item_slot: "use_item".to_string(),
+                item_scope: SlotScope::UseItem,
+            }),
+            _ => None,
+        },
+        // A single selectively-imported item: `name` is the imported name
+        // (scalar leaf); `alias` is the optional local alias (scalar leaf,
+        // guarded by the `has_alias` fact).
+        SlotScope::UseItem => match name {
+            "name" => Some(SlotShape::Scalar),
+            "alias" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A tree node, when rendered as an item (top-level tree value). Its
@@ -2033,6 +2259,12 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // A single node-child element: `value` renders the child expression
         // (dispatched through the `### expr` table).
         SlotScope::Child => match name {
+            "value" => Some(SlotShape::Scalar),
+            _ => None,
+        },
+        // A single array-literal element: `value` renders the element
+        // expression (dispatched through the `### expr` table).
+        SlotScope::ArrayElem => match name {
             "value" => Some(SlotShape::Scalar),
             _ => None,
         },
@@ -2394,6 +2626,8 @@ mod tests {
         assert_eq!(
             Item::Use {
                 path: "std::io".into(),
+                items: vec![],
+                alias: None,
                 meta: crate::ast::Meta::new(),
             }
             .kind(),
@@ -2707,5 +2941,202 @@ mod tests {
         assert_eq!(item.kind(), ItemKind::Tree);
         assert_eq!(ItemKind::Tree.as_str(), "tree");
         assert_eq!(ItemKind::Tree.scope(), SlotScope::Node);
+    }
+
+    // ---- Part 1: arrays ------------------------------------------------
+
+    #[test]
+    fn array_literal_kind_and_slots() {
+        let a = Expr::ArrayLit {
+            elems: vec![Expr::IntLiteral("1".into())],
+            meta: crate::ast::Meta::new(),
+        };
+        assert_eq!(a.kind(), ExprKind::ArrayLit);
+        assert_eq!(ExprKind::ArrayLit.as_str(), "array");
+        // `elems` loops the `array_elem` item slot in ArrayElem scope.
+        match slot_binding("elems", SlotScope::Expr) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "array_elem");
+                assert_eq!(item_scope, SlotScope::ArrayElem);
+            }
+            other => panic!("elems should be an array_elem sequence, got {other:?}"),
+        }
+        assert_eq!(
+            slot_binding("value", SlotScope::ArrayElem),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::ArrayElem), None);
+    }
+
+    #[test]
+    fn array_type_slots() {
+        // The array type exposes `elem` (recursive) and `len` (textual leaf).
+        assert_eq!(slot_binding("elem", SlotScope::Type), Some(SlotShape::Scalar));
+        assert_eq!(slot_binding("len", SlotScope::Type), Some(SlotShape::Scalar));
+        let sized = Type::Array {
+            elem: Box::new(Type::Primitive(Primitive::I32)),
+            len: Some("3".into()),
+        };
+        let unsized_ty = Type::Array {
+            elem: Box::new(Type::Primitive(Primitive::I32)),
+            len: None,
+        };
+        // Structural equality distinguishes sized from unsized.
+        assert_ne!(sized, unsized_ty);
+        assert_eq!(sized, sized.clone());
+    }
+
+    #[test]
+    fn array_literal_equality_ignores_metadata() {
+        let a = Expr::ArrayLit {
+            elems: vec![Expr::IntLiteral("1".into())],
+            meta: crate::ast::Meta::new(),
+        };
+        let b = Expr::ArrayLit {
+            elems: vec![Expr::IntLiteral("1".into())],
+            meta: crate::ast::Meta::new().with("origin", "layer"),
+        };
+        assert_eq!(a, b);
+    }
+
+    // ---- Part 2: enum payloads -----------------------------------------
+
+    #[test]
+    fn variant_payload_kinds() {
+        assert_eq!(VariantPayload::None.kind(), VariantKind::Unit);
+        assert_eq!(
+            VariantPayload::Tuple(vec![Type::Primitive(Primitive::I32)]).kind(),
+            VariantKind::Tuple
+        );
+        assert_eq!(
+            VariantPayload::Struct(vec![]).kind(),
+            VariantKind::Struct
+        );
+        assert_eq!(VariantKind::Unit.as_str(), "unit");
+        assert_eq!(VariantKind::Tuple.as_str(), "tuple");
+        assert_eq!(VariantKind::Struct.as_str(), "struct");
+    }
+
+    #[test]
+    fn variant_equality_uses_name_and_payload_ignores_meta() {
+        let a = Variant {
+            name: "Circle".into(),
+            payload: VariantPayload::Tuple(vec![Type::Primitive(Primitive::I32)]),
+            meta: crate::ast::Meta::new(),
+        };
+        let b = Variant {
+            name: "Circle".into(),
+            payload: VariantPayload::Tuple(vec![Type::Primitive(Primitive::I32)]),
+            meta: crate::ast::Meta::new().with("k", "v"),
+        };
+        // Same name + payload, different metadata -> equal.
+        assert_eq!(a, b);
+        // Different payload shape -> not equal.
+        let c = Variant {
+            name: "Circle".into(),
+            payload: VariantPayload::None,
+            meta: crate::ast::Meta::new(),
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn variant_payload_slots() {
+        // A variant exposes `name` plus its two payload sequences.
+        assert_eq!(
+            slot_binding("name", SlotScope::Variant),
+            Some(SlotShape::Scalar)
+        );
+        match slot_binding("payload_types", SlotScope::Variant) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "payload_type");
+                assert_eq!(item_scope, SlotScope::PayloadType);
+            }
+            other => panic!("payload_types should be a payload_type sequence, got {other:?}"),
+        }
+        match slot_binding("payload_fields", SlotScope::Variant) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "payload_field");
+                // Payload fields reuse the struct-field scope.
+                assert_eq!(item_scope, SlotScope::Field);
+            }
+            other => panic!("payload_fields should be a payload_field sequence, got {other:?}"),
+        }
+        assert_eq!(
+            slot_binding("type", SlotScope::PayloadType),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::PayloadType), None);
+    }
+
+    // ---- Part 3: structured use ----------------------------------------
+
+    #[test]
+    fn use_slots_and_equality() {
+        // The Use scope exposes `path`/`alias` (scalar) and `items` (sequence).
+        assert_eq!(slot_binding("path", SlotScope::Use), Some(SlotShape::Scalar));
+        assert_eq!(slot_binding("alias", SlotScope::Use), Some(SlotShape::Scalar));
+        match slot_binding("items", SlotScope::Use) {
+            Some(SlotShape::Sequence {
+                item_slot,
+                item_scope,
+            }) => {
+                assert_eq!(item_slot, "use_item");
+                assert_eq!(item_scope, SlotScope::UseItem);
+            }
+            other => panic!("items should be a use_item sequence, got {other:?}"),
+        }
+        // A use-item element exposes `name` and `alias`.
+        assert_eq!(
+            slot_binding("name", SlotScope::UseItem),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(
+            slot_binding("alias", SlotScope::UseItem),
+            Some(SlotShape::Scalar)
+        );
+        assert_eq!(slot_binding("bogus", SlotScope::UseItem), None);
+    }
+
+    #[test]
+    fn use_equality_ignores_metadata_compares_structure() {
+        let a = Item::Use {
+            path: "std::io".into(),
+            items: vec![UseItem {
+                name: "Read".into(),
+                alias: Some("R".into()),
+                meta: crate::ast::Meta::new(),
+            }],
+            alias: None,
+            meta: crate::ast::Meta::new(),
+        };
+        let b = Item::Use {
+            path: "std::io".into(),
+            items: vec![UseItem {
+                name: "Read".into(),
+                alias: Some("R".into()),
+                meta: crate::ast::Meta::new().with("k", "v"),
+            }],
+            alias: None,
+            meta: crate::ast::Meta::new().with("x", "y"),
+        };
+        assert_eq!(a, b);
+        // A different alias makes the imports unequal.
+        let c = Item::Use {
+            path: "std::io".into(),
+            items: vec![],
+            alias: Some("io".into()),
+            meta: crate::ast::Meta::new(),
+        };
+        assert_ne!(a, c);
     }
 }

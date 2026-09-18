@@ -134,14 +134,17 @@ fn enum_of_variants_renders() {
         variants: vec![
             Variant {
                 name: "Red".to_string(),
+                payload: lamina_core::ast::VariantPayload::None,
                 meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Green".to_string(),
+                payload: lamina_core::ast::VariantPayload::None,
                 meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Blue".to_string(),
+                payload: lamina_core::ast::VariantPayload::None,
                 meta: lamina_core::ast::Meta::new(),
             },
         ],
@@ -200,11 +203,15 @@ fn const_renders() {
 fn use_renders() {
     let item = Item::Use {
         path: "std::io".to_string(),
+        items: vec![],
+        alias: None,
         meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_items(vec![item.clone()], &rust()), "use std::io;");
     let ts_item = Item::Use {
         path: "\"fs\"".to_string(),
+        items: vec![],
+        alias: None,
         meta: lamina_core::ast::Meta::new(),
     };
     assert_eq!(emit_items(vec![ts_item], &ts()), "import \"fs\";");
@@ -280,6 +287,8 @@ fn item_without_section_errors_cleanly() {
     let file = File {
         items: vec![Item::Use {
             path: "x".to_string(),
+            items: vec![],
+            alias: None,
             meta: lamina_core::ast::Meta::new(),
         }],
     };

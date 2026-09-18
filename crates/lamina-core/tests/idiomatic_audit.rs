@@ -895,10 +895,12 @@ fn enum_item() {
         variants: vec![
             Variant {
                 name: "Red".to_string(),
+                payload: lamina_core::ast::VariantPayload::None,
                 meta: lamina_core::ast::Meta::new(),
             },
             Variant {
                 name: "Green".to_string(),
+                payload: lamina_core::ast::VariantPayload::None,
                 meta: lamina_core::ast::Meta::new(),
             },
         ],
@@ -938,6 +940,8 @@ fn typedef_const_use_items() {
         emit_one(
             Item::Use {
                 path: "std::io".to_string(),
+                items: vec![],
+                alias: None,
                 meta: lamina_core::ast::Meta::new(),
             },
             &rust()
@@ -948,6 +952,8 @@ fn typedef_const_use_items() {
         emit_one(
             Item::Use {
                 path: "\"fs\"".to_string(),
+                items: vec![],
+                alias: None,
                 meta: lamina_core::ast::Meta::new(),
             },
             &ts()
@@ -965,6 +971,8 @@ fn mixed_file_renders_in_order_both_targets() {
     let items = vec![
         Item::Use {
             path: "std::io".to_string(),
+            items: vec![],
+            alias: None,
             meta: lamina_core::ast::Meta::new(),
         },
         Item::Const {

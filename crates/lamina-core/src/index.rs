@@ -277,6 +277,13 @@ fn count_fnptr_refs_in_expr(
             }
         }
         Expr::Text(inner) => count_fnptr_refs_in_expr(inner, items, counts),
+        // An array literal's elements are value positions, so a bare function
+        // reference among them is a fnptr value — recurse into each.
+        Expr::ArrayLit { elems, .. } => {
+            for e in elems {
+                count_fnptr_refs_in_expr(e, items, counts);
+            }
+        }
         Expr::IntLiteral(_)
         | Expr::FloatLiteral(_)
         | Expr::BoolLiteral(_)
@@ -370,6 +377,8 @@ mod tests {
                 func("f", vec![]),
                 Item::Use {
                     path: "std".into(),
+                    items: vec![],
+                    alias: None,
                     meta: Meta::new(),
                 },
             ],

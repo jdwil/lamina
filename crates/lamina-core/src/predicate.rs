@@ -185,6 +185,16 @@ pub struct RenderContext {
     /// row so a target can render the return-type annotation conditionally
     /// (Rust `|x| -> i32 { … }`); an inference-only lambda leaves it false.
     pub has_ret_type: bool,
+    /// Answers `has_arg(<name>)` — whether a caller-supplied named argument
+    /// `<name>` is currently in scope (pushed by an argument-bearing slot
+    /// reference `{slot(name: value)}`; see [`crate::render::SlotResolver`]).
+    /// This is the branching companion to the argument mechanism: a slot
+    /// template can render one form when a declarator argument is present (the
+    /// C array/fn-pointer declarator weaves in `{name}`) and the bare form when
+    /// it is not (a type in a non-declarator position). The set is a SNAPSHOT of
+    /// the arg-stack frame names taken when this render context was built, so
+    /// predicate evaluation stays pure.
+    pub arg_names: std::collections::BTreeSet<String>,
     /// Answers `attr is <name>` — the type attribute currently being rendered
     /// in a per-element `### attribute` item slot (e.g. `attr is displayable`).
     /// `None` when the node being rendered is not a single type-attribute
@@ -574,6 +584,15 @@ impl RenderContext {
                 Some(key) => self.meta.has(key),
                 None => false,
             },
+            // Argument membership: `has_arg(<name>)` — true if a caller-supplied
+            // named argument `<name>` is currently in scope. The MECHANISM is
+            // closed (only `has_arg`); the NAME is open (whatever the def and
+            // its caller agreed to pass). Lets a slot template branch between a
+            // declarator form (name present) and a bare form (name absent).
+            ("has_arg", None) => match &fact.meta_key {
+                Some(name) => self.arg_names.contains(name),
+                None => false,
+            },
             // Metadata value query: `meta.<key> is <value>` — true if the
             // current node's metadata `<key>` equals `<value>`. Keys and values
             // are open; the engine only compares.
@@ -758,6 +777,14 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // agreed on). The engine validates the shape, never the key's meaning.
     let known = known
         || (fact.key == "has_meta"
+            && fact.value.is_none()
+            && fact.eq.is_none()
+            && fact.meta_key.as_deref().is_some_and(|k| !k.is_empty()));
+    // `has_arg(<name>)` — caller-supplied-argument membership. The MECHANISM is
+    // closed (only `has_arg`), the NAME is open (any non-empty identifier the
+    // def and its caller agreed on). Same shape as `has_meta`.
+    let known = known
+        || (fact.key == "has_arg"
             && fact.value.is_none()
             && fact.eq.is_none()
             && fact.meta_key.as_deref().is_some_and(|k| !k.is_empty()));
@@ -989,8 +1016,9 @@ impl PredParser {
                         });
                     }
                     self.pos += 1;
-                    // `has_meta(<key>)` is a boolean membership fact (no `is`).
-                    if key == "has_meta" {
+                    // `has_meta(<key>)` / `has_arg(<name>)` are boolean
+                    // membership facts (no `is`).
+                    if key == "has_meta" || key == "has_arg" {
                         let fact = Fact {
                             key,
                             value: None,
@@ -1493,8 +1521,36 @@ mod tests {
     }
 
     #[test]
-    fn meta_value_fact_parses_and_evaluates() {
-        let p = parse_predicate("meta.origin is anon_class").expect("parse");
+    fn has_arg_fact_parses_and_evaluates() {
+        // `has_arg(<name>)` mirrors `has_meta`: a closed mechanism with an open
+        // name, answering whether a caller-supplied argument is in scope.
+        let p = parse_predicate("has_arg(name)").expect("parse");
+        let with = RenderContext {
+            arg_names: ["name".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(with.eval(&p));
+        // Absent arg -> false; empty set -> false.
+        let other = RenderContext {
+            arg_names: ["unrelated".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(!other.eval(&p));
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn has_arg_name_is_open_but_mechanism_closed() {
+        // Any non-empty name parses; a bare `has_arg` with no parens is rejected
+        // (same shape rule as `has_meta`).
+        for src in ["has_arg(name)", "has_arg(whatever)", "has_arg(x) && has_arg(y)"] {
+            parse_predicate(src).unwrap_or_else(|e| panic!("`{src}` should parse: {e:?}"));
+        }
+        assert!(parse_predicate("has_arg").is_err());
+    }
+
+    #[test]
+    fn meta_value_fact_parses_and_evaluates() {        let p = parse_predicate("meta.origin is anon_class").expect("parse");
         let matching = RenderContext {
             meta: crate::ast::Meta::new().with("origin", "anon_class"),
             ..Default::default()

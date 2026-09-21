@@ -56,6 +56,16 @@ pub struct RenderState {
     /// A monotonically-increasing counter making each distinct `(prefix, key)`
     /// allocation unique within the unit.
     fresh_counter: usize,
+    /// A stack of caller-supplied named-argument frames (see
+    /// [`crate::render::SlotResolver`]). Each argument-bearing slot reference
+    /// `{name(arg: value, ...)}` pushes one frame (the rendered arg values)
+    /// before resolving `name` and pops it after. A `{arg}` reference resolves
+    /// from the INNERMOST frame that binds it, so a deeper passed arg shadows a
+    /// shallower one and normal slots are shadowed by any in-scope arg. Frames
+    /// live here (interior-mutable, shared) so args stay visible through the
+    /// nested sub-render resolvers, which each hold their own borrow of the same
+    /// `&UnitIndex`.
+    arg_frames: Vec<Vec<(String, crate::render::Rendered)>>,
 }
 
 /// A read-only index of one compilation unit ([`File`]): a map of top-level
@@ -209,6 +219,57 @@ impl<'a> UnitIndex<'a> {
     /// for final assembly by the multi-pass driver.
     pub fn take_regions(&self) -> BTreeMap<String, String> {
         std::mem::take(&mut self.state.borrow_mut().regions)
+    }
+
+    /// Pushes a frame of caller-supplied named arguments (already rendered in
+    /// the caller's scope) onto the argument stack. In effect until the paired
+    /// [`pop_args`](UnitIndex::pop_args). See [`crate::render::SlotResolver`].
+    pub fn push_args(&self, args: Vec<(String, crate::render::Rendered)>) {
+        self.state.borrow_mut().arg_frames.push(args);
+    }
+
+    /// Pops the most recently pushed argument frame. A no-op if the stack is
+    /// empty (which never happens under balanced push/pop from the renderer).
+    pub fn pop_args(&self) {
+        self.state.borrow_mut().arg_frames.pop();
+    }
+
+    /// Looks up a caller-supplied argument by `name`, searching frames from the
+    /// innermost (top of stack) outward so a deeper passed arg shadows a
+    /// shallower one. Returns the already-rendered value if bound, else `None`.
+    pub fn lookup_arg(&self, name: &str) -> Option<crate::render::Rendered> {
+        let state = self.state.borrow();
+        state
+            .arg_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+    }
+
+    /// A snapshot of every caller-supplied argument name currently in scope
+    /// whose value is non-empty (across all frames on the stack). Used to
+    /// populate the `has_arg(<name>)` predicate fact so a slot template can
+    /// branch on argument presence while predicate evaluation itself stays pure
+    /// (it reads the snapshot, not the live stack).
+    ///
+    /// An empty-valued frame SHADOWS an outer same-named argument to empty (the
+    /// engine pushes one when descending into a nested type so a declarator name
+    /// applies exactly once); excluding empty values here makes `has_arg(name)`
+    /// correctly report the name as out of scope for that nested render.
+    pub fn arg_names(&self) -> std::collections::BTreeSet<String> {
+        let state = self.state.borrow();
+        let mut names = std::collections::BTreeSet::new();
+        // Innermost frame wins: walk outward and let a nearer empty value hide
+        // a farther non-empty one (and vice versa).
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in state.arg_frames.iter().rev() {
+            for (k, v) in frame {
+                if seen.insert(k.clone()) && !v.text.is_empty() {
+                    names.insert(k.clone());
+                }
+            }
+        }
+        names
     }
 }
 

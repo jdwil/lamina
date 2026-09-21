@@ -216,6 +216,76 @@ The engine stays dumb: a projection only selects *which* item template a
 collection loops with — it adds no scripting and no per-element logic beyond the
 usual `When`-table dispatch.
 
+### Slot Arguments (`{slot(name: value)}`)
+
+A slot's sub-render normally sees only its own context (the element it renders,
+its facts, its sub-slots). Occasionally a sub-render needs an **extra** value
+its normal scope does not provide. The canonical case is C's *declarator*: the
+type spelling wraps around the variable NAME (`int32_t arr[3]`,
+`int (*fp)(int)`), so rendering a binding's TYPE needs the binding's NAME — a
+value the type scope does not expose.
+
+A slot reference may pass the extra value explicitly as a **named argument**
+(dependency injection — NOT tree navigation; a slot only ever sees what it was
+handed):
+
+```text
+{slot(argname: value, ...)}
+```
+
+- Each `value` is a **template fragment** rendered in the **caller's** scope
+  (so `{name}` in a value is the caller's `name`). The rendered fragments are in
+  scope for the duration of resolving `slot` **and its nested sub-renders**, as
+  slots named `argname`.
+- Arguments **augment**, never replace, the callee's normal scope; they forward
+  only what the caller could already resolve (bounded — no new access).
+- The callee just *uses* `{argname}` — no declaration ceremony. A passed
+  argument **shadows** a same-named normal slot within the sub-render, and a
+  deeper passed argument shadows a shallower one.
+- The presence of an argument is queryable with the [`has_arg(<name>)`
+  fact](#when-predicates), so a slot template can branch between a form that
+  weaves the argument in and a bare form when it is absent.
+- Referencing `{argname}` on a reachable path where nothing passed it (and no
+  normal slot of that name exists) is a clean render-time `UnknownSlot` error.
+
+`{slot}` with **no** argument list is unchanged — byte-identical to a definition
+written before slot arguments existed (the backward-compat guarantee). A closed
+helper call such as `{escape(x, c)}` or `{field_type(A, b)}` has no `name:`
+label inside its parentheses, so it is NOT an argument list and is left
+untouched.
+
+**Example — the C declarator.** A binding passes its name into its type; the
+compound type slots weave it in, branching on `has_arg(name)`:
+
+```text
+### param
+| When  | Template |
+|-------|----------|
+| first | "{type(name: {name})}" |
+| else  | ", {type(name: {name})}" |
+
+### array
+| When                     | Template |
+|--------------------------|----------|
+| has_arg(name) && has_len | "{elem} {name}[{len}]" |
+| has_arg(name)            | "{elem} {name}[]" |
+| has_len                  | "{elem}[{len}]" |
+| else                     | "{elem}[]" |
+
+### fnptr
+| When          | Template |
+|---------------|----------|
+| has_arg(name) | "{ret} (*{name})({params})" |
+| else          | "{ret} (*)({params})" |
+```
+
+A primitive or named type has no `### <slot>` to weave into, so the engine
+composes the universal `type name` declarator for it automatically when a `name`
+argument is in scope; a type in a **non-declarator** position (a return type, a
+cast, a type argument) passes no name and renders the bare type. Nested types
+(an array element, a pointee, an fn-pointer parameter/return) are non-declarator
+positions — the injected name applies exactly once, to the outermost type.
+
 ### Slot Subsections
 
 Each `### <slot>` is one of two forms:
@@ -361,6 +431,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
 | `has_meta(<key>)` | bool | (metadata) the current node carries metadata key `<key>` — keys are open (a layer↔def contract), the *mechanism* is closed |
+| `has_arg(<name>)` | bool | (slot argument) a caller-supplied named argument `<name>` is in scope (see [Slot Arguments](#slot-arguments-slotname-value)) — names are open (a callee↔caller contract), the *mechanism* is closed. Lets a slot branch between a declarator form (name present) and a bare form |
 | `meta.<key> is <value>` | enum | (metadata) the current node's metadata `<key>` equals `<value>` — keys and values are open |
 | `fnptr_ref_count(<arg>) is <n>` | enum | (helper) the function the `<arg>` sub-slot's fnptr value refers to is used as a value exactly `<n>` times in the unit |
 | `type_of(<arg>) is <type>` | enum | (helper) the resolved type of the `<arg>` sub-slot's expression is `<type>` (a locally-nameable type) |

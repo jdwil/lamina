@@ -100,7 +100,32 @@ enum TemplatePart {
     /// Literal text emitted verbatim.
     Literal(String),
     /// A named slot to be filled by a [`SlotResolver`].
-    Slot(String),
+    Slot(SlotRef),
+}
+
+/// A parsed slot reference: the raw slot name (which may itself contain the
+/// existing projection `:` syntax and closed-helper `(...)` calls, unchanged)
+/// plus any NEW caller-supplied named arguments.
+///
+/// A bare `{name}` (or the existing `{name:item}` / `{helper(x)}` forms) parses
+/// to a `SlotRef` with an EMPTY `args` list and is resolved BYTE-IDENTICALLY to
+/// before (the backward-compat guarantee): the whole reference text is handed to
+/// [`SlotResolver::resolve`] exactly as it always was.
+///
+/// A `{name(argname: value, ...)}` reference (NEW) captures each `value` as a
+/// nested [`Template`] rendered in the CALLER's scope; the rendered fragments
+/// are pushed as named args for the duration of resolving `name` and its nested
+/// sub-renders (see [`Template::render`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotRef {
+    /// The slot name as handed to the resolver (may contain `:` projection and
+    /// closed-helper `(...)` calls — those are the resolver's concern, not the
+    /// template parser's). For a no-arg reference this is the entire text
+    /// between the braces.
+    name: String,
+    /// Caller-supplied named arguments, each an `(argname, value-template)`
+    /// pair. Empty for every existing (no-arg) slot form.
+    args: Vec<(String, Template)>,
 }
 
 /// An error while parsing a template string.
@@ -112,6 +137,9 @@ pub enum TemplateError {
     UnmatchedBrace,
     /// A slot name was empty (`{}`).
     EmptySlot,
+    /// A slot-argument list `{name(...)}` was malformed: an arg had no `name:`
+    /// label, an empty arg name, or an unbalanced/empty parenthesis group.
+    MalformedSlotArgs(String),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -120,6 +148,9 @@ impl std::fmt::Display for TemplateError {
             TemplateError::UnclosedSlot => write!(f, "unclosed `{{` in template"),
             TemplateError::UnmatchedBrace => write!(f, "unmatched `}}` in template"),
             TemplateError::EmptySlot => write!(f, "empty slot `{{}}` in template"),
+            TemplateError::MalformedSlotArgs(msg) => {
+                write!(f, "malformed slot arguments: {msg}")
+            }
         }
     }
 }
@@ -131,10 +162,19 @@ impl Template {
     ///
     /// `{{` and `}}` are literal braces; `{name}` is a slot.
     ///
+    /// A slot may carry NEW caller-supplied named arguments:
+    /// `{name(argname: value, ...)}`, where each `value` is itself a template
+    /// fragment (it MAY contain nested `{...}` slots, which are resolved in the
+    /// CALLER's scope when the slot is rendered). The parser balances braces and
+    /// parentheses inside the argument list so nested `{...}` are captured
+    /// whole. A slot with NO argument list (`{name}`, `{name:item}`, or a closed
+    /// helper call like `{escape(x, c)}`) parses byte-identically to before —
+    /// the entire inner text becomes the slot name and no args are attached.
+    ///
     /// # Errors
     ///
-    /// Returns [`TemplateError`] on an unclosed slot, unmatched brace, or empty
-    /// slot name.
+    /// Returns [`TemplateError`] on an unclosed slot, unmatched brace, empty
+    /// slot name, or a malformed argument list.
     pub fn parse(src: &str) -> Result<Template, TemplateError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
@@ -152,18 +192,15 @@ impl Template {
                     if !literal.is_empty() {
                         parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
                     }
-                    let mut name = String::new();
-                    loop {
-                        match chars.next() {
-                            Some('}') => break,
-                            Some(ch) => name.push(ch),
-                            None => return Err(TemplateError::UnclosedSlot),
-                        }
-                    }
-                    if name.is_empty() {
+                    // Capture the raw slot body up to the matching `}`, honoring
+                    // nested `{...}` and `(...)` so a slot-argument value that
+                    // itself contains `{sub}` (e.g. `{type(name: {name})}`) is
+                    // read whole rather than terminating at the inner `}`.
+                    let body = capture_slot_body(&mut chars)?;
+                    if body.is_empty() {
                         return Err(TemplateError::EmptySlot);
                     }
-                    parts.push(TemplatePart::Slot(name));
+                    parts.push(TemplatePart::Slot(parse_slot_ref(&body)?));
                 }
                 '}' => {
                     if chars.peek() == Some(&'}') {
@@ -183,12 +220,14 @@ impl Template {
     }
 
     /// The names of the slots this template references, in order (duplicates
-    /// included). Useful for validation.
+    /// included). Useful for validation. The name is the resolver-facing slot
+    /// name (excluding any NEW argument list); argument *values* are nested
+    /// templates and are not surfaced here.
     pub fn slot_names(&self) -> Vec<&str> {
         self.parts
             .iter()
             .filter_map(|p| match p {
-                TemplatePart::Slot(name) => Some(name.as_str()),
+                TemplatePart::Slot(slot) => Some(slot.name.as_str()),
                 TemplatePart::Literal(_) => None,
             })
             .collect()
@@ -221,14 +260,64 @@ impl Template {
         for part in &self.parts {
             match part {
                 TemplatePart::Literal(text) => out.push_str(text),
-                TemplatePart::Slot(name) => {
+                TemplatePart::Slot(slot) => {
                     let indent = current_column(&out.text);
-                    let fragment = resolver.resolve(name)?;
+                    let fragment = self.resolve_slot(slot, resolver)?;
                     out.push(indent_continuation_lines(fragment, indent));
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Resolves a single slot reference, handling caller-supplied named
+    /// arguments.
+    ///
+    /// Resolution order:
+    /// 1. **Argument shadowing (no-arg reference):** a bare `{argname}` whose
+    ///    name matches an argument currently in scope resolves to that pushed
+    ///    argument value, SHADOWING any same-named normal slot. This is what
+    ///    makes a passed arg reachable (`{name}` inside the C declarator type)
+    ///    and lets it shadow a normal slot of the same name.
+    /// 2. **Argument-bearing reference (`{name(a: v, ...)}`):** each `v` is
+    ///    rendered NOW, in the CALLER's scope (`self` + `resolver`), producing a
+    ///    fragment. Those fragments are pushed as named args, `name` is resolved
+    ///    (its sub-renders see the args, and may shadow them at a deeper level),
+    ///    then the args are popped. Args AUGMENT, never replace, the callee's
+    ///    normal scope.
+    /// 3. **Plain reference:** handed to [`SlotResolver::resolve`] unchanged
+    ///    (byte-identical to the pre-argument behavior).
+    fn resolve_slot<R: SlotResolver>(
+        &self,
+        slot: &SlotRef,
+        resolver: &mut R,
+    ) -> Result<Rendered, R::Error> {
+        // (1) A no-arg reference that names an in-scope pushed argument resolves
+        // to that argument, shadowing a normal slot of the same name. Only bare
+        // references (no `:` projection, no `(...)` helper/args) can be argument
+        // names, so this never intercepts projections or helper calls.
+        if slot.args.is_empty() && is_bare_identifier(&slot.name) {
+            if let Some(value) = resolver.resolve_arg(&slot.name) {
+                return Ok(value);
+            }
+        }
+
+        // (3) Plain reference (no args): unchanged path.
+        if slot.args.is_empty() {
+            return resolver.resolve(&slot.name);
+        }
+
+        // (2) Argument-bearing reference: render each value in the caller's
+        // scope, push, resolve, pop (pop even on error).
+        let mut rendered_args = Vec::with_capacity(slot.args.len());
+        for (arg_name, value_template) in &slot.args {
+            let value = value_template.render(resolver)?;
+            rendered_args.push((arg_name.clone(), value));
+        }
+        resolver.push_args(rendered_args);
+        let result = resolver.resolve(&slot.name);
+        resolver.pop_args();
+        result
     }
 }
 
@@ -342,6 +431,241 @@ fn shift_offset(offset_map: &[(usize, usize)], old: usize, text: &str, indent: u
     old + added
 }
 
+/// Reads the raw body of a slot from `chars`, having already consumed the
+/// opening `{`, up to and consuming the matching closing `}`.
+///
+/// Braces and parentheses are BALANCED: a `}` only terminates the slot at
+/// brace-depth 0, so a slot-argument value that itself contains a nested
+/// `{sub}` (e.g. `{type(name: {name})}`) is captured whole. Parentheses are
+/// tracked too so a `}` inside a `(...)` group is treated as literal body text.
+/// This is strictly more permissive than the old "read to first `}`" scan and
+/// is byte-compatible for every existing slot form (which contain no nested
+/// braces).
+///
+/// # Errors
+///
+/// [`TemplateError::UnclosedSlot`] if the input ends before the matching `}`.
+fn capture_slot_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, TemplateError> {
+    let mut body = String::new();
+    let mut brace_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    loop {
+        match chars.next() {
+            None => return Err(TemplateError::UnclosedSlot),
+            Some('}') if brace_depth == 0 => return Ok(body),
+            Some('}') => {
+                brace_depth -= 1;
+                body.push('}');
+            }
+            Some('{') => {
+                brace_depth += 1;
+                body.push('{');
+            }
+            Some('(') => {
+                paren_depth += 1;
+                body.push('(');
+            }
+            Some(')') => {
+                paren_depth = paren_depth.saturating_sub(1);
+                body.push(')');
+            }
+            Some(ch) => body.push(ch),
+        }
+    }
+}
+
+/// Parses a captured slot body into a [`SlotRef`].
+///
+/// The body is EITHER the existing no-arg form (a plain name, a `name:item`
+/// projection, or a closed helper call such as `escape(x, c)`) — in which case
+/// the whole body becomes the resolver-facing name with no args — OR the NEW
+/// argument form `name(argname: value, ...)`.
+///
+/// The two are distinguished structurally: the argument form has a
+/// parenthesized tail whose top-level content parses as one or more
+/// `argname: value` pairs (an identifier, then `:`, then a value). A closed
+/// helper call like `escape(x, c)` has NO `:` in its argument list, so it is
+/// left as a plain name and handed to the resolver unchanged (backward compat).
+///
+/// # Errors
+///
+/// [`TemplateError::MalformedSlotArgs`] if a `(...)` tail looks like the
+/// argument form (contains a top-level `:`) but is malformed (empty arg name,
+/// missing value, unbalanced parens, or a trailing/empty segment).
+fn parse_slot_ref(body: &str) -> Result<SlotRef, TemplateError> {
+    // Find a top-level `(...)` tail: the LAST `(` at paren-depth 0 whose group
+    // extends to the end of the body. Only a trailing, fully-balanced `(...)`
+    // group is an argument list.
+    let Some(open) = find_arg_paren(body) else {
+        return Ok(SlotRef {
+            name: body.to_string(),
+            args: Vec::new(),
+        });
+    };
+    let inner = &body[open + 1..body.len() - 1];
+    // The argument form is recognized only when the parenthesized content has a
+    // top-level `argname:` label. Otherwise it is a closed helper call (or some
+    // other `(...)` the resolver understands) and is left untouched.
+    if !has_top_level_colon(inner) {
+        return Ok(SlotRef {
+            name: body.to_string(),
+            args: Vec::new(),
+        });
+    }
+    let name = body[..open].to_string();
+    if name.is_empty() {
+        return Err(TemplateError::MalformedSlotArgs(
+            "slot name before `(` is empty".to_string(),
+        ));
+    }
+    let args = parse_slot_args(inner)?;
+    Ok(SlotRef { name, args })
+}
+
+/// Locates the opening index of a trailing, balanced top-level `(...)` group
+/// that spans to the end of `body`, or `None` if the body has no such tail.
+fn find_arg_paren(body: &str) -> Option<usize> {
+    if !body.ends_with(')') {
+        return None;
+    }
+    // Walk backward, matching the trailing `)` to its `(`.
+    let bytes = body.as_bytes();
+    let mut depth: usize = 0;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `s` contains a `:` outside any nested `{...}` or `(...)` group — the
+/// marker that a parenthesized tail is an argument list rather than a closed
+/// helper call. Nested-group `:`s (inside an arg value's `{sub:proj}`) are
+/// ignored.
+fn has_top_level_colon(s: &str) -> bool {
+    let mut brace: usize = 0;
+    let mut paren: usize = 0;
+    for c in s.chars() {
+        match c {
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            ':' if brace == 0 && paren == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Parses the inner text of an argument list (`argname: value, ...`) into
+/// `(argname, value-template)` pairs. Splitting on top-level `,` and `:` honors
+/// nested `{...}`/`(...)` groups so an arg value may itself contain commas,
+/// colons, and nested slots.
+///
+/// # Errors
+///
+/// [`TemplateError::MalformedSlotArgs`] on an empty arg name, a segment with no
+/// `:`, or a value that fails to parse as a template.
+fn parse_slot_args(inner: &str) -> Result<Vec<(String, Template)>, TemplateError> {
+    let mut args = Vec::new();
+    for segment in split_top_level(inner, ',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            return Err(TemplateError::MalformedSlotArgs(
+                "empty argument segment (stray comma?)".to_string(),
+            ));
+        }
+        let Some((arg_name, value)) = split_once_top_level(segment, ':') else {
+            return Err(TemplateError::MalformedSlotArgs(format!(
+                "argument `{segment}` is missing a `name: value` label"
+            )));
+        };
+        let arg_name = arg_name.trim();
+        let value = value.trim();
+        if !is_bare_identifier(arg_name) {
+            return Err(TemplateError::MalformedSlotArgs(format!(
+                "argument name `{arg_name}` is not a bare identifier"
+            )));
+        }
+        let value_template = Template::parse(value)?;
+        args.push((arg_name.to_string(), value_template));
+    }
+    if args.is_empty() {
+        return Err(TemplateError::MalformedSlotArgs(
+            "empty argument list".to_string(),
+        ));
+    }
+    Ok(args)
+}
+
+/// Splits `s` on top-level occurrences of `sep` (outside any `{...}`/`(...)`),
+/// returning the segments in order.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut brace: usize = 0;
+    let mut paren: usize = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            _ if c == sep && brace == 0 && paren == 0 => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Splits `s` on the FIRST top-level occurrence of `sep` (outside any
+/// `{...}`/`(...)`), returning the two sides, or `None` if `sep` never appears
+/// at top level.
+fn split_once_top_level(s: &str, sep: char) -> Option<(&str, &str)> {
+    let mut brace: usize = 0;
+    let mut paren: usize = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            _ if c == sep && brace == 0 && paren == 0 => {
+                return Some((&s[..i], &s[i + c.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `s` is a non-empty bare identifier — no `:`, `(`, `)`, `{`, `}`, `,`,
+/// or whitespace. Only bare identifiers can be argument names (so an argument
+/// reference `{name}` is unambiguous) and can be looked up as pushed args.
+fn is_bare_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && !s.chars().any(|c| {
+            c.is_whitespace() || matches!(c, ':' | '(' | ')' | '{' | '}' | ',')
+        })
+}
+
 /// Splits a slot reference into its base name and an optional projected item
 /// slot, on the FIRST `:`.
 ///
@@ -376,6 +700,30 @@ pub trait SlotResolver {
 
     /// Renders the slot named `name` into a [`Rendered`] fragment.
     fn resolve(&mut self, name: &str) -> Result<Rendered, Self::Error>;
+
+    /// Pushes a frame of caller-supplied named arguments onto the resolver's
+    /// argument stack, in effect for the duration of resolving one
+    /// argument-bearing slot reference and its nested sub-renders.
+    ///
+    /// The default is a no-op: a resolver that does not participate in argument
+    /// passing (e.g. a simple test resolver) simply ignores pushed args, and a
+    /// `{argname}` reference then falls through to normal slot resolution. Real
+    /// resolvers override this (and [`resolve_arg`](SlotResolver::resolve_arg) /
+    /// [`pop_args`](SlotResolver::pop_args)) to store the frame on the shared
+    /// render state so it is visible to every nested resolver.
+    fn push_args(&mut self, _args: Vec<(String, Rendered)>) {}
+
+    /// Pops the most recently pushed argument frame. Paired with
+    /// [`push_args`](SlotResolver::push_args); the default is a no-op.
+    fn pop_args(&mut self) {}
+
+    /// Looks up a caller-supplied argument by `name`, returning its
+    /// already-rendered value if one is in scope (innermost frame wins, so a
+    /// deeper passed arg shadows a shallower one). The default returns `None`,
+    /// so a bare `{name}` reference falls through to normal slot resolution.
+    fn resolve_arg(&mut self, _name: &str) -> Option<Rendered> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -527,5 +875,276 @@ mod tests {
             parse_slot_projection("fresh_name(loop, w)"),
             ("fresh_name(loop, w)", None)
         );
+    }
+
+    // ---- Slot arguments `{name(arg: value, ...)}` ----
+
+    /// An argument-aware resolver: a stack of `(name -> text)` frames, plus a
+    /// base map for normal slots. Mirrors how the real emitter delegates the
+    /// three trait methods to the shared unit index.
+    struct ArgResolver {
+        base: std::collections::HashMap<String, String>,
+        frames: Vec<Vec<(String, Rendered)>>,
+    }
+
+    impl ArgResolver {
+        fn new(pairs: &[(&str, &str)]) -> Self {
+            ArgResolver {
+                base: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                frames: Vec::new(),
+            }
+        }
+    }
+
+    impl SlotResolver for ArgResolver {
+        type Error = String;
+        fn resolve(&mut self, name: &str) -> Result<Rendered, String> {
+            self.base
+                .get(name)
+                .map(|s| Rendered::text(s.clone()))
+                .ok_or_else(|| format!("no slot {name}"))
+        }
+        fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+            self.frames.push(args);
+        }
+        fn pop_args(&mut self) {
+            self.frames.pop();
+        }
+        fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+            self.frames
+                .iter()
+                .rev()
+                .find_map(|f| f.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+        }
+    }
+
+    #[test]
+    fn no_arg_slot_parses_with_empty_args() {
+        // Every existing form parses to a SlotRef with empty args (byte-compat).
+        let t = Template::parse("{name}").expect("parse");
+        assert_eq!(
+            t.parts,
+            vec![TemplatePart::Slot(SlotRef {
+                name: "name".to_string(),
+                args: Vec::new(),
+            })]
+        );
+    }
+
+    #[test]
+    fn helper_call_without_colon_stays_a_plain_name() {
+        // `escape(x, c)` / `field_type(a, b)` have no top-level `:`, so they are
+        // NOT treated as the arg form: the whole text is the slot name.
+        for form in ["escape(value, c)", "field_type(Point, x)", "resolve_fnptr(v)"] {
+            let t = Template::parse(&format!("{{{form}}}")).expect("parse");
+            assert_eq!(t.slot_names(), vec![form]);
+        }
+    }
+
+    #[test]
+    fn arg_slot_parses_name_and_values() {
+        // `{type(name: {name})}` -> slot "type" with one arg "name" = `{name}`.
+        let t = Template::parse("{type(name: {name})}").expect("parse");
+        match &t.parts[0] {
+            TemplatePart::Slot(s) => {
+                assert_eq!(s.name, "type");
+                assert_eq!(s.args.len(), 1);
+                assert_eq!(s.args[0].0, "name");
+                assert_eq!(s.args[0].1.slot_names(), vec!["name"]);
+            }
+            other => panic!("expected slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arg_reference_resolves_and_shadows() {
+        // Directly exercise resolve_slot semantics: a passed arg is visible as
+        // `{argname}` and SHADOWS a same-named base slot during the sub-render.
+        // Template: `{callee(name: {name})}` where base has name="OUTER" and
+        // callee="<{name}>". The arg `name` = caller's `{name}` = "OUTER"; but
+        // to prove shadowing we give the CALLEE a different base `name`.
+        //
+        // We model the callee as a template by having `resolve("callee")` render
+        // a sub-template through the SAME resolver.
+        struct NestingResolver {
+            frames: Vec<Vec<(String, Rendered)>>,
+        }
+        impl SlotResolver for NestingResolver {
+            type Error = String;
+            fn resolve(&mut self, name: &str) -> Result<Rendered, String> {
+                match name {
+                    // The callee references `{name}` — which must resolve to the
+                    // PUSHED arg (shadowing), not this base value.
+                    "callee" => Template::parse("<{name}>")
+                        .map_err(|e| e.to_string())?
+                        .render(self),
+                    "name" => Ok(Rendered::text("BASE")),
+                    "outer_name" => Ok(Rendered::text("OUTER")),
+                    other => Err(format!("no slot {other}")),
+                }
+            }
+            fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+                self.frames.push(args);
+            }
+            fn pop_args(&mut self) {
+                self.frames.pop();
+            }
+            fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+                self.frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+            }
+        }
+
+        // Pass `name: {outer_name}` -> the arg value renders in the CALLER scope
+        // to "OUTER"; inside `callee`, `{name}` resolves to the pushed "OUTER"
+        // (shadowing the base "BASE").
+        let t = Template::parse("{callee(name: {outer_name})}").expect("parse");
+        let mut r = NestingResolver { frames: Vec::new() };
+        let out = t.render(&mut r).expect("render");
+        assert_eq!(out.text, "<OUTER>");
+        // After rendering, the frame is popped: a bare `{name}` now sees BASE.
+        let t2 = Template::parse("{name}").expect("parse");
+        assert_eq!(t2.render(&mut r).expect("render").text, "BASE");
+    }
+
+    #[test]
+    fn args_propagate_to_nested_sub_renders() {
+        // An arg pushed at the outer invocation stays visible through a nested
+        // sub-render (the callee renders another slot that references the arg).
+        struct DeepResolver {
+            frames: Vec<Vec<(String, Rendered)>>,
+        }
+        impl SlotResolver for DeepResolver {
+            type Error = String;
+            fn resolve(&mut self, name: &str) -> Result<Rendered, String> {
+                match name {
+                    "outer" => Template::parse("[{inner}]")
+                        .map_err(|e| e.to_string())?
+                        .render(self),
+                    // `inner` references `{tag}` which was passed to `outer` two
+                    // levels up — it must still be in scope here.
+                    "inner" => Template::parse("{tag}")
+                        .map_err(|e| e.to_string())?
+                        .render(self),
+                    "src" => Ok(Rendered::text("T")),
+                    other => Err(format!("no slot {other}")),
+                }
+            }
+            fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+                self.frames.push(args);
+            }
+            fn pop_args(&mut self) {
+                self.frames.pop();
+            }
+            fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+                self.frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+            }
+        }
+        let t = Template::parse("{outer(tag: {src})}").expect("parse");
+        let mut r = DeepResolver { frames: Vec::new() };
+        assert_eq!(t.render(&mut r).expect("render").text, "[T]");
+    }
+
+    #[test]
+    fn unpassed_arg_reference_falls_through_to_resolver_error() {
+        // A `{arg}` reference with no arg in scope and no base slot is a normal
+        // unknown-slot error from the resolver (clean render-time error).
+        let t = Template::parse("{missing}").expect("parse");
+        let mut r = ArgResolver::new(&[]);
+        assert_eq!(t.render(&mut r), Err("no slot missing".to_string()));
+    }
+
+    #[test]
+    fn arg_value_renders_in_caller_scope_not_callee() {
+        // The arg VALUE is rendered in the caller's scope. Prove it with a
+        // resolver where `echo` renders `{v}` and the value references a
+        // caller-only base slot `{caller_only}`.
+        let t = Template::parse("{echo(v: {caller_only})}").expect("parse");
+        struct Echo {
+            frames: Vec<Vec<(String, Rendered)>>,
+            base: std::collections::HashMap<String, String>,
+        }
+        impl SlotResolver for Echo {
+            type Error = String;
+            fn resolve(&mut self, name: &str) -> Result<Rendered, String> {
+                if name == "echo" {
+                    return Template::parse("{v}").map_err(|e| e.to_string())?.render(self);
+                }
+                self.base
+                    .get(name)
+                    .map(|s| Rendered::text(s.clone()))
+                    .ok_or_else(|| format!("no slot {name}"))
+            }
+            fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+                self.frames.push(args);
+            }
+            fn pop_args(&mut self) {
+                self.frames.pop();
+            }
+            fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+                self.frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+            }
+        }
+        let mut e = Echo {
+            frames: Vec::new(),
+            base: [("caller_only".to_string(), "CV".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(t.render(&mut e).expect("render").text, "CV");
+    }
+
+    #[test]
+    fn rejects_malformed_arg_list() {
+        // A parenthesized tail with a top-level `:` but a bad body is an error.
+        assert!(matches!(
+            Template::parse("{t(: v)}"),
+            Err(TemplateError::MalformedSlotArgs(_))
+        ));
+        // No colon at all -> treated as a plain helper name, NOT an error.
+        assert!(Template::parse("{t(a v)}").is_ok());
+        assert!(matches!(
+            Template::parse("{(a: v)}"),
+            Err(TemplateError::MalformedSlotArgs(_))
+        ));
+    }
+
+    #[test]
+    fn arg_value_may_contain_commas_and_nested_slots() {
+        // Splitting honors nested `{...}`/`(...)`, so an arg value with a comma
+        // inside a nested group stays one value.
+        let t = Template::parse("{f(a: {g(x: {y}, z: {w})})}").expect("parse");
+        match &t.parts[0] {
+            TemplatePart::Slot(s) => {
+                assert_eq!(s.name, "f");
+                assert_eq!(s.args.len(), 1);
+                assert_eq!(s.args[0].0, "a");
+            }
+            other => panic!("expected slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_args_parse_in_order() {
+        let t = Template::parse("{f(a: {x}, b: {y})}").expect("parse");
+        match &t.parts[0] {
+            TemplatePart::Slot(s) => {
+                assert_eq!(s.args.len(), 2);
+                assert_eq!(s.args[0].0, "a");
+                assert_eq!(s.args[1].0, "b");
+            }
+            other => panic!("expected slot, got {other:?}"),
+        }
     }
 }

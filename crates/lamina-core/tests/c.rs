@@ -410,9 +410,8 @@ fn cast_renders_as_c_prefix() {
 #[test]
 fn array_literal_and_index_render() {
     // An array *literal* and indexing are valid C: `{10, 20, 30}` and `arr[1]`.
-    // NOTE: the array *type* in a `let` declarator is a documented C blocker
-    // (see `array_type_declarator_is_a_c_blocker`), so this test exercises the
-    // literal as an expression-statement and the index form separately.
+    // (The array *type* in a declarator is handled separately by
+    // `array_type_declarator_renders_valid_c`.)
     let arr = Expr::ArrayLit {
         elems: vec![int("10"), int("20"), int("30")],
         meta: Meta::new(),
@@ -434,18 +433,13 @@ fn array_literal_and_index_render() {
 }
 
 #[test]
-fn array_type_declarator_is_a_c_blocker() {
-    // KERNEL BLOCKER (documented): C's array declarator is POSTFIX around the
-    // NAME (`int32_t arr[3]`), but the kernel renders a type in isolation and
-    // the `let`/`param`/`field` slots place the rendered type BEFORE the name
-    // (`{type} {name}`). The `### array` type slot can only produce
-    // `int32_t[3]`, yielding the INVALID C `int32_t[3] arr`. The kernel has no
-    // "declarator" seam that interleaves the name into the type spelling, so a
-    // C array-typed binding cannot be rendered as valid C by a language
-    // definition alone. This test PINS the current (invalid-C) output so the
-    // limitation is visible and tracked; it is NOT an endorsement of the
-    // output as correct C. A layer would emit such a binding via a raw
-    // statement instead.
+fn array_type_declarator_renders_valid_c() {
+    // BLOCKER #1 FIXED: C's array declarator is POSTFIX around the NAME
+    // (`int32_t arr[3]`). The slot-argument declarator seam lets the `let`
+    // binding inject its NAME into the type via `{let_type(name: {name})}`, and
+    // the `### array` type slot weaves that name into the C declarator. So an
+    // array-typed binding now renders VALID, idiomatic C (hand-verified) rather
+    // than the previously-invalid `int32_t[3] arr`.
     let assign_arr = Statement::Let {
         name: "arr".to_string(),
         ty: Some(Type::Array {
@@ -463,11 +457,72 @@ fn array_type_declarator_is_a_c_blocker() {
         Type::Primitive(Primitive::Void),
         vec![assign_arr],
     );
-    // `int32_t[3] arr` is INVALID C (should be `int32_t arr[3]`) — pinned to
-    // document the blocker.
+    // `int32_t arr[3] = {10, 20, 30};` is VALID C — the declarator name is woven
+    // into the array type by the slot-argument seam.
     assert_eq!(
         emit_ok(vec![f], &c()),
-        "void arrf() {\n    int32_t[3] arr = {10, 20, 30};\n}"
+        "void arrf() {\n    int32_t arr[3] = {10, 20, 30};\n}"
+    );
+}
+
+#[test]
+fn array_typed_param_renders_valid_c() {
+    // An array-typed PARAMETER also weaves the name into the declarator:
+    // `int32_t xs[3]` (valid C), via the `param` slot's `{type(name: {name})}`.
+    let f = func(
+        "sum",
+        vec![param(
+            "xs",
+            Type::Array {
+                elem: Box::new(i32t()),
+                len: Some("3".to_string()),
+            },
+        )],
+        i32t(),
+        vec![Statement::Return(Some(int("0")))],
+    );
+    assert_eq!(
+        emit_ok(vec![f], &c()),
+        "int32_t sum(int32_t xs[3]) {\n    return 0;\n}"
+    );
+}
+
+#[test]
+fn fn_pointer_typed_param_renders_valid_c() {
+    // A function-pointer PARAMETER weaves the name INSIDE the `(*name)` group —
+    // C's postfix-around-the-name fn-pointer declarator. `int (*op)(int)` is
+    // valid C (hand-verified). Here the fnptr is `i32 (*)(i32)`.
+    let fnptr = Type::FnPtr {
+        params: vec![i32t()],
+        ret: Box::new(i32t()),
+    };
+    let f = func(
+        "apply",
+        vec![param("op", fnptr)],
+        i32t(),
+        vec![Statement::Return(Some(int("0")))],
+    );
+    assert_eq!(
+        emit_ok(vec![f], &c()),
+        "int32_t apply(int32_t (*op)(int32_t)) {\n    return 0;\n}"
+    );
+}
+
+#[test]
+fn fn_pointer_typedef_renders_bare_type_woven_name() {
+    // A `typedef` to a function-pointer type is itself a declarator: the alias
+    // NAME sits inside `(*Name)`. `typedef int32_t (*Op)(int32_t);` is valid C.
+    let td = Item::TypeDef {
+        name: "Op".to_string(),
+        target: Type::FnPtr {
+            params: vec![i32t()],
+            ret: Box::new(i32t()),
+        },
+        meta: Meta::new(),
+    };
+    assert_eq!(
+        emit_ok(vec![td], &c()),
+        "typedef int32_t (*Op)(int32_t);"
     );
 }
 
@@ -610,13 +665,14 @@ fn typedef_const_and_use_render() {
 
 #[test]
 fn pointer_typedef_renders() {
-    // typedef int32_t * IntPtr;
+    // typedef int32_t *IntPtr;  (the alias name is woven into the pointer
+    // declarator via the slot-argument seam — valid, idiomatic C.)
     let td = Item::TypeDef {
         name: "IntPtr".to_string(),
         target: Type::Pointer(Box::new(i32t())),
         meta: Meta::new(),
     };
-    assert_eq!(emit_ok(vec![td], &c()), "typedef int32_t * IntPtr;");
+    assert_eq!(emit_ok(vec![td], &c()), "typedef int32_t *IntPtr;");
 }
 
 // ---- multiple items: blank-line separated --------------------------------

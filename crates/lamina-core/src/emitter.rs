@@ -795,6 +795,16 @@ impl<'a> SlotResolver for ItemResolver<'a> {
             }
         }
     }
+
+    fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+        self.index.push_args(args);
+    }
+    fn pop_args(&mut self) {
+        self.index.pop_args();
+    }
+    fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+        self.index.lookup_arg(name)
+    }
 }
 
 /// What the resolver is currently rendering: the function as a whole, or one
@@ -994,6 +1004,16 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
                 self.render_named_slot(base)
             }
         }
+    }
+
+    fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+        self.index.push_args(args);
+    }
+    fn pop_args(&mut self) {
+        self.index.pop_args();
+    }
+    fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+        self.index.lookup_arg(name)
     }
 }
 
@@ -1462,6 +1482,16 @@ impl<'a> SlotResolver for StmtResolver<'a> {
                 self.render_named_slot(base)
             }
         }
+    }
+
+    fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+        self.index.push_args(args);
+    }
+    fn pop_args(&mut self) {
+        self.index.pop_args();
+    }
+    fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+        self.index.lookup_arg(name)
     }
 }
 
@@ -2547,6 +2577,16 @@ impl<'a> SlotResolver for ExprResolver<'a> {
             }
         }
     }
+
+    fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+        self.index.push_args(args);
+    }
+    fn pop_args(&mut self) {
+        self.index.pop_args();
+    }
+    fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+        self.index.lookup_arg(name)
+    }
 }
 
 impl<'a> ExprResolver<'a> {
@@ -2661,8 +2701,11 @@ impl<'a> ExprResolver<'a> {
 ///   [`SlotScope::Type`].
 fn resolve_type(ty: &Type, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
     match ty {
-        Type::Primitive(primitive) => resolve_primitive(*primitive, lang).map(Rendered::text),
-        Type::Named(name) => Ok(Rendered::text(name.clone())),
+        Type::Primitive(primitive) => {
+            let base = resolve_primitive(*primitive, lang)?;
+            Ok(apply_declarator_name(Rendered::text(base), index))
+        }
+        Type::Named(name) => Ok(apply_declarator_name(Rendered::text(name.clone()), index)),
         Type::Pointer(_) => {
             // A pointer is only expressible where the `ptr` primitive is not
             // forbidden.
@@ -2682,6 +2725,38 @@ fn resolve_type(ty: &Type, lang: &LanguageDef, index: &UnitIndex) -> Result<Rend
             let has_len = len.is_some();
             render_array_type(ty, has_len, lang, index)
         }
+    }
+}
+
+/// The name a caller injected for a **declarator** binding, if any: the
+/// rendered value of the `name` argument currently in scope (pushed by a
+/// binding slot writing `{type(name: {name})}`). This is the seam that lets a
+/// language definition interleave a binding's name into its type spelling — the
+/// C array/fn-pointer declarator problem (`int32_t arr[3]`, `int (*fp)(int)`).
+///
+/// It is exposed here (and consumed by [`apply_declarator_name`] for the
+/// no-slot primitive/named types, and via the `has_arg(name)` fact + `{name}`
+/// reference for the compound `### pointer`/`### array`/`### fnptr` slots) so a
+/// non-declarator position (a return type, a cast, a type argument) — which
+/// passes no `name` — renders the bare type exactly as before.
+const DECLARATOR_ARG: &str = "name";
+
+/// Appends a C-style declarator name to a no-slot type spelling
+/// (`int32_t` → `int32_t arr`) when a `name` declarator argument is in scope.
+/// A primitive or named type has no `### <slot>` to weave the name into, so the
+/// (universal `type name`) composition is done here; compound types
+/// (pointer/array/fn-pointer) instead weave `{name}` inside their own slot
+/// templates, branching on `has_arg(name)`. With no declarator argument in
+/// scope (a non-binding position) the type is returned unchanged.
+fn apply_declarator_name(base: Rendered, index: &UnitIndex) -> Rendered {
+    match index.lookup_arg(DECLARATOR_ARG) {
+        Some(name) if !name.text.is_empty() => {
+            let mut out = base;
+            out.push_str(" ");
+            out.push(name);
+            out
+        }
+        _ => base,
     }
 }
 
@@ -2717,7 +2792,13 @@ fn render_type_slot(
         lang,
         index,
         scope: TypeScope::Compound,
-        ctx: RenderContext::default(),
+        ctx: RenderContext {
+            // Snapshot the in-scope caller-argument names so a compound type
+            // slot (`### fnptr`) can branch on `has_arg(name)` — the declarator
+            // seam that weaves a binding's name into the type spelling.
+            arg_names: index.arg_names(),
+            ..Default::default()
+        },
     };
     resolver.render_named_slot(slot)
 }
@@ -2739,6 +2820,9 @@ fn render_array_type(
         scope: TypeScope::Compound,
         ctx: RenderContext {
             has_len,
+            // Snapshot in-scope argument names so the `### array` slot can
+            // branch on `has_arg(name)` for the declarator form.
+            arg_names: index.arg_names(),
             ..Default::default()
         },
     };
@@ -2814,14 +2898,14 @@ impl<'a> TypeResolver<'a> {
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
         match (&self.scope, name) {
             (TypeScope::Compound, "pointee") => match self.ty {
-                Type::Pointer(inner) => resolve_type(inner, self.lang, self.index),
+                Type::Pointer(inner) => self.resolve_nested_type(inner),
                 _ => Err(EmitError::UnknownSlot {
                     target: self.lang.name.clone(),
                     slot: name.to_string(),
                 }),
             },
             (TypeScope::Compound, "ret") => match self.ty {
-                Type::FnPtr { ret, .. } => resolve_type(ret, self.lang, self.index),
+                Type::FnPtr { ret, .. } => self.resolve_nested_type(ret),
                 _ => Err(EmitError::UnknownSlot {
                     target: self.lang.name.clone(),
                     slot: name.to_string(),
@@ -2829,7 +2913,7 @@ impl<'a> TypeResolver<'a> {
             },
             // An array type's element type and its textual length.
             (TypeScope::Compound, "elem") => match self.ty {
-                Type::Array { elem, .. } => resolve_type(elem, self.lang, self.index),
+                Type::Array { elem, .. } => self.resolve_nested_type(elem),
                 _ => Err(EmitError::UnknownSlot {
                     target: self.lang.name.clone(),
                     slot: name.to_string(),
@@ -2846,12 +2930,29 @@ impl<'a> TypeResolver<'a> {
                     slot: name.to_string(),
                 }),
             },
-            (TypeScope::Param(elem), "type") => resolve_type(elem, self.lang, self.index),
+            (TypeScope::Param(elem), "type") => self.resolve_nested_type(elem),
             _ => Err(EmitError::UnknownSlot {
                 target: self.lang.name.clone(),
                 slot: name.to_string(),
             }),
         }
+    }
+
+    /// Resolves a NESTED type (an element/pointee/return/parameter type) with
+    /// the declarator `name` argument SHADOWED to empty, so a binding name
+    /// injected for the OUTER type (`{type(name: {name})}`) applies exactly once
+    /// — woven into the outer compound spelling by its `### <slot>` template —
+    /// and never leaks into the inner types (which are non-declarator
+    /// positions). The compound slot itself has already consumed `{name}` in its
+    /// own template scope before this nested render runs.
+    fn resolve_nested_type(&self, inner: &Type) -> Result<Rendered, EmitError> {
+        // Shadow the outer declarator name with an empty frame for the duration
+        // of the nested render.
+        self.index
+            .push_args(vec![(DECLARATOR_ARG.to_string(), Rendered::empty())]);
+        let result = resolve_type(inner, self.lang, self.index);
+        self.index.pop_args();
+        result
     }
 
     /// Loops a function pointer's parameter types, rendering `item_slot` per
@@ -2963,6 +3064,16 @@ impl<'a> SlotResolver for TypeResolver<'a> {
                 self.render_named_slot(base)
             }
         }
+    }
+
+    fn push_args(&mut self, args: Vec<(String, Rendered)>) {
+        self.index.push_args(args);
+    }
+    fn pop_args(&mut self) {
+        self.index.pop_args();
+    }
+    fn resolve_arg(&mut self, name: &str) -> Option<Rendered> {
+        self.index.lookup_arg(name)
     }
 }
 

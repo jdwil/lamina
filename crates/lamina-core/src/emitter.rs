@@ -684,6 +684,10 @@ impl<'a> ItemResolver<'a> {
                 last: i + 1 == len,
                 index: i,
                 meta: field.meta.clone(),
+                // The payload field's declared type is in scope, so `type is
+                // <class>` answers its category (payload fields reuse the field
+                // element scope).
+                type_class: Some(field.ty.class()),
                 ..Default::default()
             };
             let mut elem = ItemResolver {
@@ -720,6 +724,10 @@ impl<'a> ItemResolver<'a> {
                 last: i + 1 == len,
                 index: i,
                 meta: field.meta.clone(),
+                // The field's declared type is in scope here, so the closed
+                // `type is <class>` fact answers its category for type-directed
+                // dispatch (e.g. picking a `printf` specifier per field).
+                type_class: Some(field.ty.class()),
                 ..Default::default()
             };
             let mut elem = ItemResolver {
@@ -926,6 +934,13 @@ impl<'a> FunctionResolver<'a> {
             elem_ctx.meta = match &scope {
                 Scope::Param(p) => p.meta.clone(),
                 Scope::Function => crate::ast::Meta::new(),
+            };
+            // The parameter's declared type is in scope in the `param` element
+            // scope, so `type is <class>` answers its category for type-directed
+            // dispatch; the function scope itself has no single type in scope.
+            elem_ctx.type_class = match &scope {
+                Scope::Param(p) => Some(p.ty.class()),
+                Scope::Function => None,
             };
 
             let mut elem_resolver = FunctionResolver {

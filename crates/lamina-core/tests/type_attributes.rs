@@ -227,11 +227,52 @@ fn ts_struct_equatable_generates_field_wise_eq_fn() {
 }
 
 #[test]
+fn ts_struct_displayable_generates_to_string_fn() {
+    // A TS `displayable` struct generates a field-wise
+    // `function Point_toString(a: Point): string` using a template string
+    // (Blocker #D), emitted above the interface. A primitive field interpolates
+    // honestly via `${…}`. Hand-verified valid, idiomatic TypeScript.
+    let item = point_struct(vec![TypeAttribute::Displayable], Visibility::Public);
+    let out = emit_one(item, &ts()).expect("emit");
+    assert_eq!(
+        out,
+        "function Point_toString(a: Point): string {\n    \
+         return `Point { x = ${a.x}, y = ${a.y} }`;\n}\n\
+         export interface Point {\n    x: number;\n    y: number;\n}",
+        "got: {out}"
+    );
+}
+
+#[test]
+fn ts_struct_displayable_named_field_is_forbidden() {
+    // A `named` field would interpolate to the useless `[object Object]`, and a
+    // cross-type `_toString` availability check is out of scope for #D, so a
+    // named field forbids the printer (mirroring C's escalated decision).
+    let item = Item::Struct {
+        name: "Wrap".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![Field {
+            name: "inner".to_string(),
+            ty: lamina_core::ast::Type::Named("Point".to_string()),
+            visibility: Visibility::Public,
+            meta: lamina_core::ast::Meta::new(),
+        }],
+        attributes: vec![TypeAttribute::Displayable],
+        meta: lamina_core::ast::Meta::new(),
+    };
+    let err = emit_one(item, &ts()).expect_err("named field forbidden in TS toString");
+    assert!(
+        matches!(err, EmitError::ForbiddenConstruct { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
 fn ts_struct_non_equatable_attributes_are_forbidden() {
-    // Only `equatable` has a clean field-wise TS form; every other attribute is
-    // a clean ForbiddenConstruct (see typescript.mdl `## Struct` prose).
+    // `equatable` and `displayable` have clean field-wise TS forms; every other
+    // attribute is a clean ForbiddenConstruct (see typescript.mdl `## Struct`
+    // prose).
     for attr in [
-        TypeAttribute::Displayable,
         TypeAttribute::Comparable,
         TypeAttribute::Hashable,
         TypeAttribute::Cloneable,

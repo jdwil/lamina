@@ -219,6 +219,15 @@ pub struct RenderContext {
     /// `None` when the node being rendered is not a single type-attribute
     /// element.
     pub attribute: Option<crate::ast::TypeAttribute>,
+    /// Answers `type is <class>` — the closed [`TypeClass`](crate::ast::TypeClass)
+    /// of the type currently in scope for rendering (a field's declared type in
+    /// the field element scope, a parameter's type in the param element scope).
+    /// `None` when the node being rendered has no single classifiable type in
+    /// scope. This is the closed type-directed-dispatch fact: a definition
+    /// branches on the class (`type is signed_int -> "%d"`) to pick a per-type
+    /// spelling, without any scripting surface — the engine owns the closed
+    /// vocabulary via [`TypeClass::all`](crate::ast::TypeClass::all).
+    pub type_class: Option<crate::ast::TypeClass>,
     /// Answers `value is <kind>` — the [`ExprKind`] of the current node's
     /// direct `value` sub-part (Part 2, one-level structural predicate). Set
     /// when the node being rendered has a `value` sub-expression (an `assign`'s
@@ -618,6 +627,15 @@ impl RenderContext {
                     .unwrap_or(false)
                     && type_attribute_is_known(name)
             }
+            // Type-class dispatch: `type is <class>`. The value must be a known
+            // class spelling and match the type currently in scope for
+            // rendering (a field's or parameter's declared type).
+            ("type", Some(class)) => {
+                self.type_class
+                    .map(|c| c.as_str() == class)
+                    .unwrap_or(false)
+                    && type_class_is_known(class)
+            }
             // One-level structural sub-part kind query: `value is <kind>` — the
             // dispatch kind of the current node's direct `value` sub-part.
             ("value", Some(kind)) if fact.eq.is_none() => {
@@ -757,6 +775,15 @@ fn type_attribute_is_known(name: &str) -> bool {
     crate::ast::TypeAttribute::from_name(name).is_some()
 }
 
+/// Returns `true` if `class` is a known `type is <class>` value spelling. Keeps
+/// the closed type-class fact vocabulary in one place, shared by
+/// [`RenderContext::eval_fact`] and [`validate_fact`], delegating to the
+/// [`TypeClass`](crate::ast::TypeClass) vocabulary so an unknown class spelling
+/// is a load-time error.
+fn type_class_is_known(class: &str) -> bool {
+    crate::ast::TypeClass::from_name(class).is_some()
+}
+
 /// Validates that a fact is part of the closed registry. Used at parse time so
 /// a malformed `When` predicate fails loudly rather than silently evaluating to
 /// `false`.
@@ -814,6 +841,10 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // vocabulary; an unknown attribute value is rejected at parse time.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("attr", Some(k)) if type_attribute_is_known(k));
+    // `type is <class>` is validated against the closed type-class vocabulary;
+    // an unknown class value is rejected at parse time.
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("type", Some(k)) if type_class_is_known(k));
     // `value is <kind>` — one-level sub-part kind query — is validated against
     // the closed expression-kind vocabulary (and must not be an `eq` query).
     let known = known
@@ -1778,6 +1809,65 @@ mod tests {
         assert!(c.eval(&p));
         let c2 = RenderContext {
             attribute: Some(crate::ast::TypeAttribute::Displayable),
+            first: false,
+            ..Default::default()
+        };
+        assert!(!c2.eval(&p));
+    }
+
+    #[test]
+    fn type_class_all_values_parse_and_dispatch() {
+        // Every closed `type is <class>` spelling parses and evaluates true when
+        // the matching class is in scope.
+        for class in crate::ast::TypeClass::all() {
+            let name = class.as_str();
+            let p = parse_predicate(&format!("type is {name}"))
+                .unwrap_or_else(|e| panic!("`type is {name}` should parse: {e:?}"));
+            let c = RenderContext {
+                type_class: Some(class),
+                ..Default::default()
+            };
+            assert!(c.eval(&p), "`type is {name}` should hold for {class:?}");
+            // And it must NOT hold for a different class in scope.
+            let other = if class == crate::ast::TypeClass::SignedInt {
+                crate::ast::TypeClass::Float
+            } else {
+                crate::ast::TypeClass::SignedInt
+            };
+            let c2 = RenderContext {
+                type_class: Some(other),
+                ..Default::default()
+            };
+            assert!(!c2.eval(&p), "`type is {name}` should not hold for {other:?}");
+        }
+    }
+
+    #[test]
+    fn type_class_absent_is_false() {
+        // With no type in scope, `type is <class>` is false (not an error).
+        let p = parse_predicate("type is signed_int").expect("parse");
+        assert!(!ctx().eval(&p));
+    }
+
+    #[test]
+    fn rejects_unknown_type_class_value() {
+        // An unknown class spelling is a LOAD-TIME (parse-time) error.
+        let err = parse_predicate("type is complex").expect_err("unknown class");
+        assert!(matches!(err, PredicateError::UnknownFact { .. }));
+    }
+
+    #[test]
+    fn type_class_composes_with_loop_facts() {
+        // The C printer idiom composes `type is <class>` with other facts.
+        let p = parse_predicate("type is float && first").expect("parse");
+        let c = RenderContext {
+            type_class: Some(crate::ast::TypeClass::Float),
+            first: true,
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        let c2 = RenderContext {
+            type_class: Some(crate::ast::TypeClass::Float),
             first: false,
             ..Default::default()
         };

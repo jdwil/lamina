@@ -504,6 +504,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `has_ret_type` | bool | (`expr is lambda`) the lambda being rendered declares an explicit return type — lets a target render the return-type annotation conditionally |
 | `body is single` / `body is block` | enum | (`expr is lambda`) the **cardinality** of the lambda body: `single` when it is exactly one value-producing statement (a bare expression-statement or a value `return`), so a target can spell it inline (`lambda x: expr`, `|x| expr`); `block` otherwise (zero, two-or-more, or a single non-value statement), so an expression-only / lambda-less target must **hoist** it to a named function. A closed engine-derived fact — the definition may only branch on the two values, never inspect the body further |
 | `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`displayable` `equatable` `comparable` `hashable` `cloneable` `copyable` `hasdefault` `iterable`) |
+| `type is <class>` | enum | (wherever a type is in scope for rendering — a field's type in the field element scope, a parameter's type in the param element scope) the **closed classification** of that type: `signed_int` `unsigned_int` `float` `bool` `char` `string` `bytes` `unit` `never` `ptr` `fnptr` `named` `array`. A total, engine-computed classification over the frozen `Type`/`Primitive` set (every primitive and every `Type` variant maps to exactly one class); an unknown class spelling is a load-time error. Lets a def do **type-directed dispatch** — pick a `printf` specifier, a hash step, a serializer form — from a closed vocabulary with no scripting surface. See [Type Classification](#type-classification-type-is-class) |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
 | `target eq value.lhs` | bool | (one-level structural) the current node's `target` sub-part is structurally equal to its `value` sub-part's left operand |
@@ -548,6 +549,55 @@ increment (`i = i + 1` → `i++`).
 | stmt is assign && value is binary && value.op is add && target eq value.lhs | "{target} += {value.rhs};" |
 | stmt is assign                                                              | "{target} = {value};" |
 ```
+
+### Type Classification (`type is <class>`)
+
+A language definition can do **type-directed dispatch** — pick a per-type
+spelling from a type's *category* — via the closed `type is <class>` fact,
+mirroring the closed-dispatch pattern of `expr is <kind>` / `stmt is <kind>`.
+Wherever a type is in scope for rendering (a field's declared type in the field
+element scope, a parameter's type in the param element scope), the engine
+classifies that type into one of a small, **closed** set of classes:
+
+| Class | Covers |
+|-------|--------|
+| `signed_int` | `i8` `i16` `i32` `i64` `i128` `isize` |
+| `unsigned_int` | `u8` `u16` `u32` `u64` `u128` `usize`, and `byte` (an octet is an unsigned 8-bit integer in value terms) |
+| `float` | `f16` `bf16` `f32` `f64` `f128` |
+| `bool` | `bool` |
+| `char` | `char` (a Unicode scalar) |
+| `string` | `str` |
+| `bytes` | `bytes` (a byte *buffer*, distinct from a single `byte`) |
+| `unit` | `void` |
+| `never` | `never` |
+| `ptr` | the `ptr` primitive OR a pointer type (`Type::Pointer`) |
+| `fnptr` | the `fnptr` primitive OR a function-pointer type (`Type::FnPtr`) |
+| `named` | a user-defined type reference (`Type::Named` — a `struct`/`enum`/`typedef`) |
+| `array` | a fixed array type (`Type::Array`) |
+
+The classification is **total** over the frozen `Type`/`Primitive` set — every
+primitive and every `Type` variant maps to **exactly one** class, by a
+compile-checked exhaustive match with no catch-all (adding a primitive is a
+compile error until it is mapped). It is a purely local decision on the type
+being rendered: a compound type classifies by its **outermost** shape
+(`Type::Pointer` → `ptr`, `Type::Array` → `array`), not its element — the def
+recurses through the element's own `{type}` slot (and its own `type is <class>`
+fact) when it needs deeper detail.
+
+`type is <class>` is a **fact** (closed dispatch), not a scalar slot: a def may
+only branch on the class (`type is signed_int -> "%d"`), never inspect a type
+further, so the engine stays dumb and the surface stays non-scripting. A class
+spelling not in the closed set above is a **load-time** error. The motivating
+case is a generated formatter: C's `displayable` `### field_print` picks a
+`printf` specifier per field (`%d` signed, `%u` unsigned, `%f` float, `%s`
+string), and forbids the classes it cannot print honestly (`char` → C11
+`char32_t` has no portable specifier; `named` → would need the field type's own
+generated printer, whose availability is not knowable from field scope;
+`ptr`/`fnptr`/`bytes`/`array` → no scalar value form). The same fact serves any
+type-directed need (hashing, serialization).
+
+Adding `type is <class>` is **strictly additive**: a definition that never
+references it renders byte-identically to before it existed.
 
 ### Assignment, Cast, and Construction Slots
 

@@ -933,6 +933,127 @@ impl Type {
         static EMPTY: std::sync::OnceLock<Meta> = std::sync::OnceLock::new();
         EMPTY.get_or_init(Meta::new)
     }
+
+    /// Classifies this type into its closed [`TypeClass`] category.
+    ///
+    /// This is a **total**, engine-computed classification over the frozen
+    /// [`Type`]/[`Primitive`] set: every primitive and every `Type` variant maps
+    /// to exactly one class, checked by an exhaustive `match` with no catch-all
+    /// (so a future primitive cannot be silently misclassified — adding one is a
+    /// compile error until it is mapped here). It backs the closed
+    /// `type is <class>` predicate fact, letting a language definition perform
+    /// **type-directed dispatch** (choosing a `printf` specifier, a hash step, a
+    /// serializer, …) from a small, closed vocabulary rather than a scripting
+    /// surface.
+    ///
+    /// The classification is purely local to this node: a compound type
+    /// (`Pointer`/`FnPtr`/`Array`) classifies by its outermost shape, not its
+    /// element/pointee — the def recurses through the element's own `type` slot
+    /// (and its own `type is <class>` fact) when it needs to.
+    pub fn class(&self) -> TypeClass {
+        match self {
+            Type::Primitive(p) => p.class(),
+            Type::Named(_) => TypeClass::Named,
+            Type::Pointer(_) => TypeClass::Ptr,
+            Type::FnPtr { .. } => TypeClass::FnPtr,
+            Type::Array { .. } => TypeClass::Array,
+        }
+    }
+}
+
+/// A **closed** classification of a [`Type`] into a small category vocabulary,
+/// for type-directed dispatch via the `type is <class>` predicate fact.
+///
+/// This mirrors the closed-dispatch pattern of
+/// [`StmtKind`](crate::predicate::StmtKind) /
+/// [`ExprKind`](crate::predicate::ExprKind): a fixed set of categories with an
+/// [`as_str`](TypeClass::as_str) canonical spelling and an [`all`](TypeClass::all)
+/// enumerator, so the engine (not the definition) owns the vocabulary. A
+/// language definition may only *branch* on a class (`type is signed_int ->
+/// "%d"`); it can neither invent a class nor inspect a type further — keeping the
+/// engine dumb and the fact non-scripting.
+///
+/// [`Type::class`] maps every [`Type`] variant and every frozen [`Primitive`] to
+/// exactly one of these classes with an exhaustive `match`; see that method for
+/// the mapping rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeClass {
+    /// A signed integer primitive (`i8`/`i16`/`i32`/`i64`/`i128`/`isize`).
+    SignedInt,
+    /// An unsigned integer primitive
+    /// (`u8`/`u16`/`u32`/`u64`/`u128`/`usize`, and `byte` — an octet is an
+    /// unsigned 8-bit integer in value terms).
+    UnsignedInt,
+    /// A floating-point primitive (`f16`/`bf16`/`f32`/`f64`/`f128`).
+    Float,
+    /// The boolean primitive (`bool`).
+    Bool,
+    /// The Unicode-scalar character primitive (`char`).
+    Char,
+    /// The text-string primitive (`str`).
+    String,
+    /// The byte-buffer primitive (`bytes`) — a sequence of octets, distinct from
+    /// a single `byte` and from a numeric integer.
+    Bytes,
+    /// The unit / no-value primitive (`void`).
+    Unit,
+    /// The uninhabited / never-returns primitive (`never`).
+    Never,
+    /// A raw pointer: the `ptr` primitive OR a [`Type::Pointer`].
+    Ptr,
+    /// A function pointer: the `fnptr` primitive OR a [`Type::FnPtr`].
+    FnPtr,
+    /// A reference to a user-defined type ([`Type::Named`] — a
+    /// `struct`/`enum`/`typedef`).
+    Named,
+    /// A fixed array type ([`Type::Array`]).
+    Array,
+}
+
+impl TypeClass {
+    /// The canonical `type is <class>` value spelling for this class.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeClass::SignedInt => "signed_int",
+            TypeClass::UnsignedInt => "unsigned_int",
+            TypeClass::Float => "float",
+            TypeClass::Bool => "bool",
+            TypeClass::Char => "char",
+            TypeClass::String => "string",
+            TypeClass::Bytes => "bytes",
+            TypeClass::Unit => "unit",
+            TypeClass::Never => "never",
+            TypeClass::Ptr => "ptr",
+            TypeClass::FnPtr => "fnptr",
+            TypeClass::Named => "named",
+            TypeClass::Array => "array",
+        }
+    }
+
+    /// Resolves a type class from its canonical spelling. Returns `None` if
+    /// `name` is not a known class.
+    pub fn from_name(name: &str) -> Option<TypeClass> {
+        TypeClass::all().into_iter().find(|c| c.as_str() == name)
+    }
+
+    /// The complete closed set of type classes, in canonical order.
+    pub fn all() -> [TypeClass; 13] {
+        [
+            TypeClass::SignedInt,
+            TypeClass::UnsignedInt,
+            TypeClass::Float,
+            TypeClass::Bool,
+            TypeClass::Char,
+            TypeClass::String,
+            TypeClass::Bytes,
+            TypeClass::Unit,
+            TypeClass::Never,
+            TypeClass::Ptr,
+            TypeClass::FnPtr,
+            TypeClass::Named,
+            TypeClass::Array,
+        ]
+    }
 }
 
 /// The Lamina kernel primitive types.
@@ -1066,6 +1187,54 @@ impl Primitive {
             Primitive::Ptr,
             Primitive::Fnptr,
         ]
+    }
+
+    /// Classifies this primitive into its closed [`TypeClass`] category.
+    ///
+    /// The mapping is **total and exhaustive** over the frozen 26-primitive set
+    /// (no catch-all), so adding a primitive is a compile error until it is
+    /// mapped here. Rationale for the non-obvious groupings:
+    ///
+    /// - The width variants collapse into `signed_int` / `unsigned_int` /
+    ///   `float`: a type-directed def cares about the *category* (which `printf`
+    ///   specifier, which comparison), not the exact width, and the width is
+    ///   already carried by the capability-matrix spelling of the `{type}` slot.
+    /// - `byte` classifies as `unsigned_int`: an octet is an unsigned 8-bit
+    ///   integer in value terms (C maps it to `uint8_t`), so it prints/compares
+    ///   like one. `bytes` (a *buffer* of octets) is its own `bytes` class —
+    ///   it is a sequence, not a scalar number.
+    /// - `ptr`/`fnptr` classify alongside their compound [`Type`] forms
+    ///   ([`Type::Pointer`]/[`Type::FnPtr`]) so a def branches on `ptr`/`fnptr`
+    ///   uniformly whether the type is the bare primitive or a typed compound.
+    pub fn class(self) -> TypeClass {
+        match self {
+            Primitive::I8
+            | Primitive::I16
+            | Primitive::I32
+            | Primitive::I64
+            | Primitive::I128
+            | Primitive::Isize => TypeClass::SignedInt,
+            Primitive::U8
+            | Primitive::U16
+            | Primitive::U32
+            | Primitive::U64
+            | Primitive::U128
+            | Primitive::Usize
+            | Primitive::Byte => TypeClass::UnsignedInt,
+            Primitive::F16
+            | Primitive::Bf16
+            | Primitive::F32
+            | Primitive::F64
+            | Primitive::F128 => TypeClass::Float,
+            Primitive::Bool => TypeClass::Bool,
+            Primitive::Char => TypeClass::Char,
+            Primitive::Str => TypeClass::String,
+            Primitive::Bytes => TypeClass::Bytes,
+            Primitive::Void => TypeClass::Unit,
+            Primitive::Never => TypeClass::Never,
+            Primitive::Ptr => TypeClass::Ptr,
+            Primitive::Fnptr => TypeClass::FnPtr,
+        }
     }
 }
 
@@ -3608,6 +3777,87 @@ mod tests {
             assert!(!attr.as_str().is_empty());
         }
         assert_eq!(TypeAttribute::from_name("nope"), None);
+    }
+
+    #[test]
+    fn type_class_roundtrips_via_name() {
+        for class in TypeClass::all() {
+            assert_eq!(TypeClass::from_name(class.as_str()), Some(class));
+            assert!(!class.as_str().is_empty());
+        }
+        assert_eq!(TypeClass::from_name("nope"), None);
+    }
+
+    #[test]
+    fn primitive_class_maps_every_frozen_primitive() {
+        // The classification is TOTAL over the frozen 26-primitive set: every
+        // primitive maps to exactly the expected class. This locks the mapping
+        // (the exhaustive `match` in `Primitive::class` already makes a missing
+        // primitive a compile error; this asserts the concrete groupings).
+        use Primitive::*;
+        let expect: &[(Primitive, TypeClass)] = &[
+            (I8, TypeClass::SignedInt),
+            (I16, TypeClass::SignedInt),
+            (I32, TypeClass::SignedInt),
+            (I64, TypeClass::SignedInt),
+            (I128, TypeClass::SignedInt),
+            (Isize, TypeClass::SignedInt),
+            (U8, TypeClass::UnsignedInt),
+            (U16, TypeClass::UnsignedInt),
+            (U32, TypeClass::UnsignedInt),
+            (U64, TypeClass::UnsignedInt),
+            (U128, TypeClass::UnsignedInt),
+            (Usize, TypeClass::UnsignedInt),
+            (Byte, TypeClass::UnsignedInt),
+            (F16, TypeClass::Float),
+            (Bf16, TypeClass::Float),
+            (F32, TypeClass::Float),
+            (F64, TypeClass::Float),
+            (F128, TypeClass::Float),
+            (Bool, TypeClass::Bool),
+            (Char, TypeClass::Char),
+            (Str, TypeClass::String),
+            (Bytes, TypeClass::Bytes),
+            (Void, TypeClass::Unit),
+            (Never, TypeClass::Never),
+            (Ptr, TypeClass::Ptr),
+            (Fnptr, TypeClass::FnPtr),
+        ];
+        // Every frozen primitive is covered exactly once.
+        assert_eq!(expect.len(), Primitive::all().len());
+        for (p, want) in expect {
+            assert_eq!(p.class(), *want, "{p:?} should classify as {want:?}");
+            assert_eq!(
+                Type::Primitive(*p).class(),
+                *want,
+                "Type::Primitive({p:?}) should classify as {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_class_maps_every_compound_variant() {
+        assert_eq!(Type::Named("Foo".to_string()).class(), TypeClass::Named);
+        assert_eq!(
+            Type::Pointer(Box::new(Type::Primitive(Primitive::I32))).class(),
+            TypeClass::Ptr
+        );
+        assert_eq!(
+            Type::FnPtr {
+                params: vec![],
+                ret: Box::new(Type::Primitive(Primitive::Void)),
+            }
+            .class(),
+            TypeClass::FnPtr
+        );
+        assert_eq!(
+            Type::Array {
+                elem: Box::new(Type::Primitive(Primitive::I32)),
+                len: Some("3".to_string()),
+            }
+            .class(),
+            TypeClass::Array
+        );
     }
 
     #[test]

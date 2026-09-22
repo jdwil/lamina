@@ -217,21 +217,104 @@ fn struct_copyable_is_inherent_no_text() {
 }
 
 #[test]
-fn struct_displayable_stays_forbidden() {
-    // A field-wise `printf` needs a per-field-type format specifier the slot
-    // vocabulary cannot compute; emitting one specifier for all fields would be
-    // dishonest, so `displayable` stays a clean forbidden construct (reported as
-    // a follow-on capability blocker, not hacked).
+fn struct_displayable_generates_field_wise_print_fn() {
+    // Blocker #D: `displayable` now GENERATES a field-wise
+    // `void <Name>_print(const struct <Name> *self)` that prints each field
+    // with a `printf` whose format specifier is chosen by the field's TYPE via
+    // the closed `type is <class>` fact. Routed to the `helpers` region
+    // (assembled BELOW the struct so the type is complete when the printer
+    // dereferences it). Mixed field types exercise the per-class specifiers.
+    // A signed int prints via `%lld` on a `(long long)` cast and an unsigned via
+    // `%llu` on an `(unsigned long long)` cast: every C-realizable integer width
+    // (i8..i64/isize, u8..u64/usize; i128/u128 are forbidden as C has no 128-bit
+    // int) fits losslessly in `long long`/`unsigned long long`, so this is
+    // width-correct and avoids the undefined behavior a bare `%d`/`%u` would
+    // cause on a 64-bit field. `%f` (float), `%d` (bool, a `_Bool` promotes to
+    // `int`), `%s` (string). Hand-verified valid, idiomatic C11.
     let s = Item::Struct {
-        name: "Point".to_string(),
+        name: "Rec".to_string(),
         visibility: Visibility::Public,
-        fields: vec![field("x", i32t())],
+        fields: vec![
+            field("i", Type::Primitive(Primitive::I32)),
+            field("u", Type::Primitive(Primitive::U32)),
+            field("f", Type::Primitive(Primitive::F64)),
+            field("b", Type::Primitive(Primitive::Bool)),
+            field("s", Type::Primitive(Primitive::Str)),
+        ],
+        attributes: vec![TypeAttribute::Displayable],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &c());
+    assert_eq!(
+        out,
+        "struct Rec {\n    \
+             int32_t i;\n    \
+             uint32_t u;\n    \
+             double f;\n    \
+             bool b;\n    \
+             char * s;\n};\n\
+         void Rec_print(const struct Rec *self) {\n    \
+             printf(\"i = %lld\\n\", (long long)self->i);\n    \
+             printf(\"u = %llu\\n\", (unsigned long long)self->u);\n    \
+             printf(\"f = %f\\n\", self->f);\n    \
+             printf(\"b = %d\\n\", self->b);\n    \
+             printf(\"s = %s\\n\", self->s);\n}"
+    );
+}
+
+#[test]
+fn struct_displayable_byte_field_uses_unsigned_specifier() {
+    // A `byte` (octet) classifies as `unsigned_int`, so its printer uses `%llu`
+    // on an `(unsigned long long)` cast (uniform with every other unsigned
+    // width; C maps `byte` to `uint8_t`).
+    let s = Item::Struct {
+        name: "B".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("o", Type::Primitive(Primitive::Byte))],
+        attributes: vec![TypeAttribute::Displayable],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &c());
+    assert!(
+        out.contains("printf(\"o = %llu\\n\", (unsigned long long)self->o);"),
+        "byte field should print with %llu on an unsigned-long-long cast, got:\n{out}"
+    );
+}
+
+#[test]
+fn struct_displayable_char_field_is_forbidden() {
+    // A `char` field maps to C11 `char32_t`, which has no portable `printf`
+    // specifier, so a struct with a `char` field cannot be `displayable` — the
+    // printer forbids that field class rather than emitting a wrong specifier.
+    let s = Item::Struct {
+        name: "C".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("c", Type::Primitive(Primitive::Char))],
         attributes: vec![TypeAttribute::Displayable],
         meta: Meta::new(),
     };
     assert!(
         emit_err(vec![s], &c()).contains("forbid"),
-        "displayable has no honest field-wise C form"
+        "a char field has no honest printf form"
+    );
+}
+
+#[test]
+fn struct_displayable_named_field_is_forbidden() {
+    // A `named` (struct/enum) field would need a call to that field type's own
+    // `_print`, whose availability is not knowable from field scope; emitting a
+    // possibly-nonexistent call would be dishonest, so it is forbidden (an
+    // escalated cross-type "is displayable" capability is out of scope for #D).
+    let s = Item::Struct {
+        name: "N".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("inner", named("Point"))],
+        attributes: vec![TypeAttribute::Displayable],
+        meta: Meta::new(),
+    };
+    assert!(
+        emit_err(vec![s], &c()).contains("forbid"),
+        "a named field has no honest field-wise printf form (see escalation)"
     );
 }
 

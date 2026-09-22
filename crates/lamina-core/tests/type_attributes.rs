@@ -207,15 +207,45 @@ fn rust_iterable_attribute_is_forbidden() {
 // ---- (d) TypeScript: attributes are forbidden; empty is byte-identical -
 
 #[test]
-fn ts_struct_with_attributes_is_forbidden() {
-    // A TS interface cannot realize a type-level attribute, so a struct that
-    // requests any attribute is a clean ForbiddenConstruct.
-    let item = point_struct(vec![TypeAttribute::Displayable], Visibility::Public);
-    let err = emit_one(item, &ts()).expect_err("attributes forbidden on TS");
-    assert!(
-        matches!(err, EmitError::ForbiddenConstruct { .. }),
-        "got: {err:?}"
+fn ts_struct_equatable_generates_field_wise_eq_fn() {
+    // With the validator argument-aware (Blocker #C), a TS `equatable` struct
+    // generates a field-wise `function Point_eq(...)` above the interface.
+    // Field-wise `===` is the honest structural comparison. Hand-verified valid
+    // idiomatic TypeScript.
+    let item = point_struct(vec![TypeAttribute::Equatable], Visibility::Public);
+    let out = emit_one(item, &ts()).expect("emit");
+    // The generated helper is emitted directly above the interface, separated by
+    // a single newline (a template trailing blank line is trimmed by the block
+    // extractor, matching the C def's own defs/body convention). Valid TS.
+    assert_eq!(
+        out,
+        "function Point_eq(a: Point, b: Point): boolean {\n    \
+         return a.x === b.x && a.y === b.y;\n}\n\
+         export interface Point {\n    x: number;\n    y: number;\n}",
+        "got: {out}"
     );
+}
+
+#[test]
+fn ts_struct_non_equatable_attributes_are_forbidden() {
+    // Only `equatable` has a clean field-wise TS form; every other attribute is
+    // a clean ForbiddenConstruct (see typescript.mdl `## Struct` prose).
+    for attr in [
+        TypeAttribute::Displayable,
+        TypeAttribute::Comparable,
+        TypeAttribute::Hashable,
+        TypeAttribute::Cloneable,
+        TypeAttribute::Copyable,
+        TypeAttribute::HasDefault,
+        TypeAttribute::Iterable,
+    ] {
+        let item = point_struct(vec![attr], Visibility::Public);
+        let err = emit_one(item, &ts()).expect_err("non-equatable attr forbidden on TS");
+        assert!(
+            matches!(err, EmitError::ForbiddenConstruct { .. }),
+            "{attr:?} got: {err:?}"
+        );
+    }
 }
 
 #[test]

@@ -128,6 +128,29 @@ struct SlotRef {
     args: Vec<(String, Template)>,
 }
 
+/// A read-only, borrowed view of a single `SlotRef` for the load-time
+/// slot-graph validator.
+///
+/// `SlotRef` itself is a private parser type; this view exposes exactly the two
+/// things the validator needs — the resolver-facing base `name` (which may
+/// still carry the existing `:` projection or a closed-helper `(...)` call, the
+/// resolver's concern) and the caller-supplied `args`. Each arg is an
+/// `(argname, value-template)` pair: the value-template is rendered in the
+/// caller's scope at render time, so the validator validates the slots IT
+/// references in the caller's current scope, and the argname is treated as
+/// satisfied-by-injection within the referenced subsection's sub-graph.
+///
+/// Exposed via [`Template::slot_refs`]; [`Template::slot_names`] and its callers
+/// are unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotRefView<'a> {
+    /// The slot name as handed to the resolver (may contain `:` projection and
+    /// closed-helper `(...)` calls).
+    pub name: &'a str,
+    /// The caller-supplied named arguments (empty for a no-arg reference).
+    pub args: &'a [(String, Template)],
+}
+
 /// An error while parsing a template string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateError {
@@ -228,6 +251,32 @@ impl Template {
             .iter()
             .filter_map(|p| match p {
                 TemplatePart::Slot(slot) => Some(slot.name.as_str()),
+                TemplatePart::Literal(_) => None,
+            })
+            .collect()
+    }
+
+    /// The **structured** slot references this template makes, in order
+    /// (duplicates included). Unlike [`slot_names`](Template::slot_names) — which
+    /// surfaces only the resolver-facing base name — this also exposes each
+    /// reference's caller-supplied named arguments (`argname` + the nested
+    /// value-template rendered in the caller's scope).
+    ///
+    /// This is a **new, non-breaking** accessor added for the argument-aware
+    /// load-time slot-graph validator: `slot_names()` and all of its existing
+    /// callers are left byte-identical (a def with no arg-bearing references
+    /// yields the same base names either way). The validator uses `slot_refs()`
+    /// so it can (a) validate each arg *value* template in the caller's scope
+    /// and (b) treat the injected argnames as satisfied within the callee's
+    /// sub-graph. See [`SlotRefView`].
+    pub fn slot_refs(&self) -> Vec<SlotRefView<'_>> {
+        self.parts
+            .iter()
+            .filter_map(|p| match p {
+                TemplatePart::Slot(slot) => Some(SlotRefView {
+                    name: slot.name.as_str(),
+                    args: &slot.args,
+                }),
                 TemplatePart::Literal(_) => None,
             })
             .collect()

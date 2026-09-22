@@ -12,8 +12,11 @@
 //! and the `**`/`//`/`>>>` operators. A payload-bearing `enum` is now realized
 //! as C's idiomatic tagged union (a discriminant `enum` + a `struct` of a tag
 //! and a `union`, with tuple members positionally numbered `_0`/`_1` via the
-//! per-element `{index}`). Struct type-level deriving stays forbidden pending a
-//! reported validator-argument-awareness blocker (see `struct_attributes_are_forbidden`).
+//! per-element `{index}`). A struct type-level `equatable` attribute is now
+//! GENERATED as a field-wise `bool <Name>_eq(const struct <Name> *a, …)` helper
+//! (routed below the declaration), `copyable` is inherent (a C struct is a value
+//! type), and attributes with no honest field-wise C form stay forbidden (see
+//! `struct_equatable_generates_field_wise_eq_fn` and the sibling tests).
 //!
 //! There is no concrete Lamina source syntax yet, so each test builds the AST
 //! directly and transpiles it with the REAL `c.mdl` document shipped in
@@ -167,26 +170,88 @@ fn struct_renders_as_c_struct() {
 }
 
 #[test]
-fn struct_attributes_are_forbidden() {
-    // C has no deriving. Generating a per-struct attribute helper (a field-wise
-    // `Point_eq`) is unblocked by #A's field projection PLUS #B, but still needs
-    // to bridge the per-attribute dispatch scope to the struct's name/fields via
-    // the slot-argument seam — and the load-time slot-graph validator is not
-    // argument-aware for a graph-reachable `###` subsection (REPORTED as a new
-    // blocker, not hacked). So a struct requesting a type attribute stays a
-    // clean forbidden construct. (The enum tagged-union rework needs no injected
-    // args, so it IS realized — see the enum tests above.)
+fn struct_equatable_generates_field_wise_eq_fn() {
+    // C has no deriving. With the validator now argument-aware (Blocker #C), an
+    // `equatable` struct generates a field-wise `bool <Name>_eq(...)` routed to
+    // the `defs` region (assembled above the struct declaration). Field-wise
+    // `==` — NOT `memcmp` — is the honest structural comparison. Hand-verified
+    // valid, idiomatic C11.
+    let s = Item::Struct {
+        name: "Point".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t()), field("y", i32t())],
+        attributes: vec![TypeAttribute::Equatable],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &c());
+    // The generated helper is assembled in the `helpers` region, BELOW the
+    // struct declaration (the `body` region), so the complete `struct Point`
+    // type is already declared when `_eq` dereferences it. The type is spelled
+    // `struct Point` (the def emits a bare `struct`, not a `typedef`). The
+    // helper's leading blank line joins the two regions with a newline.
+    // Hand-verified valid, idiomatic C11.
+    assert_eq!(
+        out,
+        "struct Point {\n    int32_t x;\n    int32_t y;\n};\n\
+         bool Point_eq(const struct Point *a, const struct Point *b) {\n    \
+         return a->x == b->x && a->y == b->y;\n}"
+    );
+}
+
+#[test]
+fn struct_copyable_is_inherent_no_text() {
+    // A C struct is a value type (copy is member-wise assignment), so `copyable`
+    // is realized inherently — no emitted text — and the struct renders exactly
+    // as an attribute-free one.
+    let s = Item::Struct {
+        name: "Point".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t()), field("y", i32t())],
+        attributes: vec![TypeAttribute::Copyable],
+        meta: Meta::new(),
+    };
+    assert_eq!(
+        emit_ok(vec![s], &c()),
+        "struct Point {\n    int32_t x;\n    int32_t y;\n};"
+    );
+}
+
+#[test]
+fn struct_displayable_stays_forbidden() {
+    // A field-wise `printf` needs a per-field-type format specifier the slot
+    // vocabulary cannot compute; emitting one specifier for all fields would be
+    // dishonest, so `displayable` stays a clean forbidden construct (reported as
+    // a follow-on capability blocker, not hacked).
     let s = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
         fields: vec![field("x", i32t())],
-        attributes: vec![TypeAttribute::Equatable],
+        attributes: vec![TypeAttribute::Displayable],
         meta: Meta::new(),
     };
     assert!(
         emit_err(vec![s], &c()).contains("forbid"),
-        "struct attributes should be forbidden in C (validator arg-awareness blocker)"
+        "displayable has no honest field-wise C form"
     );
+}
+
+#[test]
+fn struct_hashable_and_comparable_stay_forbidden() {
+    // Neither has an honest mechanical field-wise C form (a hash-combine scheme
+    // is arbitrary; a total order is lexicographic with a float NaN hazard).
+    for attr in [TypeAttribute::Hashable, TypeAttribute::Comparable] {
+        let s = Item::Struct {
+            name: "Point".to_string(),
+            visibility: Visibility::Public,
+            fields: vec![field("x", i32t())],
+            attributes: vec![attr],
+            meta: Meta::new(),
+        };
+        assert!(
+            emit_err(vec![s], &c()).contains("forbid"),
+            "{attr:?} should stay forbidden in C"
+        );
+    }
 }
 
 // ---- enum: a plain C enum (payloads forbidden) ---------------------------

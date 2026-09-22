@@ -34,7 +34,7 @@
 //! The engine ships NO built-in definitions — a definition is always loaded
 //! from a document like this, keeping the engine "dumb."
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::{slot_binding, BinaryOp, ItemKind, Primitive, SlotScope, SlotShape, UnaryOp};
 use crate::error::LangDocError;
@@ -730,12 +730,10 @@ fn validate_slot_graph(
     slots: &HashMap<String, SlotDef>,
     scope: SlotScope,
 ) -> Result<(), LangDocError> {
-    // Seed with the entry template's referenced slots, in the section's scope.
-    let work: Vec<(String, SlotScope)> = entry
-        .slot_names()
-        .iter()
-        .map(|s| (s.to_string(), scope))
-        .collect();
+    // Seed with the entry template's referenced slots (with any arg data), in
+    // the section's scope and an empty injected-name set.
+    let mut work: Vec<WorkItem> = Vec::new();
+    expand_refs(&entry.slot_refs(), scope, &BTreeSet::new(), &mut work);
     validate_slots_from(work, slots)
 }
 
@@ -746,25 +744,131 @@ fn validate_slot_graph(
 /// bindings) and any node sub-slots the target names. An absent `### expr` is a
 /// dangling reference exactly as at function scope.
 fn validate_tree_slot_graph(slots: &HashMap<String, SlotDef>) -> Result<(), LangDocError> {
-    validate_slots_from(vec![("expr".to_string(), SlotScope::Expr)], slots)
+    validate_slots_from(
+        vec![WorkItem {
+            name: "expr".to_string(),
+            scope: SlotScope::Expr,
+            satisfied: BTreeSet::new(),
+        }],
+        slots,
+    )
+}
+
+/// One item on the slot-graph work list: a slot `name` to validate in a given
+/// `scope`, plus the set of argnames that are **satisfied by injection** on the
+/// descent that reached it.
+///
+/// The `satisfied` set is what makes the validator argument-aware. When the
+/// traversal descends into a subsection *because of* an arg-bearing reference
+/// `{sub(a: v, ...)}`, the passed argnames (`a`, …) are in scope (satisfied) for
+/// that subsection and its nested references — mirroring render-time, where the
+/// pushed args are visible to the sub-render and its nested renders. A name in
+/// this set resolves to nothing further (like a scalar); a name NOT in the set
+/// and not otherwise bound or subsectioned stays an
+/// [`UnknownSlotReference`](LangDocError::UnknownSlotReference), so a genuine
+/// typo — and a `{argname}` used on a plain (un-injected) reference path — still
+/// errors, matching render-time.
+#[derive(Debug, Clone)]
+struct WorkItem {
+    /// The slot name to validate (may carry a `:` projection).
+    name: String,
+    /// The scope the name resolves in.
+    scope: SlotScope,
+    /// Argnames satisfied by injection on the descent that reached this name.
+    satisfied: BTreeSet<String>,
+}
+
+/// Expands a template's structured slot references (as produced by
+/// [`Template::slot_refs`]) into work items, in a given `scope` with a given
+/// `satisfied`-by-injection set. Called both to seed the traversal (from an
+/// entry template) and to descend through each def's references.
+///
+/// For each reference:
+/// - Its **arg values** are templates rendered in the CALLER's scope, so each
+///   arg value's own references are expanded in `(scope, satisfied)` — this is
+///   what makes a typo in an arg value a load-time error (it was previously
+///   invisible, since `slot_names()` dropped arg values entirely).
+/// - The reference's **base name** is queued in `scope` with the satisfied set
+///   EXTENDED by the argnames passed at THIS site (`satisfied ∪ argnames`), so
+///   those names are satisfied within the callee's sub-graph. A deeper
+///   arg-bearing reference unions its own argnames on top (shadowable/
+///   extendable), exactly as render-time nests pushed arg frames.
+fn expand_refs(
+    refs: &[crate::render::SlotRefView<'_>],
+    scope: SlotScope,
+    satisfied: &BTreeSet<String>,
+    work: &mut Vec<WorkItem>,
+) {
+    for r in refs {
+        // (a) Validate each arg VALUE in the caller's current scope/satisfied.
+        for (_argname, value_template) in r.args {
+            expand_refs(&value_template.slot_refs(), scope, satisfied, work);
+        }
+        // (b) Queue the base name with the argnames injected at this site added
+        // to the satisfied set for the callee's sub-graph.
+        let mut child_satisfied = satisfied.clone();
+        for (argname, _value) in r.args {
+            child_satisfied.insert(argname.clone());
+        }
+        work.push(WorkItem {
+            name: r.name.to_string(),
+            scope,
+            satisfied: child_satisfied,
+        });
+    }
 }
 
 /// The shared slot-graph traversal used by both [`validate_slot_graph`] (seeded
 /// from an entry template) and [`validate_tree_slot_graph`] (seeded from the
 /// `### expr` tree entry point). Every reachable slot must resolve to an
-/// engine-bound slot (in the scope it is referenced in) or a `### <slot>`
-/// subsection, and any sequence-shaped slot must have its item subsection.
+/// engine-bound slot (in the scope it is referenced in), a name satisfied by
+/// injection (see [`WorkItem`]), or a `### <slot>` subsection, and any
+/// sequence-shaped slot must have its item subsection.
+///
+/// **Argument-awareness (visited-set keying).** The traversal is argument-aware:
+/// a subsection's validity can depend on WHICH argnames were injected on the
+/// descent that reached it (a `{sname}` reference is satisfied only when `sname`
+/// was passed at the call site). The validity therefore depends on the
+/// injection context, so the visited/work key is the full
+/// `(name, scope, satisfied)` triple — NOT just `(name, scope)`. This makes a
+/// subsection reached both via injection (arg present) and via a plain
+/// reference (arg absent) validated in BOTH contexts: the plain path (empty
+/// satisfied set) still errors on the un-injected `{argname}`. Termination holds
+/// because the satisfied set is always a subset of the finitely-many argnames
+/// that appear in the definition and the slot graph is finite, so only finitely
+/// many distinct keys exist.
+///
+/// **Strictly additive.** A definition with no arg-bearing reachable
+/// subsections only ever produces empty satisfied sets, so every key is
+/// `(name, scope, {})` and the traversal is byte-identical to the pre-argument
+/// `(name, scope)` traversal.
 fn validate_slots_from(
-    mut work: Vec<(String, SlotScope)>,
+    mut work: Vec<WorkItem>,
     slots: &HashMap<String, SlotDef>,
 ) -> Result<(), LangDocError> {
-    let mut visited: Vec<(String, SlotScope)> = Vec::new();
+    let mut visited: Vec<(String, SlotScope, BTreeSet<String>)> = Vec::new();
 
-    while let Some((name, scope)) = work.pop() {
-        if visited.contains(&(name.clone(), scope)) {
+    while let Some(WorkItem {
+        name,
+        scope,
+        satisfied,
+    }) = work.pop()
+    {
+        let key = (name.clone(), scope, satisfied.clone());
+        if visited.contains(&key) {
             continue;
         }
-        visited.push((name.clone(), scope));
+        visited.push(key);
+
+        // Argument-aware (Part 0): a bare name that was injected as an argument
+        // on the descent that reached it is SATISFIED — it resolves to the
+        // pushed arg value at render time and references nothing further, so it
+        // needs no binding or subsection. Only a bare identifier can be an
+        // argname (never a projection or a helper call), matching the render
+        // path's `is_bare_identifier` gate.
+        if is_bare_slot_name(&name) && satisfied.contains(&name) {
+            continue;
+        }
 
         // Special slots (Part 1/2): a metadata slot `{meta.<key>}` or a call to
         // a closed render helper (`resolve_fnptr(...)`, `escape(..., style)`).
@@ -793,9 +897,10 @@ fn validate_slots_from(
                             item: item.to_string(),
                         }
                     })?;
-                    for r in referenced_by(def) {
-                        work.push((r, item_scope));
-                    }
+                    // The projected item slot's references resolve in the
+                    // element scope, carrying the current satisfied set (an
+                    // injected argname stays satisfied through a projection).
+                    expand_refs(&referenced_refs(def), item_scope, &satisfied, &mut work);
                 }
                 // Projection is only meaningful on a collection: a scalar
                 // engine-bound slot, or a named helper slot, cannot be looped.
@@ -818,30 +923,40 @@ fn validate_slots_from(
                 item_scope,
             }) => {
                 // The item slot subsection must exist, and its referenced slots
-                // are validated in the element scope.
+                // are validated in the element scope (carrying the satisfied
+                // set through the loop).
                 let def = slots
                     .get(&item_slot)
                     .ok_or_else(|| LangDocError::MissingItemSlot {
                         collection: name.clone(),
                         item: item_slot.clone(),
                     })?;
-                for r in referenced_by(def) {
-                    work.push((r, item_scope));
-                }
+                expand_refs(&referenced_refs(def), item_scope, &satisfied, &mut work);
             }
             None => {
                 // Must be satisfied by a subsection; its references stay in the
-                // same scope (function-level helper slots like `ret`, `vis`).
+                // same scope (function-level helper slots like `ret`, `vis`)
+                // and carry the satisfied set (so an injected argname referenced
+                // inside the subsection resolves, while a plain-path reference
+                // with no such injection errors on it).
                 let def = slots
                     .get(&name)
                     .ok_or_else(|| LangDocError::UnknownSlotReference { slot: name.clone() })?;
-                for r in referenced_by(def) {
-                    work.push((r, scope));
-                }
+                expand_refs(&referenced_refs(def), scope, &satisfied, &mut work);
             }
         }
     }
     Ok(())
+}
+
+/// Whether `name` is a bare slot identifier (no `:` projection and no `(...)`
+/// helper/argument call) — the only form that can be an injected argname, so
+/// the only form the satisfied-by-injection check applies to. Mirrors the
+/// render path's `is_bare_identifier` gate on argument resolution.
+fn is_bare_slot_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|c| matches!(c, ':' | '(' | ')' | '{' | '}' | ',') || c.is_whitespace())
 }
 
 /// Returns `true` if `name` is a special (engine-provided) slot form rather
@@ -862,18 +977,24 @@ fn is_special_slot(name: &str) -> bool {
 }
 
 /// The slot names referenced by a slot definition's template(s).
-fn referenced_by(def: &SlotDef) -> Vec<String> {
+/// The **structured** slot references made by a slot definition's template(s),
+/// in order. Unlike a bare-name list, each reference carries any caller-supplied
+/// named arguments (see [`crate::render::SlotRefView`]), which the
+/// argument-aware traversal needs to (a) validate each arg value in the caller
+/// scope and (b) extend the satisfied-by-injection set for the callee.
+fn referenced_refs(def: &SlotDef) -> Vec<crate::render::SlotRefView<'_>> {
     let mut out = Vec::new();
-    let add = |outcome: &Outcome, out: &mut Vec<String>| {
-        if let Outcome::Render(t) = outcome {
-            out.extend(t.slot_names().iter().map(|s| s.to_string()));
-        }
-    };
     match def {
-        SlotDef::Fixed { outcome, .. } => add(outcome, &mut out),
+        SlotDef::Fixed { outcome, .. } => {
+            if let Outcome::Render(t) = outcome {
+                out.extend(t.slot_refs());
+            }
+        }
         SlotDef::Table(table) => {
             for row in &table.rows {
-                add(&row.outcome, &mut out);
+                if let Outcome::Render(t) = &row.outcome {
+                    out.extend(t.slot_refs());
+                }
             }
         }
     }
@@ -1640,6 +1761,121 @@ mod tests {
                 slot: "name".to_string(),
                 item: "foo".to_string(),
             })
+        );
+    }
+
+    // ---- argument-aware slot-graph validation (Blocker #C) --------------
+
+    #[test]
+    fn injected_argname_is_satisfied_in_callee_subgraph() {
+        // A `{helper(sname: {name})}` reference passes `sname` into `### helper`.
+        // Inside `### helper`, `{sname}` is NOT an engine-bound slot and has no
+        // `### sname` subsection — but it is injected at the call site, so the
+        // argument-aware validator treats it as satisfied. Must validate.
+        let doc = mk("```template\n\
+            fn {name}({params}) {{ {helper(sname: {name})} }}\n\
+            ```\n\
+            \n\
+            ### param\n\
+            | When  | Template |\n\
+            |-------|----------|\n\
+            | first | \"{name}\" |\n\
+            | else  | \", {name}\" |\n\
+            \n\
+            ### helper\n\
+            ```template\n\
+            /* for {sname} */\n\
+            ```");
+        assert!(
+            parse_language_def(&doc).is_ok(),
+            "an injected argname must be satisfied inside the callee subsection"
+        );
+    }
+
+    #[test]
+    fn typo_in_arg_value_is_a_load_error() {
+        // The arg VALUE `{bogus}` is rendered in the CALLER's (function) scope,
+        // where `bogus` is neither an engine-bound slot nor a subsection — so
+        // validating the arg value surfaces it as an unknown slot. Previously
+        // `slot_names()` dropped arg values and this hole went uncaught.
+        let doc = mk("```template\n\
+            fn {name}() {{ {helper(sname: {bogus})} }}\n\
+            ```\n\
+            \n\
+            ### helper\n\
+            ```template\n\
+            /* for {sname} */\n\
+            ```");
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::UnknownSlotReference {
+                slot: "bogus".to_string()
+            }),
+            "a typo in a slot-argument value must be a load-time error"
+        );
+    }
+
+    #[test]
+    fn uninjected_argname_on_plain_reference_path_still_errors() {
+        // `### helper` references `{sname}`. It is reached BOTH via an
+        // arg-bearing reference (arg present -> satisfied) AND via a plain
+        // reference `{helper}` (no arg). On the plain path `sname` is NOT
+        // injected, has no binding and no subsection, so it MUST error —
+        // matching the render-time used-but-unpassed guarantee.
+        let doc = mk("```template\n\
+            fn {name}() {{ {helper(sname: {name})} {helper} }}\n\
+            ```\n\
+            \n\
+            ### helper\n\
+            ```template\n\
+            /* for {sname} */\n\
+            ```");
+        assert_eq!(
+            parse_language_def(&doc),
+            Err(LangDocError::UnknownSlotReference {
+                slot: "sname".to_string()
+            }),
+            "a `{{argname}}` used on a plain (un-injected) reference path must error"
+        );
+    }
+
+    #[test]
+    fn no_arg_reference_validates_byte_identically() {
+        // Strictly additive: a definition with no arg-bearing references
+        // validates exactly as before (empty satisfied sets throughout).
+        let doc = mk("```template\n\
+            fn {name}() {{ {helper} }}\n\
+            ```\n\
+            \n\
+            ### helper\n\
+            ```template\n\
+            /* body */\n\
+            ```");
+        assert!(parse_language_def(&doc).is_ok());
+    }
+
+    #[test]
+    fn nested_arg_injection_extends_satisfied_set() {
+        // `### outer` (reached with `a` injected) itself passes `b` into
+        // `### inner`; inside `### inner` BOTH `{a}` (from the outer descent)
+        // and `{b}` (injected here) are satisfied. Proves the satisfied set is
+        // threaded and extended through a deeper arg-bearing reference.
+        let doc = mk("```template\n\
+            fn {name}() {{ {outer(a: {name})} }}\n\
+            ```\n\
+            \n\
+            ### outer\n\
+            ```template\n\
+            {inner(b: {a})}\n\
+            ```\n\
+            \n\
+            ### inner\n\
+            ```template\n\
+            /* {a} and {b} */\n\
+            ```");
+        assert!(
+            parse_language_def(&doc).is_ok(),
+            "a nested arg-bearing reference must extend (union) the satisfied set"
         );
     }
 

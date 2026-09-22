@@ -333,6 +333,35 @@ cast, a type argument) passes no name and renders the bare type. Nested types
 (an array element, a pointee, an fn-pointer parameter/return) are non-declarator
 positions — the injected name applies exactly once, to the outermost type.
 
+#### Load-time validation of arg-bearing references
+
+The load-time slot-graph validator is **argument-aware**, so an arg-bearing
+reference reachable through a `### <slot>` subsection is checked as strictly as a
+plain one (the render path was always correct; this closes the corresponding
+load-time gaps):
+
+- **Arg values are validated in the caller's scope.** Each arg value is a
+  template fragment rendered in the caller's scope, so every slot IT references
+  must resolve *there*. A typo in an arg value (`{attr_helper(sname: {nmae})}`)
+  is a load-time `UnknownSlotReference` — it is no longer silently dropped.
+- **Injected argnames are satisfied inside the callee sub-graph.** When the
+  traversal descends into a subsection *because of* an arg-bearing reference, the
+  argnames passed at that site are in scope (satisfied) for that subsection and
+  its nested references — mirroring render-time, where the pushed args are
+  visible to the sub-render and its nested renders. A `{sname}` inside a
+  `### attr_helper` reached via `{attributes:attr_helper(sname: {name}, …)}`
+  therefore validates. A deeper arg-bearing reference unions its own argnames on
+  top (shadowable/extendable).
+- **Used-but-unpassed still errors.** A `{argname}` referenced on a path where
+  nothing injected it — including a subsection reached BOTH via injection and via
+  a plain (no-arg) reference — is a load-time `UnknownSlotReference` on the plain
+  path, exactly matching the render-time `UnknownSlot` guarantee.
+
+This is **strictly additive**: a definition with no arg-bearing reachable
+subsections validates byte-identically to before (the satisfied-by-injection set
+is always empty). The engine stays dumb — this is validator bookkeeping only; no
+new `.mdl` surface and no scripting.
+
 ### Slot Subsections
 
 Each `### <slot>` is one of two forms:

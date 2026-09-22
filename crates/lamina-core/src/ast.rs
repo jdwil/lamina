@@ -2378,6 +2378,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::Param => match name {
             "name" => Some(SlotShape::Scalar),
             "type" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A statement's sub-slots. Which are meaningful depends on the
@@ -2443,6 +2445,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // `body` the case's statement sequence.
         SlotScope::SwitchCase => match name {
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             "body" => Some(SlotShape::Sequence {
                 item_slot: "statement".to_string(),
                 item_scope: SlotScope::Statement,
@@ -2522,6 +2526,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // expression (dispatching through the `### expr` table).
         SlotScope::ExprArg => match name {
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single struct-literal field initializer: `name` is the field name
@@ -2530,6 +2536,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::FieldInit => match name {
             "name" => Some(SlotShape::Scalar),
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A struct declaration: `name` is a scalar leaf; `fields` loops the
@@ -2551,6 +2559,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::Field => match name {
             "name" => Some(SlotShape::Scalar),
             "type" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // An enum declaration: `name` is a scalar leaf; `variants` loops the
@@ -2584,6 +2594,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
                 item_slot: "payload_field".to_string(),
                 item_scope: SlotScope::Field,
             }),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single type-attribute element: `name` is the attribute's canonical
@@ -2591,12 +2603,17 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // target derive/annotation text; loop facts supply the separator.
         SlotScope::Attribute => match name {
             "name" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single tuple-payload type element: `type` is the rendered payload
         // type (dispatched through the type machinery).
         SlotScope::PayloadType => match name {
             "type" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]) — the source
+            // of a C tuple-payload tagged union's numbered members (`_0`, `_1`).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A type alias: `name` is a scalar leaf; `target` renders the aliased
@@ -2634,6 +2651,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::UseItem => match name {
             "name" => Some(SlotShape::Scalar),
             "alias" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A tree node, when rendered as an item (top-level tree value). Its
@@ -2659,18 +2678,24 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         SlotScope::Attr => match name {
             "name" => Some(SlotShape::Scalar),
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single node-child element: `value` renders the child expression
         // (dispatched through the `### expr` table).
         SlotScope::Child => match name {
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A single array-literal element: `value` renders the element
         // expression (dispatched through the `### expr` table).
         SlotScope::ArrayElem => match name {
             "value" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A raw / verbatim top-level item: `value` is the verbatim code string

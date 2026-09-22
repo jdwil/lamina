@@ -9,9 +9,11 @@
 //! file-scope function whose name (a function-pointer value) is left at the use
 //! site. What C genuinely cannot host stays forbidden: the iterator loop
 //! (`foreach`), a return-type-less `lambda` (no C signature without inference),
-//! enum payloads (no native sum types; the def-authoring vocabulary cannot
-//! number a tuple payload's members), type-level deriving, and the `**`/`//`/
-//! `>>>` operators.
+//! and the `**`/`//`/`>>>` operators. A payload-bearing `enum` is now realized
+//! as C's idiomatic tagged union (a discriminant `enum` + a `struct` of a tag
+//! and a `union`, with tuple members positionally numbered `_0`/`_1` via the
+//! per-element `{index}`). Struct type-level deriving stays forbidden pending a
+//! reported validator-argument-awareness blocker (see `struct_attributes_are_forbidden`).
 //!
 //! There is no concrete Lamina source syntax yet, so each test builds the AST
 //! directly and transpiles it with the REAL `c.mdl` document shipped in
@@ -166,8 +168,14 @@ fn struct_renders_as_c_struct() {
 
 #[test]
 fn struct_attributes_are_forbidden() {
-    // C has no deriving; requesting a type attribute is a clean forbidden
-    // construct (not silently dropped).
+    // C has no deriving. Generating a per-struct attribute helper (a field-wise
+    // `Point_eq`) is unblocked by #A's field projection PLUS #B, but still needs
+    // to bridge the per-attribute dispatch scope to the struct's name/fields via
+    // the slot-argument seam — and the load-time slot-graph validator is not
+    // argument-aware for a graph-reachable `###` subsection (REPORTED as a new
+    // blocker, not hacked). So a struct requesting a type attribute stays a
+    // clean forbidden construct. (The enum tagged-union rework needs no injected
+    // args, so it IS realized — see the enum tests above.)
     let s = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
@@ -177,7 +185,7 @@ fn struct_attributes_are_forbidden() {
     };
     assert!(
         emit_err(vec![s], &c()).contains("forbid"),
-        "struct attributes should be forbidden in C"
+        "struct attributes should be forbidden in C (validator arg-awareness blocker)"
     );
 }
 
@@ -220,24 +228,81 @@ fn plain_enum_renders_as_c_enum() {
 }
 
 #[test]
-fn enum_with_payload_is_forbidden() {
-    // C enums are plain integer constants — a payload-bearing variant has no
-    // native C enum form and is honestly forbidden.
+fn enum_with_tuple_payload_renders_as_tagged_union() {
+    // BLOCKERS #A (projected variant/payload item slots) + #B (per-element
+    // `{index}`) FIXED: a payload-bearing C `enum` is now realized as C's
+    // idiomatic TAGGED UNION — a discriminant `enum <Name>Tag` plus a
+    // `struct <Name>` holding the tag and a `union` of per-variant payloads.
+    // The tuple payload's members are positionally numbered `_0`, `_1` via the
+    // 0-based `{index}` ordinal. Hand-verified valid, idiomatic C11.
+    let e = Item::Enum {
+        name: "Shape".to_string(),
+        visibility: Visibility::Public,
+        variants: vec![
+            Variant {
+                name: "Circle".to_string(),
+                payload: VariantPayload::Tuple(vec![i32t()]),
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Rect".to_string(),
+                payload: VariantPayload::Tuple(vec![i32t(), i32t()]),
+                meta: Meta::new(),
+            },
+        ],
+        attributes: vec![],
+        meta: Meta::new(),
+    };
+    let expected = "enum ShapeTag {\n    Circle,\n    Rect\n};\nstruct Shape {\n    enum ShapeTag tag;\n    union {\n        struct { int32_t _0; } Circle;\n        struct { int32_t _0; int32_t _1; } Rect;\n    } data;\n};";
+    assert_eq!(emit_ok(vec![e], &c()), expected);
+}
+
+#[test]
+fn enum_with_struct_payload_renders_named_union_members() {
+    // A struct-style payload variant contributes an anonymous struct of its
+    // NAMED payload fields as a union member. Hand-verified valid C11.
     let e = Item::Enum {
         name: "Shape".to_string(),
         visibility: Visibility::Public,
         variants: vec![Variant {
-            name: "Circle".to_string(),
-            payload: VariantPayload::Tuple(vec![i32t()]),
+            name: "Rect".to_string(),
+            payload: VariantPayload::Struct(vec![
+                field("w", i32t()),
+                field("h", i32t()),
+            ]),
             meta: Meta::new(),
         }],
         attributes: vec![],
         meta: Meta::new(),
     };
-    assert!(
-        emit_err(vec![e], &c()).contains("forbid"),
-        "enum payloads should be forbidden in C"
-    );
+    let expected = "enum ShapeTag {\n    Rect\n};\nstruct Shape {\n    enum ShapeTag tag;\n    union {\n        struct { int32_t w; int32_t h; } Rect;\n    } data;\n};";
+    assert_eq!(emit_ok(vec![e], &c()), expected);
+}
+
+#[test]
+fn enum_with_mixed_unit_and_payload_variants_renders_tagged_union() {
+    // A unit variant among payload variants contributes a tag enumerator but NO
+    // union member (it carries no data) — the idiomatic C tagged-union form.
+    let e = Item::Enum {
+        name: "Shape".to_string(),
+        visibility: Visibility::Public,
+        variants: vec![
+            Variant {
+                name: "Empty".to_string(),
+                payload: VariantPayload::None,
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Circle".to_string(),
+                payload: VariantPayload::Tuple(vec![i32t()]),
+                meta: Meta::new(),
+            },
+        ],
+        attributes: vec![],
+        meta: Meta::new(),
+    };
+    let expected = "enum ShapeTag {\n    Empty,\n    Circle\n};\nstruct Shape {\n    enum ShapeTag tag;\n    union {\n        struct { int32_t _0; } Circle;\n    } data;\n};";
+    assert_eq!(emit_ok(vec![e], &c()), expected);
 }
 
 // ---- if / while / for: direct C control flow -----------------------------

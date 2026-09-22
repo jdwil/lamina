@@ -228,6 +228,41 @@ lambda-less target renders the hoisted function body through its own item slot
 `### statement` table is pass-gated for a different purpose. `{body}` with no
 `:` loops the default `statement` item slot byte-identically to before.
 
+**Type-declaration projection (`{fields}` / `{variants}` / `{attributes}` /
+`{payload_types}` / `{payload_fields}`).** The field, variant, attribute, and
+variant-payload sequences project exactly like every other collection: a struct
+may render its `{fields}` as declarations AND, in the same declaration, render
+`{fields:field_eq}` as field-wise comparisons; an enum may render `{variants}`
+one way and `{variants:tag}` another. The projected item slot resolves in the
+same per-element scope as the default (Field / Variant / Attribute /
+PayloadType), so it sees the same `{name}`/`{type}` sub-slots, the same loop
+facts, and the same `{index}` ordinal. The default (`{fields}` → `field`,
+`{variants}` → `variant`, `{attributes}` → `attribute`, `{payload_types}` →
+`payload_type`, `{payload_fields}` → `payload_field`) is byte-identical to
+before projection existed. This is what lets C generate an idiomatic tagged
+union from a payload-bearing `enum` (variants projected as tag enumerators AND
+as union members, tuple members numbered via `{index}`). A projected item slot
+that names a missing subsection is a load-time `MissingProjectionItemSlot`
+error.
+
+### The `{index}` Element Ordinal
+
+Inside a looped item slot, alongside the `first`/`last` loop facts, the engine
+exposes the element's **0-based ordinal** as the scalar slot `{index}`. It is a
+**closed, engine-provided value** — not a scripting surface: a template can only
+*render* it (e.g. `_{index}` → `_0`, `_1`, …), giving a target the numbered
+members a C tuple-payload tagged union needs. It is 0-based (matching the
+tuple-member convention) and is a **slot** (rendered), not a fact — there is no
+`index is <n>` predicate, keeping the engine dumb. `{index}` is bound only in
+the looped element scopes that also carry `first`/`last` (`param`, `field`,
+`variant`, `payload_type` / `payload_field`, `attribute`, `use_item`,
+`switch_case`, and the expression-collection element scopes `expr_arg`,
+`field_init`, `attr`, `child`, `array_elem`); referencing `{index}` in a
+non-looped scope (e.g. on the struct node itself) is a load-time unknown-slot
+error, keeping binding and resolution consistent. Adding `{index}` to a
+definition is strictly additive: a definition that never references it renders
+byte-identically to before it existed.
+
 ### Slot Arguments (`{slot(name: value)}`)
 
 A slot's sub-render normally sees only its own context (the element it renders,

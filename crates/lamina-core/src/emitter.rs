@@ -443,6 +443,12 @@ impl<'a> ItemResolver<'a> {
     /// [`resolve_type`] and nested expressions through [`emit_expr`], reusing
     /// the shared `## Function`-hosted helper slots.
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
+        // The engine-provided 0-based loop ordinal, bound only in looped
+        // element scopes (see [`slot_binding`] / [`RenderContext::index`]).
+        // Resolved uniformly here from the element's render context.
+        if name == "index" {
+            return Ok(Rendered::text(self.ctx.index.to_string()));
+        }
         match &self.scope {
             ItemScope::Field(field) => match name {
                 "name" => Ok(Rendered::text(field.name.clone())),
@@ -511,18 +517,19 @@ impl<'a> ItemResolver<'a> {
     }
 
     /// Loops a struct's/enum's type attributes, rendering the `attribute` item
-    /// slot per attribute with `first`/`last` loop facts and the per-element
-    /// `attr is <name>` dispatch fact set. `has_attributes` is propagated from
-    /// the parent so a row may still consult it. Only meaningful when looping
-    /// the `attributes` sequence; the item slot is fixed as `attribute`.
+    /// slot (or a projected item slot via `{attributes:item_slot}`) per
+    /// attribute with `first`/`last` loop facts, the 0-based `{index}` ordinal,
+    /// and the per-element `attr is <name>` dispatch fact set. `has_attributes`
+    /// is propagated from the parent so a row may still consult it. The default
+    /// (`item_slot == "attribute"`) is byte-identical to before projection
+    /// existed; a projected item slot resolves the named `### item` subsection
+    /// in the same [`SlotScope::Attribute`] element scope (validated at load
+    /// time).
     fn render_attributes(
         &self,
         attributes: &[TypeAttribute],
         item_slot: &str,
     ) -> Result<Rendered, EmitError> {
-        if item_slot != "attribute" {
-            return self.unknown_slot(item_slot);
-        }
         let len = attributes.len();
         let mut out = Rendered::empty();
         for (i, attr) in attributes.iter().enumerate() {
@@ -530,6 +537,7 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 // The per-element `attr is <name>` dispatch fact.
                 attribute: Some(*attr),
                 // Keep `has_attributes` as-is (it is true here by construction);
@@ -568,6 +576,7 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 has_alias: use_item.alias.is_some(),
                 meta: use_item.meta.clone(),
                 ..Default::default()
@@ -615,15 +624,18 @@ impl<'a> ItemResolver<'a> {
     }
 
     /// Loops a tuple variant's payload types, rendering the `payload_type` item
-    /// slot per type with `first`/`last` loop facts.
+    /// slot (or a projected item slot via `{payload_types:item_slot}`) per type
+    /// with `first`/`last` loop facts and the 0-based `{index}` ordinal. The
+    /// default (`item_slot == "payload_type"`) is byte-identical to before
+    /// projection existed; a projected item slot resolves the named `### item`
+    /// subsection in the same [`SlotScope::PayloadType`] element scope (validated
+    /// at load time). The C tagged-union case projects these as numbered union
+    /// members (`_0`, `_1`, … via `{index}`).
     fn render_payload_types(
         &self,
         types: &[Type],
         item_slot: &str,
     ) -> Result<Rendered, EmitError> {
-        if item_slot != "payload_type" {
-            return self.unknown_slot(item_slot);
-        }
         let len = types.len();
         let mut out = Rendered::empty();
         for (i, ty) in types.iter().enumerate() {
@@ -631,6 +643,7 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 ..Default::default()
             };
             let mut elem = ItemResolver {
@@ -647,17 +660,19 @@ impl<'a> ItemResolver<'a> {
     }
 
     /// Loops a struct variant's payload fields, rendering the `payload_field`
-    /// item slot per field with `first`/`last` loop facts and each field's own
-    /// `vis`/`export` facts. Payload fields resolve in [`SlotScope::Field`],
-    /// reusing the struct-field `name`/`type` sub-slots.
+    /// item slot (or a projected item slot via `{payload_fields:item_slot}`) per
+    /// field with `first`/`last` loop facts, the 0-based `{index}` ordinal, and
+    /// each field's own `vis`/`export` facts. Payload fields resolve in
+    /// [`SlotScope::Field`], reusing the struct-field `name`/`type` sub-slots.
+    /// The default (`item_slot == "payload_field"`) is byte-identical to before
+    /// projection existed; a projected item slot resolves the named `### item`
+    /// subsection in the same element scope (validated at load time). The C
+    /// tagged-union case projects these as named union struct members.
     fn render_payload_fields(
         &self,
         fields: &[Field],
         item_slot: &str,
     ) -> Result<Rendered, EmitError> {
-        if item_slot != "payload_field" {
-            return self.unknown_slot(item_slot);
-        }
         let len = fields.len();
         let mut out = Rendered::empty();
         for (i, field) in fields.iter().enumerate() {
@@ -667,6 +682,7 @@ impl<'a> ItemResolver<'a> {
                 vis: Some(vis_kind(field.visibility)),
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 meta: field.meta.clone(),
                 ..Default::default()
             };
@@ -683,15 +699,16 @@ impl<'a> ItemResolver<'a> {
         Ok(out)
     }
 
-    /// Loops a struct's fields, rendering the `field` item slot per field with
-    /// `first`/`last` loop facts and each field's own `vis`/`export` facts.
+    /// Loops a struct's fields, rendering the `field` item slot (or a projected
+    /// item slot via `{fields:item_slot}`) per field with `first`/`last` loop
+    /// facts, the 0-based `{index}` ordinal, and each field's own `vis`/`export`
+    /// facts. The default (`item_slot == "field"`) is byte-identical to before
+    /// projection existed; a projected item slot resolves the named `### item`
+    /// subsection in the same [`SlotScope::Field`] element scope (validated at
+    /// load time). This lets one struct render its fields two ways in one
+    /// declaration — the C attribute-helper case (fields as `a->x == b->x`
+    /// comparisons AND as declarations).
     fn render_fields(&self, fields: &[Field], item_slot: &str) -> Result<Rendered, EmitError> {
-        if item_slot != "field" {
-            return Err(EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: item_slot.to_string(),
-            });
-        }
         let len = fields.len();
         let mut out = Rendered::empty();
         for (i, field) in fields.iter().enumerate() {
@@ -701,6 +718,7 @@ impl<'a> ItemResolver<'a> {
                 vis: Some(vis_kind(field.visibility)),
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 meta: field.meta.clone(),
                 ..Default::default()
             };
@@ -717,19 +735,20 @@ impl<'a> ItemResolver<'a> {
         Ok(out)
     }
 
-    /// Loops an enum's variants, rendering the `variant` item slot per variant
-    /// with `first`/`last` loop facts.
+    /// Loops an enum's variants, rendering the `variant` item slot (or a
+    /// projected item slot via `{variants:item_slot}`) per variant with
+    /// `first`/`last` loop facts and the 0-based `{index}` ordinal. The default
+    /// (`item_slot == "variant"`) is byte-identical to before projection
+    /// existed; a projected item slot resolves the named `### item` subsection
+    /// in the same [`SlotScope::Variant`] element scope (validated at load
+    /// time). This lets one enum render its variants multiple ways in one
+    /// declaration — the C tagged-union case (variants as tag enumerators AND
+    /// as union members).
     fn render_variants(
         &self,
         variants: &[Variant],
         item_slot: &str,
     ) -> Result<Rendered, EmitError> {
-        if item_slot != "variant" {
-            return Err(EmitError::UnknownSlot {
-                target: self.lang.name.clone(),
-                slot: item_slot.to_string(),
-            });
-        }
         let len = variants.len();
         let mut out = Rendered::empty();
         for (i, variant) in variants.iter().enumerate() {
@@ -737,6 +756,7 @@ impl<'a> ItemResolver<'a> {
                 item: self.ctx.item,
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 variant: Some(variant_kind(variant.payload.kind())),
                 // Propagate the enum-level `has_payload` so a target that
                 // renders payload-bearing enums as a discriminated union (e.g.
@@ -896,6 +916,7 @@ impl<'a> FunctionResolver<'a> {
             let mut elem_ctx = self.ctx.clone();
             elem_ctx.first = i == 0;
             elem_ctx.last = i + 1 == len;
+            elem_ctx.index = i;
 
             let scope = make_scope(i);
             // The element carries its OWN metadata, not the function's — a
@@ -931,6 +952,11 @@ impl<'a> FunctionResolver<'a> {
     /// current scope. Only called for names the binding table declares
     /// `Scalar`, so the scope/name combinations here are exhaustive for those.
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
+        // The engine-provided 0-based loop ordinal (bound only in the looped
+        // `param` element scope; see [`RenderContext::index`]).
+        if name == "index" {
+            return Ok(Rendered::text(self.ctx.index.to_string()));
+        }
         match (&self.scope, name) {
             (Scope::Param(p), "name") => Ok(Rendered::text(p.name.clone())),
             (Scope::Param(p), "type") => resolve_type(&p.ty, self.lang, self.index),
@@ -1304,6 +1330,11 @@ impl<'a> StmtResolver<'a> {
     /// Produces the text of a scalar engine-bound statement sub-slot, resolved
     /// against the current statement variant.
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
+        // The engine-provided 0-based loop ordinal, bound only in the looped
+        // switch-case element scope (see [`RenderContext::index`]).
+        if name == "index" {
+            return Ok(Rendered::text(self.ctx.index.to_string()));
+        }
         match &self.scope {
             StmtScope::Case(case) => match name {
                 "value" => emit_expr(&case.value, self.lang, self.index),
@@ -1454,6 +1485,7 @@ impl<'a> StmtResolver<'a> {
                 caller: self.caller,
                 first: i == 0,
                 last: i + 1 == len,
+                index: i,
                 meta: case.meta.clone(),
                 ..Default::default()
             };
@@ -1552,6 +1584,7 @@ fn emit_expr(expr: &Expr, lang: &LanguageDef, index: &UnitIndex) -> Result<Rende
         lang,
         index,
         scope: ExprScope::Node,
+        ord: 0,
     };
     resolver.render_named_slot("expr")
 }
@@ -1884,6 +1917,12 @@ struct ExprResolver<'a> {
     lang: &'a LanguageDef,
     index: &'a UnitIndex<'a>,
     scope: ExprScope<'a>,
+    /// The 0-based loop ordinal of this element within its collection, exposed
+    /// through the engine-provided `{index}` scalar slot (see
+    /// [`RenderContext::index`]). `0` for the node itself (not looped); set to
+    /// the element position when rendering one element of an `args` / `fields`
+    /// / `attrs` / `children` / `elems` collection.
+    ord: usize,
 }
 
 impl<'a> ExprResolver<'a> {
@@ -2053,6 +2092,7 @@ impl<'a> ExprResolver<'a> {
             lang: self.lang,
             index: self.index,
             scope: ExprScope::Node,
+            ord: 0,
         };
         let inner = resolver.render_named_slot("expr")?;
         if is_compound(child) {
@@ -2068,6 +2108,20 @@ impl<'a> ExprResolver<'a> {
     /// Produces the text of a scalar engine-bound expression sub-slot.
     fn scalar(&self, name: &str) -> Result<Rendered, EmitError> {
         match (&self.scope, name) {
+            // The engine-provided 0-based loop ordinal, bound only in the looped
+            // element scopes (`expr_arg`, `field_init`, `attr`, `child`,
+            // `array_elem`; see [`RenderContext::index`]). The node itself is
+            // not looped, so `{index}` is not bound in `SlotScope::Expr` and a
+            // stray reference is rejected at load time.
+            (
+                ExprScope::Arg(_)
+                | ExprScope::Field(_)
+                | ExprScope::Attr(_)
+                | ExprScope::Child(_)
+                | ExprScope::ArrayElem(_)
+                | ExprScope::LambdaParam(_),
+                "index",
+            ) => Ok(Rendered::text(self.ord.to_string())),
             // A call-argument element renders its wrapped expression as `value`.
             (ExprScope::Arg(elem), "value") => self.render_child(elem),
             // A struct-literal field-initializer element: its field name and
@@ -2203,6 +2257,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::Arg(elem),
+                ord: i,
             };
             let slot = self
                 .lang
@@ -2270,6 +2325,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::Field(init),
+                ord: i,
             };
             let slot = self
                 .lang
@@ -2337,6 +2393,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::Attr(attr),
+                ord: i,
             };
             let slot = self
                 .lang
@@ -2405,6 +2462,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::Child(child),
+                ord: i,
             };
             let slot = self
                 .lang
@@ -2473,6 +2531,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::ArrayElem(elem),
+                ord: i,
             };
             let slot = self
                 .lang
@@ -2542,6 +2601,7 @@ impl<'a> ExprResolver<'a> {
                 lang: self.lang,
                 index: self.index,
                 scope: ExprScope::LambdaParam(param),
+                ord: i,
             };
             let slot = self
                 .lang

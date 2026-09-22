@@ -122,6 +122,17 @@ pub struct RenderContext {
     pub first: bool,
     /// `last` — this element is the last in a collection being looped.
     pub last: bool,
+    /// The 0-based ordinal of this element within the collection being looped
+    /// (`params`, `fields`, `variants`, payload types/fields, etc.). Rendered
+    /// by the engine-provided `{index}` scalar slot, which is bound only in the
+    /// looped element scopes that also carry `first`/`last`. This is a **closed,
+    /// engine-provided ordinal** — not a scripting surface: a template can only
+    /// render it (e.g. `_{index}` → `_0`, `_1`, …), giving a target the numbered
+    /// members a C tuple-payload tagged union needs. `0` outside any loop (the
+    /// default), where the `{index}` slot is not reachable anyway (it is not
+    /// bound in a non-looped scope, so a load-time slot-graph check rejects a
+    /// stray reference).
+    pub index: usize,
     /// Answers `expr is int|float|bool|string|char|null|ref|field|index|call|
     /// unary|binary` — the dispatch kind of the expression being rendered.
     /// `None` when the node being rendered is not an expression.

@@ -1,11 +1,9 @@
-//! Integration tests for the **CSS** language definition — the
-//! *tree-core-vs-styles* validator.
+//! Integration tests for the **CSS** language definition.
 //!
-//! Where `tree_core.rs` proves the generic `node` / `attr` / `text` substrate
-//! lowers to angle-bracket markup (HTML) and brace/colon data (JSON), these
-//! tests prove it also lowers to a **stylesheet**: the SAME generic tree AST
-//! shape (`Expr::Node { name, attrs, children }` / `Attr`) expresses CSS's
-//! `selector { property: value; }` rule shape.
+//! These verify that the same generic tree shape that renders to HTML and JSON
+//! also renders to a CSS **stylesheet** — that `Expr::Node { name, attrs,
+//! children }` / `Attr` expresses CSS's `selector { property: value; }` rule
+//! shape.
 //!
 //! The mapping under test:
 //! - a CSS **rule** is a `node` whose `name` is the arbitrary selector string;
@@ -13,7 +11,7 @@
 //!   CSS renders as its own `property: value;` line (contrast HTML's
 //!   ` name="value"` and JSON's `"name": value`);
 //! - a **stylesheet** is a sequence of top-level `Item::Tree` values, joined by
-//!   the engine's blank-line item separator.
+//!   a blank line between rules.
 //!
 //! Every assertion below is hand-verified valid CSS.
 

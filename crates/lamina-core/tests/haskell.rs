@@ -1,12 +1,12 @@
 //! End-to-end tests for the shipped `haskell.mdl` language definition.
 //!
-//! Haskell is a pure functional language, so this suite proves the dual-paradigm
-//! kernel lowers to *idiomatic* Haskell for the functional-shaped subset (a
-//! `fn` as a defining equation, a `struct` as a record, an `enum` as an ADT, a
-//! `switch` as a `case … of`, an `if` as an if-expression, `Expr::Lambda` as
-//! `\x -> …`, a `Call` as juxtaposition application, and type attributes as a
-//! `deriving (…)` clause) and to a correct — if verbose — recursive monadic
-//! action for the imperative `while`.
+//! Haskell is a pure functional language, so this suite verifies the definition
+//! emits *idiomatic* Haskell for the function-shaped constructs (a function as a
+//! defining equation, a `struct` as a record, an `enum` as an ADT, a `switch` as
+//! a `case … of`, an `if` as an if-expression, a lambda as `\x -> …`, a call as
+//! juxtaposition application, and type attributes as a `deriving (…)` clause),
+//! and that genuinely imperative constructs with no faithful pure form are
+//! cleanly forbidden.
 //!
 //! There is no concrete Lamina source syntax yet, so each test builds the AST
 //! directly and transpiles it with the REAL `haskell.mdl` document shipped in

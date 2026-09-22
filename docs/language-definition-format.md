@@ -216,6 +216,18 @@ The engine stays dumb: a projection only selects *which* item template a
 collection loops with — it adds no scripting and no per-element logic beyond the
 usual `When`-table dispatch.
 
+**Statement-sequence projection.** A **statement-sequence** slot (`{body}`,
+`{then}`, `{default}` — including a lambda's `{body}`) is a collection too, so it
+projects exactly like the others: `{body:item_slot}` loops the same statement
+list but renders each element through the named `### item_slot` `When` table
+(which resolves in the same per-element statement scope, so it still sees
+`first`/`last`, `stmt is <kind>`, and the recursive `{stmt}` sub-slot). The
+motivating case is **multi-statement lambda hoisting**: an expression-only /
+lambda-less target renders the hoisted function body through its own item slot
+(e.g. `{body:lambda_stmt}`) so the body renders in full even when the ordinary
+`### statement` table is pass-gated for a different purpose. `{body}` with no
+`:` loops the default `statement` item slot byte-identically to before.
+
 ### Slot Arguments (`{slot(name: value)}`)
 
 A slot's sub-render normally sees only its own context (the element it renders,
@@ -426,6 +438,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `has_payload` | bool | (`enum`) at least one variant carries a payload (tuple or struct) — lets a target branch the whole enum to a discriminated-union form |
 | `has_attributes` | bool | (`struct`/`enum`) the type carries at least one type-level attribute — lets a target branch its derive/annotation line |
 | `has_ret_type` | bool | (`expr is lambda`) the lambda being rendered declares an explicit return type — lets a target render the return-type annotation conditionally |
+| `body is single` / `body is block` | enum | (`expr is lambda`) the **cardinality** of the lambda body: `single` when it is exactly one value-producing statement (a bare expression-statement or a value `return`), so a target can spell it inline (`lambda x: expr`, `|x| expr`); `block` otherwise (zero, two-or-more, or a single non-value statement), so an expression-only / lambda-less target must **hoist** it to a named function. A closed engine-derived fact — the definition may only branch on the two values, never inspect the body further |
 | `attr is <name>` | enum | (inside a `### attribute` item slot) the type attribute being rendered is that one (`displayable` `equatable` `comparable` `hashable` `cloneable` `copyable` `hasdefault` `iterable`) |
 | `value is <kind>` | enum | (one-level structural) the current node's direct `value` sub-part is that expression kind |
 | `value.op is <op>` | enum | (one-level structural) the current node's `value` sub-part is a binary with that operator (machine name: `add` `sub` `mul` …) |
@@ -958,6 +971,21 @@ both agreeing on, say, `loop_0`. The generated form is `<prefix>_<n>` where `n`
 is a monotone per-unit counter, so distinct `(prefix, key)` pairs never collide.
 `fresh_name` is a closed helper (only these names exist), called exactly like
 the other render helpers.
+
+**Per-lambda keying (multi-statement lambda hoisting).** When `fresh_name` is
+called while rendering an `Expr::Lambda` (see the `body is single|block` fact),
+the engine transparently folds the **identity of that lambda** into the memo key
+alongside the author-supplied `(prefix, key)`. This is what makes a lambda-hoist
+robust with the SAME literal call in every lambda: a single lambda's hoisted
+definition and its inline reference both render inside that one lambda, so they
+observe the same identity and share ONE name (`lam_0`), while two DISTINCT
+lambda occurrences observe different identities and receive DISTINCT names
+(`lam_0`, `lam_1`) even though both write `{fresh_name(lam, def)}`. The
+definition never sees the identity — it writes literal arguments; the engine
+scopes the memo. Outside any lambda (e.g. a `while`-hoist) the identity is
+absent, so `fresh_name` behaves exactly as the `(prefix, key)`-only description
+above. This is why a def can hoist an arbitrary number of multi-statement
+lambdas with a single fixed `{fresh_name(...)}` call in its lambda rows.
 
 ### Assembly
 

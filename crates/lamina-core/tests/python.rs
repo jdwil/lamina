@@ -1,33 +1,31 @@
 //! End-to-end tests for the shipped `python.mdl` language definition.
 //!
-//! Python is the kernel's **indentation / brace-free + dynamically-typed +
-//! expression-only-lambda** validator. Unlike every brace-language target, a
-//! Python block is a `:` header plus an *indented suite* with no delimiters, so
-//! these tests are the proof that the engine's column-derived
-//! continuation-line indentation produces correct Python nesting on a brace-free
-//! target. They also pin:
+//! Python uses indentation rather than braces: a block is a `:` header plus an
+//! *indented suite* with no delimiters, so these tests verify that a
+//! multi-line body nests correctly on a brace-free target. They also pin:
 //!
 //! * dynamically-typed signatures with optional type hints
 //!   (`def add(a: int, b: int) -> int:`),
 //! * a `struct` → `@dataclass`, a plain `enum` → `enum.Enum`,
 //! * `if`/`while`/`foreach` suites and Python 3.10 `match`/`case`,
 //! * the operators Python natively has that Rust/C lack (`**`, `//`),
-//! * a single-expression lambda → `lambda x: x + 1` (marked `meta.form = expr`
-//!   by a layer that verified the body is one expression),
-//! * a multi-statement lambda → a clean `ForbiddenConstruct` (Python has no
-//!   multi-statement lambda; see the module-level note on the hoisting blocker).
+//! * a single-expression lambda → `lambda x: x + 1` (`body is single`),
+//! * a multi-statement lambda → HOISTED to a module-level `def <fresh>(x): …`
+//!   (routed into the `defs` region assembled at the top) plus a reference to
+//!   its generated name at the lambda site (`body is block`; kernel blocker #2).
 //!
 //! There is no concrete Lamina source syntax yet, so each test builds the AST
 //! directly and transpiles it with the REAL `python.mdl` document shipped in
-//! `lamina-defs`, asserting the EXACT emitted string. No Python interpreter is
-//! available, so every asserted output was hand-verified to be valid, idiomatic
-//! Python 3.10.
+//! `lamina-defs`, asserting the EXACT emitted string. Every asserted output was
+//! hand-verified to be valid, idiomatic Python 3.10; the lambda tests
+//! additionally cross-check the emitted source with `python3 -c "ast.parse(…)"`
+//! via [`assert_valid_python`] when an interpreter is present on the host.
 
 use std::path::PathBuf;
 
 use lamina_core::ast::{
     BinaryOp, Expr, Field, FieldInit, File, Function, Item, Meta, Param, Primitive, Statement,
-    SwitchCase, Type, Variant, VariantPayload, Visibility,
+    SwitchCase, Type, TypeAttribute, Variant, VariantPayload, Visibility,
 };
 use lamina_core::emitter::emit;
 use lamina_core::lang::LanguageDef;
@@ -52,6 +50,41 @@ fn emit_err(items: Vec<Item>, lang: &LanguageDef) -> String {
     emit(&File { items }, lang)
         .expect_err("expected a forbidden-construct error")
         .to_string()
+}
+
+/// Cross-checks that `source` is syntactically valid Python by shelling out to
+/// `python3 -c "import ast; ast.parse(...)"`. If `python3` is not available on
+/// the host, the check is skipped (the exact-string assertions are the primary
+/// proof; this is an extra guard when an interpreter is present). A `python3`
+/// that IS present but rejects the source fails the test loudly.
+fn assert_valid_python(source: &str) {
+    use std::process::Command;
+    let script = "import sys, ast; ast.parse(sys.stdin.read())";
+    let mut child = match Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        // No interpreter on this host — skip the cross-check.
+        Err(_) => return,
+    };
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .expect("python3 stdin")
+        .write_all(source.as_bytes())
+        .expect("write source to python3");
+    let output = child.wait_with_output().expect("python3 to run");
+    assert!(
+        output.status.success(),
+        "emitted Python failed ast.parse:\n{source}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn i32t() -> Type {
@@ -368,6 +401,82 @@ fn struct_renders_as_dataclass() {
     );
 }
 
+// ---- struct type attributes -> @dataclass options -------------------------
+
+#[test]
+fn equatable_struct_renders_dataclass_eq_option() {
+    // A single `equatable` attribute realizes as `@dataclass(eq=True)` — value
+    // equality, made explicit. Hand-verified + ast.parse valid Python.
+    let s = Item::Struct {
+        name: "Point".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t())],
+        attributes: vec![TypeAttribute::Equatable],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &python());
+    assert_eq!(out, "@dataclass(eq=True)\nclass Point:\n    x: int");
+    assert_valid_python(&format!("from dataclasses import dataclass\n{out}"));
+}
+
+#[test]
+fn comparable_and_hashable_render_order_and_frozen_options() {
+    // `comparable` -> order=True (generates the ordering dunders); `hashable` ->
+    // frozen=True (a frozen dataclass is hashable). Two distinct dataclass
+    // options, comma-joined, no collision.
+    let s = Item::Struct {
+        name: "P".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t())],
+        attributes: vec![TypeAttribute::Comparable, TypeAttribute::Hashable],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &python());
+    assert_eq!(out, "@dataclass(order=True, frozen=True)\nclass P:\n    x: int");
+    assert_valid_python(&format!("from dataclasses import dataclass\n{out}"));
+}
+
+#[test]
+fn displayable_comparable_hashable_all_realize() {
+    let s = Item::Struct {
+        name: "P".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t())],
+        attributes: vec![
+            TypeAttribute::Displayable,
+            TypeAttribute::Comparable,
+            TypeAttribute::Hashable,
+        ],
+        meta: Meta::new(),
+    };
+    let out = emit_ok(vec![s], &python());
+    assert_eq!(
+        out,
+        "@dataclass(repr=True, order=True, frozen=True)\nclass P:\n    x: int"
+    );
+    assert_valid_python(&format!("from dataclasses import dataclass\n{out}"));
+}
+
+#[test]
+fn iterable_attribute_is_forbidden() {
+    // A dataclass has no iteration option; Python realizes iteration only via a
+    // hand-written `__iter__`, not a declarative dataclass parameter, so the
+    // `iterable` attribute is genuinely forbidden.
+    let s = Item::Struct {
+        name: "P".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", i32t())],
+        attributes: vec![TypeAttribute::Iterable],
+        meta: Meta::new(),
+    };
+    let err = emit(&File { items: vec![s] }, &python())
+        .expect_err("iterable should be forbidden");
+    assert!(
+        err.to_string().contains("forbid") || format!("{err:?}").contains("Forbidden"),
+        "iterable should surface a forbidden-construct error, got: {err:?}"
+    );
+}
+
 // ---- enum -> enum.Enum ----------------------------------------------------
 
 #[test]
@@ -514,9 +623,10 @@ fn single_expression_lambda_renders_inline() {
     }];
     let f = func("mk", vec![], Type::Primitive(Primitive::Void), body);
     assert_eq!(
-        emit_ok(vec![f], &python()),
+        emit_ok(vec![f.clone()], &python()),
         "def mk():\n    g = lambda x: x + 1"
     );
+    assert_valid_python(&emit_ok(vec![f], &python()));
 }
 
 #[test]
@@ -562,18 +672,39 @@ fn zero_param_single_expression_lambda() {
     assert_eq!(emit_ok(vec![f], &python()), "def mk():\n    g = lambda: 1");
 }
 
-// ---- multi-statement lambda -> forbidden (no Python expression form) ------
+#[test]
+fn single_return_value_lambda_renders_inline() {
+    // A `body is single` lambda whose one statement is a value `return` also has
+    // a valid inline Python spelling: the `### lambda_tail` projection strips the
+    // `return` keyword, leaving the bare expression `lambda x: x + 1`.
+    let lambda = Expr::Lambda {
+        params: vec![param("x", i32t())],
+        return_type: None,
+        body: vec![Statement::Return(Some(add(r("x"), int("1"))))],
+        meta: Meta::new(),
+    };
+    let body = vec![Statement::Let {
+        name: "g".to_string(),
+        ty: None,
+        value: Some(lambda),
+    }];
+    let f = func("mk", vec![], Type::Primitive(Primitive::Void), body);
+    let out = emit_ok(vec![f], &python());
+    assert_eq!(out, "def mk():\n    g = lambda x: x + 1");
+    assert_valid_python(&out);
+}
+
+// ---- multi-statement lambda -> hoisted to a named `def` + reference -------
 
 #[test]
-fn multi_statement_lambda_is_forbidden() {
+fn multi_statement_lambda_hoists_to_named_def() {
     // Python's `lambda` may hold only ONE expression, never statements. A
-    // multi-statement lambda has no Python expression form, so it is a clean
-    // ForbiddenConstruct here. A layer must lower it to a named `def` — a hoist
-    // the engine's two-pass mechanism cannot perform byte-exactly for an
-    // arbitrary body (see the module note / task report). An UNTAGGED lambda
-    // (no `meta.form = expr`) is likewise forbidden: without the layer's
-    // single-expression guarantee, the kernel `Expr::Lambda` is not known to fit
-    // Python's one-expression lambda.
+    // multi-statement lambda (`body is block`) therefore has no inline form and
+    // is HOISTED: the definition lifts it to a module-level `def <fresh>(x): …`
+    // (routed into the `defs` region, assembled at the top) and leaves the
+    // generated name as the inline reference. This is the whole point of kernel
+    // blocker #2 — the engine's projected statement-sequence + region routing +
+    // per-lambda fresh_name make the hoist expressible entirely in the def.
     let lambda = Expr::Lambda {
         params: vec![param("x", i32t())],
         return_type: None,
@@ -593,10 +724,63 @@ fn multi_statement_lambda_is_forbidden() {
         value: Some(lambda),
     }];
     let f = func("mk", vec![], Type::Primitive(Primitive::Void), body);
-    assert!(
-        emit_err(vec![f], &python()).contains("forbid"),
-        "a multi-statement lambda should be forbidden in Python"
+    let out = emit_ok(vec![f], &python());
+    // The hoisted `def` (with a NON-EMPTY body) appears at the top, and the
+    // lambda site references its generated name — the SAME `lam_0` in both.
+    assert_eq!(
+        out,
+        "def lam_0(x: int):\n    y = x + 1\n    return y\ndef mk():\n    g = lam_0"
     );
+    // The hoisted definition's body is genuinely non-empty (the core-bug proof).
+    assert!(out.contains("y = x + 1\n    return y"), "hoisted body must be non-empty:\n{out}");
+    // The definition and the reference share ONE generated name.
+    assert_eq!(out.matches("lam_0").count(), 2, "def + reference share one name:\n{out}");
+    // Cross-check the emitted Python parses (when python3 is present).
+    assert_valid_python(&out);
+}
+
+#[test]
+fn two_distinct_multi_statement_lambdas_get_distinct_names() {
+    // Two DISTINCT multi-statement lambdas must hoist to two DISTINCT names
+    // (no collision), each definition/reference pair internally consistent —
+    // the per-lambda fresh_name keying (cause #4).
+    let mk_lambda = |var: &str| Expr::Lambda {
+        params: vec![param("x", i32t())],
+        return_type: None,
+        body: vec![
+            Statement::Let {
+                name: var.to_string(),
+                ty: None,
+                value: Some(add(r("x"), int("1"))),
+            },
+            Statement::Return(Some(r(var))),
+        ],
+        meta: Meta::new(),
+    };
+    let body = vec![
+        Statement::Let {
+            name: "g".to_string(),
+            ty: None,
+            value: Some(mk_lambda("y")),
+        },
+        Statement::Let {
+            name: "h".to_string(),
+            ty: None,
+            value: Some(mk_lambda("z")),
+        },
+    ];
+    let f = func("mk", vec![], Type::Primitive(Primitive::Void), body);
+    let out = emit_ok(vec![f], &python());
+    // Two hoisted defs with distinct names, each referenced once.
+    assert!(out.contains("def lam_0("), "first hoisted def missing:\n{out}");
+    assert!(out.contains("def lam_1("), "second hoisted def missing:\n{out}");
+    assert!(out.contains("g = lam_0"), "first reference must use lam_0:\n{out}");
+    assert!(out.contains("h = lam_1"), "second reference must use lam_1:\n{out}");
+    // No collision: lam_0 and lam_1 each appear exactly twice (def + ref).
+    assert_eq!(out.matches("lam_0").count(), 2, "lam_0 = def + ref:\n{out}");
+    assert_eq!(out.matches("lam_1").count(), 2, "lam_1 = def + ref:\n{out}");
+    // Cross-check the emitted Python parses (when python3 is present).
+    assert_valid_python(&out);
 }
 
 // ---- struct literal -> dataclass construction -----------------------------

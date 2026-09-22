@@ -47,15 +47,33 @@ pub struct RenderState {
     /// A `BTreeMap` keeps iteration deterministic; the definition's declared
     /// `layout` drives the actual assembly order.
     regions: BTreeMap<String, String>,
-    /// Memoized fresh-name allocations keyed by `(prefix, key)`. The SAME
-    /// `(prefix, key)` returns the SAME identifier no matter which pass or
+    /// Memoized fresh-name allocations keyed by `(lambda_identity, prefix,
+    /// key)`. The SAME key returns the SAME identifier no matter which pass or
     /// region requests it — this is what lets a hoisted definition (emitted in
     /// one region during one pass) and its inline reference (emitted in another
-    /// region/pass) coordinate on a single generated name.
-    fresh: BTreeMap<(String, String), String>,
+    /// region/pass) coordinate on a single generated name. The
+    /// `lambda_identity` component (the identity of the enclosing lambda, or
+    /// `None` outside any lambda) disambiguates DISTINCT lambdas that use the
+    /// same literal `(prefix, key)`: each lambda occurrence keys its own name,
+    /// so two different lambdas never collide while a single lambda's
+    /// definition + reference still share one name.
+    fresh: BTreeMap<(Option<usize>, String, String), String>,
     /// A monotonically-increasing counter making each distinct `(prefix, key)`
     /// allocation unique within the unit.
     fresh_counter: usize,
+    /// The stable identity of the lambda currently being rendered, or `None`
+    /// when no lambda is on the render path. This is what disambiguates
+    /// `fresh_name` allocations BETWEEN distinct lambdas while keeping a single
+    /// lambda's hoisted-definition pass and its inline-reference pass agreeing
+    /// on ONE name: both passes render the SAME lambda node, so both observe the
+    /// same identity, whereas two different lambda occurrences observe different
+    /// identities. The engine folds this identity into the `fresh_name` memo
+    /// key transparently — the definition still writes `{fresh_name(prefix,
+    /// key)}` with literal arguments and never sees the identity. The identity
+    /// is the lambda AST node's stable address within the unit being emitted
+    /// (the `File` is borrowed for the whole `emit`, so a node's address is
+    /// unique and stable for that duration).
+    current_lambda: Option<usize>,
     /// A stack of caller-supplied named-argument frames (see
     /// [`crate::render::SlotResolver`]). Each argument-bearing slot reference
     /// `{name(arg: value, ...)}` pushes one frame (the rendered arg values)
@@ -195,16 +213,25 @@ impl<'a> UnitIndex<'a> {
 
     /// Returns a unit-stable, unique identifier for `(prefix, key)`, MEMOIZED:
     /// the same `(prefix, key)` always returns the SAME identifier for the whole
-    /// `emit`, regardless of which pass or region requests it. This is the one
+    /// `emit` **within the same enclosing lambda** (or outside any lambda),
+    /// regardless of which pass or region requests it. This is the one
     /// cross-pass/region coordination the mechanism provides — it lets a hoisted
     /// helper definition (emitted into one region during one pass) and its
     /// inline reference (emitted elsewhere) agree on a single generated name.
     ///
+    /// The memo is additionally keyed by the identity of the lambda currently
+    /// being rendered (see [`with_lambda`](UnitIndex::with_lambda)), so two
+    /// DISTINCT lambdas that both write `{fresh_name(lambda, x)}` receive two
+    /// DISTINCT names rather than colliding — the definition supplies only the
+    /// literal `(prefix, key)`; the engine folds the per-lambda identity in
+    /// transparently. Outside any lambda the identity is `None`, so ordinary
+    /// (e.g. `while`-hoisting) uses of `fresh_name` behave exactly as before.
+    ///
     /// The identifier is `<prefix>_<n>` where `n` is a monotonically-increasing
-    /// per-unit counter, so distinct `(prefix, key)` pairs never collide.
+    /// per-unit counter, so distinct keys never collide.
     pub fn fresh_name(&self, prefix: &str, key: &str) -> String {
         let mut state = self.state.borrow_mut();
-        let map_key = (prefix.to_string(), key.to_string());
+        let map_key = (state.current_lambda, prefix.to_string(), key.to_string());
         if let Some(existing) = state.fresh.get(&map_key) {
             return existing.clone();
         }
@@ -213,6 +240,23 @@ impl<'a> UnitIndex<'a> {
         let name = format!("{prefix}_{n}");
         state.fresh.insert(map_key, name.clone());
         name
+    }
+
+    /// Runs `f` with `identity` set as the current-lambda identity for the
+    /// duration, restoring the previous identity afterward (supporting nested
+    /// lambdas). This scopes every `fresh_name` call made while rendering the
+    /// lambda — its hoisted definition and its inline reference alike — to that
+    /// lambda's identity, so the two agree on one name while distinct lambdas
+    /// differ. `identity` is the lambda AST node's stable address within the
+    /// borrowed unit.
+    pub fn with_lambda<T>(&self, identity: usize, f: impl FnOnce() -> T) -> T {
+        let previous = {
+            let mut state = self.state.borrow_mut();
+            state.current_lambda.replace(identity)
+        };
+        let result = f();
+        self.state.borrow_mut().current_lambda = previous;
+        result
     }
 
     /// Consumes and returns the accumulated region buffers (draining the map),
@@ -637,6 +681,28 @@ mod tests {
         // Re-requesting the first pair STILL returns the original id (memoized),
         // even after other allocations bumped the counter.
         assert_eq!(idx.fresh_name("loop", "w"), a);
+    }
+
+    #[test]
+    fn fresh_name_is_keyed_per_lambda_identity() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        // The SAME lambda identity sees the SAME name for a given (prefix, key)
+        // — this is what makes a lambda's hoisted definition and its inline
+        // reference agree, even though they are requested in different passes.
+        let def_name = idx.with_lambda(0xA, || idx.fresh_name("lam", "x"));
+        let ref_name = idx.with_lambda(0xA, || idx.fresh_name("lam", "x"));
+        assert_eq!(def_name, ref_name, "one lambda's def + ref must share a name");
+        // A DISTINCT lambda identity, using the SAME literal (prefix, key), gets
+        // a DISTINCT name — no collision between different lambdas.
+        let other = idx.with_lambda(0xB, || idx.fresh_name("lam", "x"));
+        assert_ne!(def_name, other, "distinct lambdas must get distinct names");
+        // Outside any lambda, keying is unchanged (identity `None`), and it is
+        // distinct from any lambda-scoped allocation of the same (prefix, key).
+        let bare = idx.fresh_name("lam", "x");
+        assert_ne!(bare, def_name);
+        assert_ne!(bare, other);
+        assert_eq!(idx.fresh_name("lam", "x"), bare, "bare allocation memoizes");
     }
 
     #[test]

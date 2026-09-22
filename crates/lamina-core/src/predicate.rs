@@ -185,6 +185,14 @@ pub struct RenderContext {
     /// row so a target can render the return-type annotation conditionally
     /// (Rust `|x| -> i32 { … }`); an inference-only lambda leaves it false.
     pub has_ret_type: bool,
+    /// Answers `body is single|block` — the cardinality of the lambda
+    /// ([`Expr::Lambda`](crate::ast::Expr::Lambda)) body currently being
+    /// rendered. `Some(Single)` when the body is exactly one value-producing
+    /// statement (so a target can spell it inline), `Some(Block)` otherwise (so
+    /// an expression-only / lambda-less target must hoist it to a named
+    /// function). `None` when the node being rendered is not a lambda. This is
+    /// the closed body-cardinality fact — see [`BodyKind`].
+    pub body: Option<BodyKind>,
     /// Answers `has_arg(<name>)` — whether a caller-supplied named argument
     /// `<name>` is currently in scope (pushed by an argument-bearing slot
     /// reference `{slot(name: value)}`; see [`crate::render::SlotResolver`]).
@@ -271,6 +279,39 @@ pub enum CallerKind {
     Async,
     /// The enclosing callable is synchronous.
     Sync,
+}
+
+/// The **cardinality** of a lambda body, for `body is single|block` queries.
+///
+/// This is the closed body-cardinality fact a language definition branches on
+/// when rendering an [`Expr::Lambda`](crate::ast::Expr::Lambda): whether the
+/// lambda's body is a single value-producing expression (so an expression-only
+/// target can spell it inline, `lambda x: expr`) or a genuine statement block
+/// (so a lambda-less / expression-only target must HOIST it to a named
+/// function). It is derived by the engine from the body's shape — it is NOT a
+/// scripting surface: the definition can only branch on the two closed values,
+/// never inspect the body further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyKind {
+    /// `body is single` — the lambda body is exactly one value-producing
+    /// statement (a bare expression-statement or a `return <expr>`), so it has
+    /// a faithful single-expression spelling (`lambda x: expr`, `|x| expr`).
+    Single,
+    /// `body is block` — the lambda body is anything else (zero statements, two
+    /// or more statements, or a single non-value statement such as a `let` or a
+    /// bare `return`), so it needs a full statement-block spelling — and an
+    /// expression-only target must hoist it to a named function.
+    Block,
+}
+
+impl BodyKind {
+    /// The `body is <kind>` spelling used in a `When` predicate.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyKind::Single => "single",
+            BodyKind::Block => "block",
+        }
+    }
 }
 
 /// The dispatch kind of an expression, for `expr is ...` queries.
@@ -521,6 +562,9 @@ impl RenderContext {
             ("has_payload", None) => self.has_payload,
             ("has_attributes", None) => self.has_attributes,
             ("has_ret_type", None) => self.has_ret_type,
+            // Lambda body-cardinality dispatch: `body is single|block`.
+            ("body", Some("single")) => self.body == Some(BodyKind::Single),
+            ("body", Some("block")) => self.body == Some(BodyKind::Block),
             // Enum queries.
             ("ret", Some("void")) => self.ret == Some(RetKind::Void),
             ("ret", Some("never")) => self.ret == Some(RetKind::Never),
@@ -731,6 +775,8 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_payload", None)
             | ("has_attributes", None)
             | ("has_ret_type", None)
+            | ("body", Some("single"))
+            | ("body", Some("block"))
             | ("ret", Some("void"))
             | ("ret", Some("never"))
             | ("ret", Some("type"))

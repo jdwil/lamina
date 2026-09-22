@@ -1,13 +1,17 @@
 //! End-to-end tests for the shipped `c.mdl` language definition.
 //!
-//! C is the kernel's *maximal-forbid* validator: the imperative core maps
-//! DIRECTLY onto C's native constructs (`fn` → C function, `struct` → C
-//! `struct`, a plain `enum` → C `enum`, `if`/`while`/`for`/`switch`/assignment
-//! → their C forms, a cast → `(T)x`, an array literal → `{…}`, a call →
-//! `f(…)`, operators → their C spellings), while everything C *lacks* is
-//! honestly `forbid`den — closures (`Expr::Lambda`), the iterator loop
-//! (`foreach`), enum payloads, type-level deriving, and the `**`/`//`/`>>>`
-//! operators.
+//! These verify that the imperative constructs map directly onto their native C
+//! forms (a function → a C function, a `struct` → a C `struct`, a plain `enum` →
+//! a C `enum`, `if`/`while`/`for`/`switch`/assignment → their C forms, a cast →
+//! `(T)x`, an array literal → `{…}`, a call → `f(…)`, operators → their C
+//! spellings). They also pin C's reconstructions of the features it has no
+//! native syntax for: a `lambda` with a declared return type is LIFTED to a
+//! file-scope function whose name (a function-pointer value) is left at the use
+//! site. What C genuinely cannot host stays forbidden: the iterator loop
+//! (`foreach`), a return-type-less `lambda` (no C signature without inference),
+//! enum payloads (no native sum types; the def-authoring vocabulary cannot
+//! number a tuple payload's members), type-level deriving, and the `**`/`//`/
+//! `>>>` operators.
 //!
 //! There is no concrete Lamina source syntax yet, so each test builds the AST
 //! directly and transpiles it with the REAL `c.mdl` document shipped in
@@ -613,12 +617,94 @@ fn struct_literal_renders_as_compound_literal() {
     );
 }
 
-// ---- lambda: forbidden (C has no closures) -------------------------------
+// ---- lambda: lifted to a named function + function pointer ---------------
 
 #[test]
-fn lambda_is_forbidden() {
-    // C has no closures; Expr::Lambda is honestly forbidden (a layer hoists it
-    // to a named function + function pointer).
+fn typed_lambda_hoists_to_named_function() {
+    // C has no closures; a `lambda` with a declared return type is LIFTED to a
+    // file-scope function and its name (a function-pointer value) is left at
+    // the use site. Hand-verified valid, idiomatic C11:
+    //
+    //   int32_t lam_0(int32_t x) {
+    //       return x + 1;
+    //   }
+    //   void mk() {
+    //       int32_t (*g)(int32_t) = lam_0;
+    //   }
+    let lam = Expr::Lambda {
+        params: vec![param("x", i32t())],
+        return_type: Some(i32t()),
+        body: vec![Statement::Return(Some(add(r("x"), int("1"))))],
+        meta: Meta::new(),
+    };
+    let g = Statement::Let {
+        name: "g".to_string(),
+        ty: Some(Type::FnPtr {
+            params: vec![i32t()],
+            ret: Box::new(i32t()),
+        }),
+        value: Some(lam),
+    };
+    let f = Item::Function(Function {
+        name: "mk".to_string(),
+        visibility: Visibility::Public,
+        modifiers: vec![],
+        params: vec![],
+        return_type: Type::Primitive(Primitive::Void),
+        body: vec![g],
+        meta: Meta::new(),
+    });
+    assert_eq!(
+        emit_ok(vec![f], &c()),
+        "int32_t lam_0(int32_t x) {\n    return x + 1;\n}\nvoid mk() {\n    int32_t (*g)(int32_t) = lam_0;\n}"
+    );
+}
+
+#[test]
+fn two_distinct_typed_lambdas_get_distinct_names() {
+    // Two distinct lambdas lift to two distinct file-scope functions
+    // (`lam_0`, `lam_1`), each referenced by its own generated name.
+    let mk_lam = || Expr::Lambda {
+        params: vec![param("x", i32t())],
+        return_type: Some(i32t()),
+        body: vec![Statement::Return(Some(add(r("x"), int("1"))))],
+        meta: Meta::new(),
+    };
+    let f = func(
+        "mk",
+        vec![],
+        Type::Primitive(Primitive::Void),
+        vec![
+            Statement::Let {
+                name: "g".to_string(),
+                ty: Some(Type::FnPtr {
+                    params: vec![i32t()],
+                    ret: Box::new(i32t()),
+                }),
+                value: Some(mk_lam()),
+            },
+            Statement::Let {
+                name: "h".to_string(),
+                ty: Some(Type::FnPtr {
+                    params: vec![i32t()],
+                    ret: Box::new(i32t()),
+                }),
+                value: Some(mk_lam()),
+            },
+        ],
+    );
+    let out = emit_ok(vec![f], &c());
+    // Both lifted functions present with distinct names; both referenced.
+    assert!(out.contains("int32_t lam_0(int32_t x) {"), "got: {out}");
+    assert!(out.contains("int32_t lam_1(int32_t x) {"), "got: {out}");
+    assert!(out.contains("int32_t (*g)(int32_t) = lam_0;"), "got: {out}");
+    assert!(out.contains("int32_t (*h)(int32_t) = lam_1;"), "got: {out}");
+}
+
+#[test]
+fn return_type_less_lambda_is_forbidden() {
+    // C has no type inference, so a `lambda` with no declared return type has no
+    // valid C signature and is honestly forbidden (a layer must annotate it).
     let lam = Expr::Lambda {
         params: vec![param("x", i32t())],
         return_type: None,
@@ -628,7 +714,7 @@ fn lambda_is_forbidden() {
     let f = func("mk", vec![], named("F"), vec![Statement::Return(Some(lam))]);
     assert!(
         emit_err(vec![f], &c()).contains("forbid"),
-        "Expr::Lambda should be forbidden in C"
+        "a return-type-less lambda should be forbidden in C"
     );
 }
 

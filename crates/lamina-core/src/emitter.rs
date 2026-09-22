@@ -17,8 +17,8 @@ use crate::error::EmitError;
 use crate::index::{EscapeStyle, UnitIndex};
 use crate::lang::{ItemDef, LanguageDef, OperatorSpelling, Outcome, SlotDef};
 use crate::predicate::{
-    CallerKind, ExprKind as PredExprKind, ItemKind as PredItemKind, RenderContext, RetKind,
-    StmtKind as PredStmtKind, VariantKind as PredVariantKind, VisKind,
+    BodyKind, CallerKind, ExprKind as PredExprKind, ItemKind as PredItemKind, RenderContext,
+    RetKind, StmtKind as PredStmtKind, VariantKind as PredVariantKind, VisKind,
 };
 use crate::render::{parse_slot_projection, Rendered, SlotResolver};
 
@@ -80,18 +80,30 @@ fn emit_multipass(
     lang: &LanguageDef,
     index: &UnitIndex,
 ) -> Result<String, EmitError> {
+    // Inline (unrouted) item output accumulates here across every pass, joined
+    // by the SAME blank-line item separator the legacy single-pass path uses,
+    // so a multi-item file renders byte-identically whether or not the
+    // definition declares passes. Region-routed rules write straight to their
+    // named buffers during rendering and are unaffected. Only NON-EMPTY item
+    // fragments contribute (an item that routes everything to a region, or a
+    // pass in which an item renders nothing inline, adds no stray separator).
+    let mut inline_fragments: Vec<String> = Vec::new();
     for pass in &lang.passes.passes {
         index.set_current_pass(Some(pass.clone()));
         for item in &file.items {
             let rendered = emit_item(item, lang, index)?;
-            // Unrouted (inline) output for this item goes to the conventional
-            // `body` region; region-annotated rules already routed themselves.
+            // Unrouted (inline) output for this item is collected for the
+            // conventional `body` region; region-annotated rules already routed
+            // themselves.
             if !rendered.text.is_empty() {
-                index.emit_to_region(BODY_REGION, &rendered.text);
+                inline_fragments.push(rendered.text);
             }
         }
     }
     index.set_current_pass(None);
+    if !inline_fragments.is_empty() {
+        index.emit_to_region(BODY_REGION, &inline_fragments.join("\n\n"));
+    }
 
     // Assemble: concatenate the region buffers in the declared layout order.
     // A layout entry naming a region that received no emission contributes the
@@ -1101,6 +1113,26 @@ fn emit_statement(
     first: bool,
     last: bool,
 ) -> Result<Rendered, EmitError> {
+    emit_statement_via(stmt, "statement", lang, index, caller, first, last)
+}
+
+/// Renders one statement through a NAMED item slot (`statement` by default, or
+/// a projected item slot chosen via `{body:item_slot}`). Shares the statement
+/// fact context of [`emit_statement`] — the `stmt is <kind>` dispatch fact, the
+/// `has …` optional-part flags, and the `first`/`last` loop facts — but
+/// dispatches to `item_slot` instead of hardcoding `statement`. The projected
+/// item slot resolves in the same [`StmtScope::Node`] scope, so it can branch
+/// on the same facts and reuse the recursive `{stmt}` sub-slot. Passing
+/// `"statement"` is byte-identical to the pre-projection behavior.
+fn emit_statement_via(
+    stmt: &Statement,
+    item_slot: &str,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+    caller: Option<CallerKind>,
+    first: bool,
+    last: bool,
+) -> Result<Rendered, EmitError> {
     let ctx = statement_context(stmt, caller, first, last);
     let mut resolver = StmtResolver {
         stmt,
@@ -1110,7 +1142,7 @@ fn emit_statement(
         ctx,
         scope: StmtScope::Node,
     };
-    resolver.render_named_slot("statement")
+    resolver.render_named_slot(item_slot)
 }
 
 /// Renders one statement in *clause* (terminator-free) form via the target's
@@ -1138,9 +1170,21 @@ fn emit_statement_clause(
 }
 
 /// Renders a statement sequence (`then`/`body`/`default`, or a function body),
-/// looping the `item_slot` (`statement`) per element with `first`/`last` loop
-/// facts. Each element renders its own separator via those facts — there is no
+/// looping the `item_slot` per element with `first`/`last` loop facts. Each
+/// element renders its own separator via those facts — there is no
 /// engine-supplied join.
+///
+/// The `item_slot` is normally the recursive `statement` slot (the binding's
+/// default), which renders every statement byte-identically to before. A
+/// definition may instead **project** the sequence through a chosen item slot
+/// via `{body:item_slot}` (the same `{collection:item_slot}` machinery every
+/// other collection already supports): each statement is then dispatched
+/// through the named `### item_slot` `When` table, which resolves in the same
+/// per-element statement scope (so it still sees `first`/`last`, `stmt is
+/// <kind>`, and the recursive `{stmt}` sub-slot). This is what lets a hoisted
+/// lambda body render through a target's dedicated function-body item slot
+/// rather than only the default `statement` slot. A `{body}` reference with no
+/// projection is byte-identical to before (it loops `statement`).
 fn render_statement_sequence(
     statements: &[Statement],
     item_slot: &str,
@@ -1148,20 +1192,12 @@ fn render_statement_sequence(
     index: &UnitIndex,
     caller: Option<CallerKind>,
 ) -> Result<Rendered, EmitError> {
-    // The item slot for a statement sequence is always the recursive
-    // `statement` slot; a definition cannot repoint it (cardinality is fixed by
-    // `slot_binding`). Guard defensively so a mismatch is a clear error.
-    if item_slot != "statement" {
-        return Err(EmitError::UnknownSlot {
-            target: lang.name.clone(),
-            slot: item_slot.to_string(),
-        });
-    }
     let len = statements.len();
     let mut out = Rendered::empty();
     for (i, stmt) in statements.iter().enumerate() {
-        out.push(emit_statement(
+        out.push(emit_statement_via(
             stmt,
+            item_slot,
             lang,
             index,
             caller,
@@ -1801,6 +1837,25 @@ fn is_compound(expr: &Expr) -> bool {
     matches!(expr, Expr::Unary { .. } | Expr::Binary { .. })
 }
 
+/// Classifies a lambda body's cardinality for the closed `body is single|block`
+/// fact ([`BodyKind`]).
+///
+/// A body is [`BodyKind::Single`] iff it is exactly ONE value-producing
+/// statement — a bare expression-statement ([`Statement::Expr`]) or a
+/// value-carrying `return` ([`Statement::Return(Some(_))`]). That is the shape
+/// with a faithful single-expression spelling (`lambda x: expr`, `|x| expr`).
+/// Everything else (zero statements, two-or-more statements, or a single
+/// non-value statement such as a `let` or a bare `return`) is
+/// [`BodyKind::Block`], which an expression-only / lambda-less target must
+/// hoist to a named function. The classification is purely structural and
+/// bounded — it never inspects deeper than the body's top-level statement list.
+fn body_cardinality(body: &[Statement]) -> BodyKind {
+    match body {
+        [Statement::Expr(_)] | [Statement::Return(Some(_))] => BodyKind::Single,
+        _ => BodyKind::Block,
+    }
+}
+
 /// What an [`ExprResolver`] is rendering: an expression node, one element of a
 /// call's argument list, or one field initializer of a struct literal.
 enum ExprScope<'a> {
@@ -1868,6 +1923,13 @@ impl<'a> ExprResolver<'a> {
                     ..
                 }
             ),
+            // A lambda exposes its body cardinality (`body is single|block`) so
+            // an expression-only / lambda-less target can branch between an
+            // inline single-expression spelling and a hoisted named function.
+            body: match self.expr {
+                Expr::Lambda { body, .. } => Some(body_cardinality(body)),
+                _ => None,
+            },
             ..Default::default()
         }
     }
@@ -1958,7 +2020,22 @@ impl<'a> ExprResolver<'a> {
         };
 
         let rendered = match outcome {
-            Outcome::Render(template) => template.render(self)?,
+            Outcome::Render(template) => {
+                // While rendering a lambda node (and its whole sub-tree —
+                // params, body, and any `{fresh_name(...)}` therein), scope the
+                // fresh-name memo to THIS lambda's stable identity so its
+                // hoisted definition and its inline reference share one name
+                // while distinct lambdas differ. The definition never sees the
+                // identity; the engine folds it in transparently. Nested
+                // lambdas restore the outer identity on the way out.
+                if let Expr::Lambda { .. } = self.expr {
+                    let index = self.index;
+                    let identity = std::ptr::from_ref::<Expr>(self.expr) as usize;
+                    index.with_lambda(identity, || template.render(self))?
+                } else {
+                    template.render(self)?
+                }
+            }
             Outcome::Forbid => {
                 return Err(EmitError::ForbiddenConstruct {
                     target: self.lang.name.clone(),

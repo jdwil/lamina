@@ -356,13 +356,35 @@ fn haskell_output_compiles_with_ghc() {
 }
 
 // ==========================================================================
-// Go (go vet / gofmt parse)
+// Go (gofmt -e parse)
 // ==========================================================================
+//
+// Detection note: Go's driver uses the `go version` SUBCOMMAND, not a
+// `go --version` FLAG, so the generic `tool_present("go")` (`go --version`)
+// FAILS and would wrongly skip. `gofmt` is a separate binary on PATH that DOES
+// answer `gofmt --help`/parse, and it is exactly the tool this probe runs, so
+// presence is detected by probing `gofmt` (falling back to `go version`).
+
+/// Returns `true` if `gofmt` (the Go formatter/parser) is available on PATH.
+/// `gofmt -e` on an empty stdin succeeds, so we probe with a trivial help/run.
+fn gofmt_present() -> bool {
+    // `gofmt` with no args reads stdin; probe with `-h` which exits cleanly-ish.
+    // The most robust presence check is simply whether the binary can be spawned.
+    if Command::new("gofmt").arg("-h").output().is_ok() {
+        return true;
+    }
+    // Fallback: `go version` (the correct subcommand — NOT `go --version`).
+    Command::new("go")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
 
 #[test]
 fn go_output_compiles() {
-    if !tool_present("go") {
-        eprintln!("SKIP compile_check Go: go not installed");
+    if !gofmt_present() {
+        eprintln!("SKIP compile_check Go: gofmt not installed");
         return;
     }
     // Go is a Wave B target; only probe if a go.mdl exists yet.
@@ -376,18 +398,113 @@ fn go_output_compiles() {
         return;
     }
     let lang = shipped_def("go");
+
+    // A struct with the generated equatable `Equal` and displayable `String`
+    // (fmt.Stringer) methods — the risky reconstructions — plus a payloadless
+    // `iota` enum, a payload-bearing sealed-interface enum, and a function with
+    // control flow (a counted `for` header, an `if`, a `switch`).
     let point = Item::Struct {
         name: "Point".to_string(),
         visibility: Visibility::Public,
         fields: vec![field("X", Primitive::I32), field("Y", Primitive::I64)],
+        attributes: vec![TypeAttribute::Equatable, TypeAttribute::Displayable],
+        meta: Meta::new(),
+    };
+    let color = Item::Enum {
+        name: "Color".to_string(),
+        visibility: Visibility::Public,
+        variants: vec![
+            Variant {
+                name: "Red".to_string(),
+                payload: VariantPayload::None,
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Green".to_string(),
+                payload: VariantPayload::None,
+                meta: Meta::new(),
+            },
+        ],
         attributes: vec![],
         meta: Meta::new(),
     };
-    let emitted = emit_items(vec![point], &lang);
-    let program = format!("package repr\n\n{emitted}\n");
+    let shape = Item::Enum {
+        name: "Shape".to_string(),
+        visibility: Visibility::Public,
+        variants: vec![
+            Variant {
+                name: "Empty".to_string(),
+                payload: VariantPayload::None,
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Circle".to_string(),
+                payload: VariantPayload::Tuple(vec![Type::Primitive(Primitive::I32)]),
+                meta: Meta::new(),
+            },
+        ],
+        attributes: vec![],
+        meta: Meta::new(),
+    };
+    let sum = Item::Function(Function {
+        name: "Sum".to_string(),
+        visibility: Visibility::Public,
+        modifiers: vec![],
+        params: vec![Param {
+            name: "n".to_string(),
+            ty: Type::Primitive(Primitive::I32),
+            meta: Meta::new(),
+        }],
+        return_type: Type::Primitive(Primitive::I32),
+        body: vec![
+            Statement::Let {
+                name: "acc".to_string(),
+                ty: None,
+                value: Some(Expr::IntLiteral("0".to_string())),
+            },
+            Statement::For {
+                init: Some(Box::new(Statement::Let {
+                    name: "i".to_string(),
+                    ty: None,
+                    value: Some(Expr::IntLiteral("0".to_string())),
+                })),
+                cond: Some(Expr::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: Box::new(Expr::Ref("i".to_string())),
+                    rhs: Box::new(Expr::Ref("n".to_string())),
+                }),
+                step: Some(Box::new(
+                    Statement::assign(
+                        Expr::Ref("i".to_string()),
+                        Expr::Binary {
+                            op: BinaryOp::Add,
+                            lhs: Box::new(Expr::Ref("i".to_string())),
+                            rhs: Box::new(Expr::IntLiteral("1".to_string())),
+                        },
+                    )
+                    .expect("lvalue"),
+                )),
+                body: vec![Statement::assign(
+                    Expr::Ref("acc".to_string()),
+                    Expr::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(Expr::Ref("acc".to_string())),
+                        rhs: Box::new(Expr::Ref("i".to_string())),
+                    },
+                )
+                .expect("lvalue")],
+            },
+            Statement::Return(Some(Expr::Ref("acc".to_string()))),
+        ],
+        meta: Meta::new(),
+    });
+
+    let emitted = emit_items(vec![point, color, shape, sum], &lang);
+    // Prefix the package clause + the `fmt` import the generated Stringer needs.
+    // `gofmt -e` PARSES (it does not type-check import usage), so this stays a
+    // pure syntax check — the appropriate bar for a single-file def probe.
+    let program = format!("package repr\n\nimport \"fmt\"\n\n{emitted}\n");
     let src = write_temp("go_repr", "go", &program);
-    // `gofmt -e` parses and reports syntax errors without needing a full build
-    // graph; a clean parse is the appropriate bar for a single-file def probe.
     let out = Command::new("gofmt")
         .args(["-e", src.to_str().expect("utf8 path")])
         .output()
@@ -502,9 +619,142 @@ fn java_output_compiles_with_javac() {
         eprintln!("SKIP compile_check Java: java.mdl not shipped yet");
         return;
     }
-    // Left minimal until java.mdl exists; the presence+existence guards keep it
-    // a graceful skip so the harness is ready the moment Wave B ships java.mdl.
-    eprintln!("compile_check Java: java.mdl present — extend this test when it ships");
+    let lang = shipped_def("java");
+
+    // A representative program exercising the risky realizations:
+    //   * a plain top-level function → a `public static` method (the honest
+    //     no-free-functions idiom),
+    //   * a struct with record-realizable attributes → a Java `record`
+    //     (equals/hashCode/toString for free),
+    //   * a raw top-level item → verbatim pass-through (a static helper),
+    //   * a payload-bearing enum → a `sealed interface` + `record` variants
+    //     (Java 17+ discriminated union), and
+    //   * a const → a `public static final` field.
+    // Java has no free items, so every emitted member is a class member; the
+    // harness wraps them in one top-level class (public class name == filename,
+    // as javac requires). Nested records/sealed-interface are legal Java 21.
+    let add = Item::Function(Function {
+        name: "addOne".to_string(),
+        visibility: Visibility::Public,
+        modifiers: vec![],
+        params: vec![Param {
+            name: "n".to_string(),
+            ty: Type::Primitive(Primitive::I32),
+            meta: Meta::new(),
+        }],
+        return_type: Type::Primitive(Primitive::I32),
+        body: vec![Statement::Return(Some(Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(Expr::Ref("n".to_string())),
+            rhs: Box::new(Expr::IntLiteral("1".to_string())),
+        }))],
+        meta: Meta::new(),
+    });
+    let point = Item::Struct {
+        name: "Point".to_string(),
+        visibility: Visibility::Public,
+        fields: vec![field("x", Primitive::I32), field("y", Primitive::I64)],
+        attributes: vec![
+            TypeAttribute::Equatable,
+            TypeAttribute::Hashable,
+            TypeAttribute::Displayable,
+        ],
+        meta: Meta::new(),
+    };
+    let raw = Item::Raw {
+        code: "public static int square(int v) { return v * v; }".to_string(),
+        meta: Meta::new(),
+    };
+    let shape = Item::Enum {
+        name: "Shape".to_string(),
+        visibility: Visibility::Public,
+        variants: vec![
+            Variant {
+                name: "Empty".to_string(),
+                payload: VariantPayload::None,
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Circle".to_string(),
+                payload: VariantPayload::Tuple(vec![Type::Primitive(Primitive::I32)]),
+                meta: Meta::new(),
+            },
+            Variant {
+                name: "Rect".to_string(),
+                payload: VariantPayload::Struct(vec![
+                    field("w", Primitive::I32),
+                    field("h", Primitive::I32),
+                ]),
+                meta: Meta::new(),
+            },
+        ],
+        attributes: vec![],
+        meta: Meta::new(),
+    };
+    let konst = Item::Const {
+        name: "ANSWER".to_string(),
+        ty: Type::Primitive(Primitive::I32),
+        value: Expr::IntLiteral("42".to_string()),
+        visibility: Visibility::Public,
+        meta: Meta::new(),
+    };
+    let emitted = emit_items(vec![add, point, raw, shape, konst], &lang);
+
+    // Indent every emitted line one level so it nests cleanly inside the wrapper
+    // class, then add a `main` that references every generated symbol (so nothing
+    // is unused-warning'd away) and a `describe` using a sealed `switch` pattern
+    // (Java 21 pattern-matching switch, which the compiler checks for
+    // exhaustiveness against the permitted records).
+    let indented: String = emitted
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("    {l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let program = format!(
+        "public class JavaRepr {{\n\
+         {indented}\n\n    \
+         static String describe(Shape s) {{\n        \
+             return switch (s) {{\n            \
+                 case Empty e -> \"empty\";\n            \
+                 case Circle c -> \"circle \" + c.c0();\n            \
+                 case Rect r -> \"rect \" + r.w() + \" \" + r.h();\n        \
+             }};\n    \
+         }}\n\n    \
+         public static void main(String[] args) {{\n        \
+             Point p = new Point(1, 2L);\n        \
+             System.out.println(p);\n        \
+             System.out.println(p.equals(p));\n        \
+             System.out.println(p.hashCode());\n        \
+             System.out.println(square(3));\n        \
+             System.out.println(addOne(41));\n        \
+             System.out.println(ANSWER);\n        \
+             System.out.println(describe(new Circle(3)));\n    \
+         }}\n\
+         }}\n"
+    );
+    // javac requires public-class name == filename, so the stem is fixed here.
+    let src = write_temp("JavaRepr", "java", &program);
+    let out_dir = src.parent().expect("temp parent").to_path_buf();
+    let out = Command::new("javac")
+        .args([
+            "-d",
+            out_dir.to_str().expect("utf8 path"),
+            src.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run javac");
+    assert!(
+        out.status.success(),
+        "generated Java failed to compile with javac:\n--- program ---\n{program}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ==========================================================================
@@ -1349,5 +1599,146 @@ fn swift_output_compiles_with_swiftc() {
         "generated Swift failed to parse with swiftc:\n--- program ---\n{emitted}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ==========================================================================
+// SQL DDL (sqlite3 parse)  — self-contained fit-probe block
+// ==========================================================================
+//
+// SQL is a fit-assessment probe: only its DDL (`CREATE TABLE`) maps onto the
+// declarative tree core (see tests/sql.rs and the report). This probe emits a
+// representative `CREATE TABLE` from sql.mdl and, if `sqlite3` is installed,
+// feeds it to an in-memory database (`sqlite3 :memory:`) to confirm it parses
+// and executes as real DDL. When `sqlite3` is absent it degrades to a plain
+// string assertion so the suite still runs green.
+
+#[test]
+fn sql_ddl_output_parses_with_sqlite3() {
+    use lamina_core::ast::{Attr as SqlAttr, Expr as SqlExpr};
+
+    // sql.mdl is a Wave B fit-probe; only run if it exists.
+    let mut sql_def_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    sql_def_path.pop();
+    sql_def_path.pop();
+    sql_def_path.pop();
+    sql_def_path.push("lamina-defs/languages/sql.mdl");
+    if !sql_def_path.exists() {
+        eprintln!("SKIP compile_check SQL: sql.mdl not shipped yet");
+        return;
+    }
+    let lang = shipped_def("sql");
+
+    // A representative table: several columns of distinct SQLite storage classes,
+    // per-column constraints, and a table-level FOREIGN KEY constraint.
+    let sql_col = |name: &str, ty: &str, constraints: &[&str]| -> SqlExpr {
+        let mut attrs = vec![SqlAttr {
+            name: "type".to_string(),
+            value: SqlExpr::StringLiteral(ty.to_string()),
+            meta: Meta::new(),
+        }];
+        for c in constraints {
+            attrs.push(SqlAttr {
+                name: (*c).to_string(),
+                value: SqlExpr::StringLiteral(String::new()),
+                meta: Meta::new(),
+            });
+        }
+        SqlExpr::Node {
+            name: name.to_string(),
+            attrs,
+            children: vec![],
+            meta: Meta::new().with("sql", "column"),
+        }
+    };
+    let table = SqlExpr::Node {
+        name: "orders".to_string(),
+        attrs: vec![],
+        children: vec![
+            sql_col("id", "INTEGER", &["PRIMARY KEY"]),
+            sql_col("user_id", "INTEGER", &["NOT NULL"]),
+            sql_col("total", "REAL", &["NOT NULL", "DEFAULT 0"]),
+            sql_col("note", "TEXT", &[]),
+            SqlExpr::Node {
+                name: "FOREIGN KEY (user_id) REFERENCES users(id)".to_string(),
+                attrs: vec![],
+                children: vec![],
+                meta: Meta::new().with("sql", "constraint"),
+            },
+        ],
+        meta: Meta::new().with("sql", "table"),
+    };
+    let emitted = emit_items(vec![Item::Tree(table)], &lang);
+
+    // Static sanity: the emitted DDL must be a well-formed CREATE TABLE.
+    assert!(
+        emitted.starts_with("CREATE TABLE orders (") && emitted.ends_with(");"),
+        "unexpected SQL DDL shape:\n{emitted}"
+    );
+
+    // Prefix a users table so the FOREIGN KEY reference resolves, then run the
+    // whole script against an in-memory database: a clean run proves the DDL
+    // parses and executes.
+    let script = format!("CREATE TABLE users (id INTEGER PRIMARY KEY);\n{emitted}\n");
+
+    // Preferred backend: the `sqlite3` CLI, `.read`-ing the script into `:memory:`.
+    if tool_present("sqlite3") {
+        let src = write_temp("sql_repr", "sql", &script);
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!(".read {}", src.to_str().expect("utf8 path")))
+            .output()
+            .expect("run sqlite3");
+        assert!(
+            out.status.success() && out.stderr.is_empty(),
+            "generated SQL DDL failed to parse/execute with sqlite3:\n--- script ---\n{script}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    // Fallback: Python's bundled `sqlite3` module runs the SAME SQLite engine, so
+    // `executescript` against an in-memory DB is an equivalent parse+execute
+    // check when the standalone CLI is absent.
+    let py = if tool_present("python3") {
+        Some("python3")
+    } else if tool_present("python") {
+        Some("python")
+    } else {
+        None
+    };
+    if let Some(py) = py {
+        let driver = "import sqlite3, sys\n\
+             sql = sys.stdin.read()\n\
+             con = sqlite3.connect(':memory:')\n\
+             con.executescript(sql)\n\
+             con.close()\n"
+            .to_string();
+        let driver_path = write_temp("sql_driver", "py", &driver);
+        use std::io::Write;
+        let mut child = Command::new(py)
+            .arg(driver_path.to_str().expect("utf8 path"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn python sqlite3 driver");
+        child
+            .stdin
+            .take()
+            .expect("child stdin")
+            .write_all(script.as_bytes())
+            .expect("write sql to python stdin");
+        let out = child.wait_with_output().expect("wait python sqlite3 driver");
+        assert!(
+            out.status.success(),
+            "generated SQL DDL failed to parse/execute via python sqlite3:\n--- script ---\n{script}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    eprintln!(
+        "SKIP compile_check SQL: no sqlite3 CLI or python sqlite3 module (asserted emitted DDL shape only)"
     );
 }

@@ -28,7 +28,7 @@ Lamina commits to supporting a **deliberately diverse** set of targets from the 
 - **Dynamically typed imperative:** JavaScript, Python, Ruby
 - **Functional:** Haskell
 - **Declarative tree / data:** CSS, HTML, JSON, YAML, TOML
-- **Query:** SQL
+- **Procedural SQL dialects:** PL/pgSQL, PL/SQL, T-SQL — the *imperative* members of the SQL family (variables, `IF`/`LOOP`/`WHILE`, assignment, `RETURN`, stored procedures) map onto the imperative kernel. Raw declarative SQL (`SELECT`/DDL/DML) is NOT a target — it is set-oriented relational algebra with no kernel representation, and belongs to a future relational layer/DSL, not a language definition.
 - **Wearable/niche:** Monkey C (Garmin Connect IQ)
 - **Composite (a milestone, not a plain language file):** Svelte/SvelteKit — a `.svelte` file braids TypeScript + HTML + scoped CSS and requires the composite/delegating language-definition mechanism (not yet built).
 

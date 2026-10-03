@@ -12,6 +12,32 @@ elements is documentation for humans and is ignored by the parser — it should
 describe *this target's* choices, not the format itself (that is what this
 document is for).
 
+## The `.mdl` File Family and Naming Convention
+
+Lamina source, language definitions, layers, and profiles are **all `.mdl`
+documents** — they share one document structure and one parser. The *role* a
+given file plays is encoded in a **compound extension**, so the role is
+discoverable from the filename alone (by the engine, the registry, agents, and
+humans) without parsing the body:
+
+| Filename pattern      | Role | What it is |
+|-----------------------|------|------------|
+| `<name>.mdl`          | **source** (default, untagged) | A Lamina program/module. |
+| `<name>.lang.mdl`     | **language definition** | How a target spells each construct (this document's subject). |
+| `<name>.layer.mdl`    | **layer** | A reusable abstraction that lowers target-awarely to kernel IR (and may declare native dependencies). |
+| `<name>.profile.mdl`  | **profile** | A target *project structure*: manifest format (e.g. `requirements.txt` vs Poetry), file layout, and where collected dependencies are written. |
+
+The role tag is the **penultimate** segment; `.mdl` is always last and marks the
+file as a Lamina document (one format family, one tooling association). A **bare**
+`<name>.mdl` with no role tag is a **source** file — source is the common case,
+so it is the untagged default. Shipped language definitions therefore live at
+`languages/<target>.lang.mdl` (e.g. `rust.lang.mdl`, `python.lang.mdl`).
+
+The compound extension is also infrastructure for the agent-authored layer
+registry: a contributed file *declares its role* mechanically, so the verifier
+can route `*.layer.mdl` through layer-verification, `*.lang.mdl` through
+definition-verification, etc., without introspecting content.
+
 ## Document Shape
 
 ```text

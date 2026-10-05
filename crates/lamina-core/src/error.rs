@@ -14,6 +14,17 @@ pub enum ParseError {
         offset: usize,
     },
 
+    /// The lexer reached end of input inside a string or character literal.
+    #[error("unterminated {kind} literal starting at line {line}, column {column}")]
+    UnterminatedLiteral {
+        /// Which literal kind was unterminated (`"string"` or `"char"`).
+        kind: &'static str,
+        /// 1-based line where the literal opened.
+        line: usize,
+        /// 1-based column where the literal opened.
+        column: usize,
+    },
+
     /// The parser expected a specific token but found something else (or end of
     /// input).
     #[error("expected {expected} but found {found}")]
@@ -24,12 +35,51 @@ pub enum ParseError {
         found: String,
     },
 
-    /// A type name was used that is not a known Lamina primitive (for this
-    /// slice).
+    /// The parser expected a specific token but found something else, with the
+    /// source position of the offending token.
+    #[error("expected {expected} but found {found} at line {line}, column {column}")]
+    ExpectedAt {
+        /// A human-readable description of what was expected.
+        expected: String,
+        /// A human-readable description of what was actually found.
+        found: String,
+        /// 1-based line of the offending token.
+        line: usize,
+        /// 1-based column of the offending token.
+        column: usize,
+    },
+
+    /// A type name was used that is not a known Lamina primitive and is not a
+    /// well-formed user-defined type reference.
     #[error("unknown type {name:?}")]
     UnknownType {
         /// The unrecognized type name.
         name: String,
+    },
+
+    /// An assignment target was not a valid lvalue (`Ref`/`Field`/`Index`).
+    #[error("invalid assignment target at line {line}, column {column}: {detail}")]
+    InvalidAssignTarget {
+        /// A description of why the target is invalid.
+        detail: String,
+        /// 1-based line of the assignment.
+        line: usize,
+        /// 1-based column of the assignment.
+        column: usize,
+    },
+
+    /// The source used the `raw` escape hatch, whose parsing is deliberately
+    /// deferred pending the raw-lowering architectural decision (see spec
+    /// `09-parser.md`). It is a hard error rather than a silent drop.
+    #[error(
+        "raw parsing is deferred pending the raw-lowering decision \
+         (encountered `raw` at line {line}, column {column})"
+    )]
+    RawDeferred {
+        /// 1-based line of the `raw` keyword.
+        line: usize,
+        /// 1-based column of the `raw` keyword.
+        column: usize,
     },
 }
 

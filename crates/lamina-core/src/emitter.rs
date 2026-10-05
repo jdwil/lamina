@@ -9,9 +9,10 @@
 //! express fails loudly rather than emitting garbage.
 
 use crate::ast::{
-    slot_binding, Attr, BinaryOp, Expr, ExprKind, Field, FieldInit, File, Function, Item, ItemKind,
-    Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind, SwitchCase, Type,
-    TypeAttribute, UnaryOp, Variant, VariantKind as AstVariantKind, VariantPayload, Visibility,
+    slot_binding, Attr, BinaryOp, CaseBindings, Expr, ExprKind, Field, FieldInit, File, Function,
+    Item, ItemKind, Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind,
+    SwitchCase, Type, TypeAttribute, UnaryOp, Variant, VariantKind as AstVariantKind,
+    VariantPayload, Visibility,
 };
 use crate::error::EmitError;
 use crate::index::{EscapeStyle, UnitIndex};
@@ -1249,13 +1250,25 @@ fn render_statement_sequence(
     Ok(out)
 }
 
-/// What a [`StmtResolver`] is currently rendering: the statement node itself, or
-/// one element of its `switch`'s case list.
+/// What a [`StmtResolver`] is currently rendering: the statement node itself,
+/// one element of its `switch`'s case list, or one payload-binding element of a
+/// bound switch case.
 enum StmtScope<'a> {
     /// Rendering the statement node itself.
     Node,
     /// Rendering one switch-case element.
     Case(&'a SwitchCase),
+    /// Rendering one payload-binding element of a bound switch case: the local
+    /// bind name and (for a named binding) its source variant field name. A
+    /// positional binding has `field == None` (only the ordinal `{index}`
+    /// identifies the tuple member); a named binding sets both.
+    Binding {
+        /// The local name the payload is bound to in the arm.
+        bind: &'a str,
+        /// The source variant field name (named bindings only; `None` for a
+        /// positional binding).
+        field: Option<&'a str>,
+    },
 }
 
 /// Resolves the slots of a statement (the `### statement` table and its
@@ -1280,6 +1293,7 @@ impl<'a> StmtResolver<'a> {
         match self.scope {
             StmtScope::Node => SlotScope::Statement,
             StmtScope::Case(_) => SlotScope::SwitchCase,
+            StmtScope::Binding { .. } => SlotScope::CaseBinding,
         }
     }
 
@@ -1353,6 +1367,21 @@ impl<'a> StmtResolver<'a> {
         match &self.scope {
             StmtScope::Case(case) => match name {
                 "value" => emit_expr(&case.value, self.lang, self.index),
+                _ => self.unknown_slot(name),
+            },
+            // A payload-binding element exposes `name` (the local bind name)
+            // and, for a named binding, `field` (the source variant field
+            // name). `index` is handled by the shared ordinal branch above.
+            StmtScope::Binding { bind, field } => match name {
+                "name" => Ok(Rendered::text((*bind).to_string())),
+                // `field` is meaningful only for a named binding; a positional
+                // binding has no source field, so referencing `{field}` there
+                // is an unknown slot (the def guards it with `case_binds is
+                // named`). Exhaustive on the `Option`, no catch-all misrender.
+                "field" => match field {
+                    Some(f) => Ok(Rendered::text((*f).to_string())),
+                    None => self.unknown_slot(name),
+                },
                 _ => self.unknown_slot(name),
             },
             StmtScope::Node => self.scalar_node(name),
@@ -1449,7 +1478,8 @@ impl<'a> StmtResolver<'a> {
     /// `cases` sub-slot, rendering each element via its item slot with loop
     /// facts.
     fn sequence(&self, name: &str, item_slot: &str) -> Result<Rendered, EmitError> {
-        // In a switch-case element scope, `body` loops the *case's* statements.
+        // In a switch-case element scope, `body` loops the *case's* statements
+        // and `bindings` loops the case's payload bindings.
         if let StmtScope::Case(case) = &self.scope {
             if name == "body" {
                 return render_statement_sequence(
@@ -1459,6 +1489,9 @@ impl<'a> StmtResolver<'a> {
                     self.index,
                     self.caller,
                 );
+            }
+            if name == "bindings" {
+                return self.render_bindings(&case.bindings, item_slot);
             }
             return self.unknown_slot(name);
         }
@@ -1502,6 +1535,12 @@ impl<'a> StmtResolver<'a> {
                 last: i + 1 == len,
                 index: i,
                 meta: case.meta.clone(),
+                // Case payload-binding facts: `case_has_bindings` /
+                // `case_binds is <kind>`. The engine exposes only the binding
+                // SHAPE; whether the def renders a native pattern or a
+                // generated extraction is its choice.
+                case_binding: Some(case.bindings.kind()),
+                case_has_bindings: case.bindings.has_bindings(),
                 ..Default::default()
             };
             let mut elem_resolver = StmtResolver {
@@ -1511,6 +1550,57 @@ impl<'a> StmtResolver<'a> {
                 caller: self.caller,
                 ctx,
                 scope: StmtScope::Case(case),
+            };
+            out.push(elem_resolver.render_named_slot(item_slot)?);
+        }
+        Ok(out)
+    }
+
+    /// Loops a bound case's payload bindings, rendering the `binding` item slot
+    /// per binding with `first`/`last` loop facts and the 0-based `{index}`
+    /// ordinal, in the [`SlotScope::CaseBinding`] element scope.
+    ///
+    /// A [`CaseBindings::None`] case has zero bindings, so this renders the
+    /// empty string (and a def that never references `{bindings}` never calls
+    /// it) — byte-identical to the pre-binding behavior. The engine exposes
+    /// only the binding data (bind name, source field for a named binding,
+    /// ordinal); whether the def renders a native pattern or a generated
+    /// extraction is its choice.
+    fn render_bindings(
+        &self,
+        bindings: &CaseBindings,
+        item_slot: &str,
+    ) -> Result<Rendered, EmitError> {
+        // Collect each element's (bind-name, optional source-field) uniformly,
+        // exhaustively over the closed binding kinds (no catch-all that could
+        // silently misrender a kind).
+        let elems: Vec<(&str, Option<&str>)> = match bindings {
+            CaseBindings::None => Vec::new(),
+            CaseBindings::Positional(names) => {
+                names.iter().map(|n| (n.as_str(), None)).collect()
+            }
+            CaseBindings::Named(fields) => fields
+                .iter()
+                .map(|f| (f.bind.as_str(), Some(f.field.as_str())))
+                .collect(),
+        };
+        let len = elems.len();
+        let mut out = Rendered::empty();
+        for (i, (bind, field)) in elems.into_iter().enumerate() {
+            let ctx = RenderContext {
+                caller: self.caller,
+                first: i == 0,
+                last: i + 1 == len,
+                index: i,
+                ..Default::default()
+            };
+            let mut elem_resolver = StmtResolver {
+                stmt: self.stmt,
+                lang: self.lang,
+                index: self.index,
+                caller: self.caller,
+                ctx,
+                scope: StmtScope::Binding { bind, field },
             };
             out.push(elem_resolver.render_named_slot(item_slot)?);
         }
@@ -3983,6 +4073,218 @@ mod tests {
         emit(&file, &cish()).expect("emit")
     }
 
+    // ---- Switch case payload-binding rendering (spec 07) --------------
+
+    /// A def whose `switch_case` renders a payload binding via the
+    /// `{bindings:binding}` projection and branches on the closed case-binding
+    /// facts (`case_has_bindings`, `case_binds is <kind>`). The `### binding`
+    /// item slot resolves in the new `CaseBinding` scope, exposing `{name}`,
+    /// `{field}`, and the `{index}` ordinal with `first`/`last` loop facts.
+    const BIND_DEF: &str = concat!(
+        "# Lamina Language Definition: bindish\n\n",
+        "```lang-meta\nlamina-format: 0.0.0\ntarget: bindish\ntarget-version: test\n```\n\n",
+        "## Function\n\n",
+        "```template\n",
+        "fn {name}() {{\n",
+        "    {body}\n",
+        "}}\n",
+        "```\n\n",
+        "### statement\n",
+        "| When  | Template |\n",
+        "|-------|----------|\n",
+        "| first | \"{stmt}\" |\n",
+        "| else  | \"\\n{stmt}\" |\n\n",
+        "### stmt\n",
+        "| When           | Template |\n",
+        "|----------------|----------|\n",
+        "| stmt is switch | \"switch {scrutinee} {{\\n    {cases}\\n}}\" |\n",
+        "| stmt is return | \"return {value};\" |\n",
+        "| stmt is expr   | \"{value};\" |\n",
+        "| stmt is break  | \"break;\" |\n",
+        "| else           | forbid |\n\n",
+        "### switch_case\n",
+        "| When                             | Template |\n",
+        "|----------------------------------|----------|\n",
+        "| case_binds is positional         | \"case {value}({bindings:binding}): {{\\n    {body}\\n}}\" |\n",
+        "| case_binds is named              | \"case {value}{{{bindings:binding}}}: {{\\n    {body}\\n}}\" |\n",
+        "| else                             | \"case {value}: {{\\n    {body}\\n}}\" |\n\n",
+        "### binding\n",
+        "| When  | Template |\n",
+        "|-------|----------|\n",
+        "| first | \"{name}=_{index}\" |\n",
+        "| else  | \", {name}=_{index}\" |\n\n",
+        "### expr\n",
+        "| When        | Template |\n",
+        "|-------------|----------|\n",
+        "| expr is int | \"{value}\" |\n",
+        "| expr is ref | \"{value}\" |\n",
+        "| else        | forbid |\n\n",
+        "## Capabilities\n\n",
+        "| Primitive | Action | Target |\n",
+        "|-----------|--------|--------|\n",
+        "| i8 | identity | i8 |\n| i16 | identity | i16 |\n| i32 | identity | i32 |\n",
+        "| i64 | identity | i64 |\n| i128 | identity | i128 |\n| u8 | identity | u8 |\n",
+        "| u16 | identity | u16 |\n| u32 | identity | u32 |\n| u64 | identity | u64 |\n",
+        "| u128 | identity | u128 |\n| isize | identity | isize |\n| usize | identity | usize |\n",
+        "| f16 | identity | f16 |\n| bf16 | identity | bf16 |\n| f32 | identity | f32 |\n",
+        "| f64 | identity | f64 |\n| f128 | identity | f128 |\n| bool | identity | bool |\n",
+        "| void | alias | () |\n| never | alias | ! |\n| byte | alias | u8 |\n",
+        "| bytes | wrap | Vec |\n| char | identity | char |\n| str | wrap | String |\n",
+        "| ptr | wrap | Ptr |\n| fnptr | wrap | Fn |\n",
+    );
+
+    fn bindish() -> LanguageDef {
+        parse_language_def(BIND_DEF).expect("bindish def parses")
+    }
+
+    fn emit_bind_body(body: Vec<Statement>) -> String {
+        use crate::ast::{File, Visibility};
+        let file = File {
+            items: vec![Item::Function(Function {
+                name: "f".to_string(),
+                visibility: Visibility::Private,
+                modifiers: vec![],
+                params: vec![],
+                return_type: Type::Primitive(Primitive::Void),
+                body,
+                meta: crate::ast::Meta::new(),
+            })],
+        };
+        emit(&file, &bindish()).expect("emit")
+    }
+
+    #[test]
+    fn bind_def_validates_bindings_projection() {
+        // The `{bindings:binding}` projection + `### binding` CaseBinding scope
+        // must pass load-time slot-graph validation (reusing the existing
+        // projected-collection + `{index}` machinery).
+        let _ = bindish();
+    }
+
+    #[test]
+    fn none_binding_renders_plain_case() {
+        // A `CaseBindings::None` case renders through the `else` row exactly as
+        // a pre-binding case — byte-identical to the no-projection output.
+        let body = vec![Statement::Switch {
+            scrutinee: Expr::Ref("x".into()),
+            cases: vec![SwitchCase::new(
+                Expr::IntLiteral("1".into()),
+                vec![Statement::Break],
+            )],
+            default: None,
+        }];
+        let out = emit_bind_body(body);
+        assert!(out.contains("case 1: {"), "got: {out}");
+        // The unbound case takes the `else` row — no payload binding spelling.
+        assert!(!out.contains("case 1("), "no payload parens for unbound case: {out}");
+        assert!(!out.contains("case 1{"), "no payload braces for unbound case: {out}");
+    }
+
+    #[test]
+    fn positional_binding_exposes_names_and_index() {
+        use crate::ast::CaseBindings;
+        let body = vec![Statement::Switch {
+            scrutinee: Expr::Ref("s".into()),
+            cases: vec![SwitchCase::with_bindings(
+                Expr::Ref("Circle".into()),
+                vec![Statement::Return(Some(Expr::Ref("r".into())))],
+                CaseBindings::Positional(vec!["r".into(), "g".into()]),
+            )],
+            default: None,
+        }];
+        let out = emit_bind_body(body);
+        // `{bindings:binding}` loops both names with their 0-based ordinals and
+        // the per-element separator from `first`/`last`.
+        assert!(out.contains("case Circle(r=_0, g=_1):"), "got: {out}");
+        // The bound name resolves in the arm body (a plain `Expr::Ref`).
+        assert!(out.contains("return r;"), "got: {out}");
+    }
+
+    #[test]
+    fn named_binding_exposes_field_and_bind() {
+        use crate::ast::{CaseBindings, CaseFieldBind};
+        // Prove both the shorthand (bind==field) and the renamed form expose
+        // the local bind name via `{name}` and the source field via `{field}`.
+        let def = BIND_DEF.replace(
+            "| case_binds is named              | \"case {value}{{{bindings:binding}}}: {{\\n    {body}\\n}}\" |\n",
+            "| case_binds is named              | \"case {value}{{{bindings:named_bind}}}: {{\\n    {body}\\n}}\" |\n",
+        ).replace(
+            "### expr\n",
+            concat!(
+                "### named_bind\n",
+                "| When  | Template |\n",
+                "|-------|----------|\n",
+                "| first | \"{field} as {name}\" |\n",
+                "| else  | \", {field} as {name}\" |\n\n",
+                "### expr\n",
+            ),
+        );
+        let lang = parse_language_def(&def).expect("named-bind def parses");
+        use crate::ast::{File, Visibility};
+        let file = File {
+            items: vec![Item::Function(Function {
+                name: "f".to_string(),
+                visibility: Visibility::Private,
+                modifiers: vec![],
+                params: vec![],
+                return_type: Type::Primitive(Primitive::Void),
+                body: vec![Statement::Switch {
+                    scrutinee: Expr::Ref("s".into()),
+                    cases: vec![SwitchCase::with_bindings(
+                        Expr::Ref("Rect".into()),
+                        vec![Statement::Return(Some(Expr::Ref("w".into())))],
+                        CaseBindings::Named(vec![
+                            CaseFieldBind::shorthand("w"),
+                            CaseFieldBind::new("height", "h"),
+                        ]),
+                    )],
+                    default: None,
+                }],
+                meta: crate::ast::Meta::new(),
+            })],
+        };
+        let out = emit(&file, &lang).expect("emit");
+        // Shorthand: field == bind == "w"; rename: field "height" bound to "h".
+        assert!(out.contains("case Rect{w as w, height as h}:"), "got: {out}");
+        assert!(out.contains("return w;"), "got: {out}");
+    }
+
+    #[test]
+    fn field_slot_on_positional_binding_is_unknown_slot() {
+        // `{field}` is meaningful only for a NAMED binding; referencing it on a
+        // positional binding is a render-time `UnknownSlot` (the def guards it
+        // with `case_binds is named`). Proves the exhaustive, no-catch-all
+        // handling in the CaseBinding scalar scope.
+        use crate::ast::CaseBindings;
+        let def = BIND_DEF.replace(
+            "| first | \"{name}=_{index}\" |\n",
+            "| first | \"{field}=_{index}\" |\n",
+        );
+        let lang = parse_language_def(&def).expect("def parses");
+        use crate::ast::{File, Visibility};
+        let file = File {
+            items: vec![Item::Function(Function {
+                name: "f".to_string(),
+                visibility: Visibility::Private,
+                modifiers: vec![],
+                params: vec![],
+                return_type: Type::Primitive(Primitive::Void),
+                body: vec![Statement::Switch {
+                    scrutinee: Expr::Ref("s".into()),
+                    cases: vec![SwitchCase::with_bindings(
+                        Expr::Ref("Circle".into()),
+                        vec![Statement::Break],
+                        CaseBindings::Positional(vec!["r".into()]),
+                    )],
+                    default: None,
+                }],
+                meta: crate::ast::Meta::new(),
+            })],
+        };
+        let err = emit(&file, &lang).expect_err("field on positional is unknown");
+        assert!(matches!(err, EmitError::UnknownSlot { .. }), "got: {err:?}");
+    }
+
     #[test]
     fn stmt_def_loads_with_kind_dispatch() {
         // The two-level statement model (with recursive `stmt`/`statement` and
@@ -4052,11 +4354,13 @@ mod tests {
                 SwitchCase {
                     value: Expr::IntLiteral("1".into()),
                     body: vec![Statement::Break],
+                    bindings: crate::ast::CaseBindings::None,
                     meta: crate::ast::Meta::new(),
                 },
                 SwitchCase {
                     value: Expr::IntLiteral("2".into()),
                     body: vec![Statement::Break],
+                    bindings: crate::ast::CaseBindings::None,
                     meta: crate::ast::Meta::new(),
                 },
             ],

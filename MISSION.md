@@ -105,6 +105,37 @@ A target that lacks an operator (e.g. no `>>>`, no `**`) `forbid`s it or the lan
 
 The **collection-projection** mechanism (`{collection:item_slot}`) that makes this possible applies uniformly to *every* Sequence-bound collection — `params`, `body`, `fields`, `variants`, `attributes`, and the variant-payload sequences — so one collection can render two idiomatic ways in a single declaration (a C struct's fields as declarations AND as field-wise comparisons; an enum's variants as tag enumerators AND as union members). Alongside `first`/`last`, each looped element exposes its **0-based `{index}` ordinal** as a closed, engine-provided scalar slot (rendered, never a scripting predicate), giving a target the numbered members a C tuple-payload tagged union needs. Both are strictly additive: the default (non-projected, index-free) rendering is byte-identical.
 
+**Switch case payload binding.** A `switch` case may **bind** the matched variant's payload into arm-scoped locals — a tuple payload positionally (`case Circle(r)`) or a struct payload by field name (`case Rect { w, h }`). The kernel carries the binding **data** only (an additive `CaseBindings` on `SwitchCase`, default `None` ⇒ byte-identical to a pre-binding case); whether a target renders a **native pattern** (Rust `Shape::Circle(r) =>`, Swift `case .circle(let r):`, Haskell `Circle r ->`) or a **generated extraction** (C `int32_t r = s.data.Circle._0;`, Go `r := v._0` from the already-certified tagged-union/sealed/discriminated encoding) is **100% the language file's choice** — the engine does no pattern/extraction logic. A `### switch_case` slot dispatches on the closed facts `case_has_bindings` (bool) and `case_binds is none|positional|named` (enum, mirroring `variant is <kind>`), and renders the bound locals through the projected `{bindings:binding}` sequence (item slot `### binding` in the `CaseBinding` element scope, exposing the local `{name}`, the source `{field}` for a named binding, and the `{index}` tuple-member ordinal with `first`/`last`). The bound names are plain value refs, so an arm-body statement referencing `r`/`w`/`h` resolves whether the target bound it by a pattern or an extraction local.
+
+> **Def rendering status (switch payload binding).** The binding is realized and
+> compiler-verified across the **native-pattern / header-unchanged** targets:
+> **Rust** (`Shape::Circle(r) =>`, `Shape::Rect { w: w, h: h } =>`), **Swift**
+> (`case .Circle(let r):`, `case .Rect(w: let w, h: let h):`), **Haskell**
+> (`Circle r ->`, `Rect { w = w, h = h } ->`), **Python** (`case Circle(r):`,
+> `case Rect(w=w, h=h):`), **Java** (record-deconstruction `case Circle(var r):`,
+> `case Rect(var w, var h):`), plus two targets that keep the scrutinee header
+> unchanged and bind by a native arm-test + a generated extraction local read
+> from the already-certified payload encoding: **Kotlin** (`is Shape.Circle -> {
+> val r = s.c0; … }`) and **Ruby** (`when Shape::Circle` + `r = s._0`). Each is
+> verified by its real toolchain (rustc, swiftc, ghc, python3, javac, kotlinc,
+> ruby) via `tests-harness`. The tree/data defs (CSS, HTML, JSON, YAML, TOML)
+> have no imperative switch core, so they are correctly a no-op.
+>
+> **Known blocker (C, Go, JavaScript, TypeScript).** These four
+> *generated-extraction* targets must transform the `switch` **header** itself to
+> dispatch on a discriminant (`switch (s.tag)`, `switch v := s.(type)`,
+> `switch (s.tag)`) rather than on the bare scrutinee — but the kernel exposes no
+> switch-level signal to distinguish a tagged-union/pattern-dispatch switch from
+> a plain integer switch (the `SlotScope::SwitchCase` scope exposes no
+> `scrutinee`, `Statement::Switch` carries no `meta` channel, and there is no
+> switch-level `has_payload`-style fact). Making the header `.tag`-aware
+> unconditionally would break the existing plain-integer `switch (n)` output
+> (changed assertions), so it cannot be done def-only. Unblocking requires a
+> small additive engine signal (e.g. a `meta` channel on `Statement::Switch` so a
+> layer can tag a tagged-union dispatch, or a switch-level `scrutinee_binds`
+> fact). Kotlin/Ruby avoid the blocker because their `when`/`case` headers accept
+> both equality and type/class arms without a header transform.
+
 **Structured `use`.** Beyond the bare `use path;`, an import may be **selective** (`use path::{a, b as c}`) or **module-aliased** (`use path as p`). The bare form is unchanged; the language file branches on the import's shape (Rust `use path::{…};` / `use path as p;`, TypeScript `import { … } from path;` / `import * as p from path;`).
 
 **Function-as-value (fnptr).** A bare function name used as a value is a function pointer (C-style decay) — the basis of Lamina's C-struct-with-function-pointers object model. It is not a new node: it is an identifier reference rendered as the target's function-reference form, and storing one into a `fnptr`-typed field is gated by the `fnptr` capability through that field's declared type.

@@ -149,6 +149,18 @@ pub struct RenderContext {
     /// variant being rendered. `None` when the node being rendered is not an
     /// enum variant.
     pub variant: Option<VariantKind>,
+    /// Answers `case binds none|positional|named` — the payload-binding shape
+    /// of the `switch` case being rendered (see
+    /// [`CaseBindings`](crate::ast::CaseBindings)). `None` when the node being
+    /// rendered is not a switch case; `Some(CaseBindingKind::None)` for a case
+    /// with no binding (so `case binds none` is answerable). This is the closed
+    /// case-binding dispatch fact, mirroring the `variant is <kind>` style.
+    pub case_binding: Option<crate::ast::CaseBindingKind>,
+    /// `case has_bindings` — the `switch` case being rendered introduces a
+    /// payload binding (positional or named). `false` for an unbound case (and
+    /// for any non-case node), so a case built before binding existed leaves it
+    /// false and renders byte-identically.
+    pub case_has_bindings: bool,
     /// `has_value` — the statement being rendered has a value sub-part (a `let`
     /// with an initializer, or a `return` with a returned expression). Lets the
     /// `### statement` row for `let`/`return` render `{value}` conditionally.
@@ -618,6 +630,20 @@ impl RenderContext {
                     .unwrap_or(false)
                     && variant_kind_is_known(kind)
             }
+            // Case payload-binding presence: `case_has_bindings` — a bare
+            // boolean fact (mirroring `has_payload` / `has_attributes`), true
+            // when the switch case being rendered introduces a payload binding.
+            ("case_has_bindings", None) => self.case_has_bindings,
+            // Case payload-binding dispatch: `case_binds is <kind>`. The value
+            // must be a known binding-shape spelling and match the case
+            // currently being rendered (`none` for an unbound case). Mirrors
+            // the `variant is <kind>` closed-enum style.
+            ("case_binds", Some(kind)) => {
+                self.case_binding
+                    .map(|k| k.as_str() == kind)
+                    .unwrap_or(false)
+                    && case_binding_kind_is_known(kind)
+            }
             // Type-attribute dispatch: `attr is <name>`. The value must be a
             // known type-attribute spelling and match the attribute currently
             // being rendered in a `### attribute` item slot.
@@ -767,6 +793,15 @@ fn variant_kind_is_known(kind: &str) -> bool {
     matches!(kind, "unit" | "tuple" | "struct")
 }
 
+/// Returns `true` if `kind` is a known `case_binds is <kind>` value spelling.
+/// Keeps the closed case-binding fact vocabulary in one place, shared by
+/// [`RenderContext::eval_fact`] and [`validate_fact`], delegating to the
+/// [`CaseBindingKind`](crate::ast::CaseBindingKind) vocabulary so an unknown
+/// binding-shape spelling is a load-time error.
+fn case_binding_kind_is_known(kind: &str) -> bool {
+    matches!(kind, "none" | "positional" | "named")
+}
+
 /// Returns `true` if `name` is a known `attr is <name>` value spelling. Keeps
 /// the closed type-attribute fact vocabulary in one place, shared by
 /// [`RenderContext::eval_fact`] and [`validate_fact`]. Mirrors
@@ -813,6 +848,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_payload", None)
             | ("has_attributes", None)
             | ("has_ret_type", None)
+            | ("case_has_bindings", None)
             | ("body", Some("single"))
             | ("body", Some("block"))
             | ("ret", Some("void"))
@@ -837,6 +873,10 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // vocabulary.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("variant", Some(k)) if variant_kind_is_known(k));
+    // `case_binds is <kind>` is validated against the closed case-binding-shape
+    // vocabulary; an unknown binding-shape value is rejected at parse time.
+    let known = known
+        || matches!((fact.key.as_str(), fact.value.as_deref()), ("case_binds", Some(k)) if case_binding_kind_is_known(k));
     // `attr is <name>` is validated against the closed type-attribute
     // vocabulary; an unknown attribute value is rejected at parse time.
     let known = known
@@ -1872,5 +1912,77 @@ mod tests {
             ..Default::default()
         };
         assert!(!c2.eval(&p));
+    }
+
+    // ---- Switch case payload-binding facts (spec 07) ------------------
+
+    #[test]
+    fn case_has_bindings_fact() {
+        let p = parse_predicate("case_has_bindings").expect("parse");
+        // An unbound case leaves the flag false.
+        assert!(!ctx().eval(&p));
+        let bound = RenderContext {
+            case_has_bindings: true,
+            ..Default::default()
+        };
+        assert!(bound.eval(&p));
+    }
+
+    #[test]
+    fn case_binds_kind_dispatch() {
+        use crate::ast::CaseBindingKind;
+        let pos = parse_predicate("case_binds is positional").expect("parse");
+        let named = parse_predicate("case_binds is named").expect("parse");
+        let none = parse_predicate("case_binds is none").expect("parse");
+
+        let c_pos = RenderContext {
+            case_binding: Some(CaseBindingKind::Positional),
+            ..Default::default()
+        };
+        assert!(c_pos.eval(&pos));
+        assert!(!c_pos.eval(&named));
+        assert!(!c_pos.eval(&none));
+
+        let c_named = RenderContext {
+            case_binding: Some(CaseBindingKind::Named),
+            ..Default::default()
+        };
+        assert!(c_named.eval(&named));
+        assert!(!c_named.eval(&pos));
+
+        let c_none = RenderContext {
+            case_binding: Some(CaseBindingKind::None),
+            ..Default::default()
+        };
+        assert!(c_none.eval(&none));
+        assert!(!c_none.eval(&pos));
+    }
+
+    #[test]
+    fn case_binds_rejects_unknown_kind() {
+        // An unknown binding-shape spelling is a LOAD-TIME (parse-time) error,
+        // keeping the fact vocabulary closed.
+        let err = parse_predicate("case_binds is tuple").expect_err("unknown kind");
+        assert!(matches!(err, PredicateError::UnknownFact { .. }));
+    }
+
+    #[test]
+    fn case_binding_facts_compose() {
+        use crate::ast::CaseBindingKind;
+        // A def recognizes a bound positional case with one predicate.
+        let p = parse_predicate("case_has_bindings && case_binds is positional").expect("parse");
+        let c = RenderContext {
+            case_has_bindings: true,
+            case_binding: Some(CaseBindingKind::Positional),
+            ..Default::default()
+        };
+        assert!(c.eval(&p));
+        // An unbound case fails the compound predicate.
+        let unbound = RenderContext {
+            case_has_bindings: false,
+            case_binding: Some(CaseBindingKind::None),
+            ..Default::default()
+        };
+        assert!(!unbound.eval(&p));
     }
 }

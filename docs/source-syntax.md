@@ -271,6 +271,13 @@ public fn fast_sqrt(x: f64): f64 {
   tagged-union/sealed encodings on C/Go/etc.). This is its OWN implementation arc
   (kernel AST + emitter + all-16-def rendering + compiler-verified tests), done
   under the disclosed-not-hacked + independent-audit discipline — NOT folded
-  silently into the parser work.
+  silently into the parser work. **Kernel AST + engine support now landed:**
+  `SwitchCase` carries a `CaseBindings` (`None` · `Positional(Vec<String>)` ·
+  `Named(Vec<CaseFieldBind>)`, default `None`), the engine exposes the closed
+  `case_has_bindings` / `case_binds is none|positional|named` facts and the
+  projected `{bindings:binding}` sequence (item slot in the `CaseBinding`
+  scope, exposing `{name}` / `{field}` / `{index}`). The parser (a separate
+  arc) will target this AST; the def rendering across all 16 targets is the
+  next arc.
 - **Rich SDK binding, dependency versioning, profiles' manifest mechanics** — all
   layer/tooling-arc concerns, deferred (see the layer-ecosystem wiki).

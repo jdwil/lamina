@@ -1506,26 +1506,205 @@ pub enum AstError {
     },
 }
 
-/// One `case` of a [`Statement::Switch`]: a matched value and its body.
+/// One `case` of a [`Statement::Switch`]: a matched value, its body, and an
+/// optional payload binding introduced by the case head.
 ///
-/// Structural equality **ignores** the `meta` field (see [`Meta`]).
+/// A case may bind the matched enum variant's payload into locals scoped to the
+/// arm's body (`case Circle(r) { … }` binds the tuple payload positionally;
+/// `case Rect { w, h } { … }` binds the struct payload by field name) — see
+/// [`CaseBindings`]. The default is [`CaseBindings::None`] (no binding), which
+/// renders byte-identically to a case built before payload binding existed.
+///
+/// Structural equality **ignores** the `meta` field (see [`Meta`]) but
+/// **includes** `bindings` (two cases binding different payload locals are not
+/// structurally equal); a [`CaseBindings::None`] binding compares equal to
+/// another `None`, so an unbound case is byte-identical in equality terms to a
+/// case built before the field existed.
 #[derive(Debug, Clone)]
 pub struct SwitchCase {
     /// The value this case matches against the scrutinee.
     pub value: Expr,
     /// The statements run when the case matches.
     pub body: Vec<Statement>,
+    /// The payload binding introduced by this case head; default
+    /// [`CaseBindings::None`] (no binding).
+    pub bindings: CaseBindings,
     /// Engine-transparent metadata (see [`Meta`]); default empty.
     pub meta: Meta,
 }
 
+impl SwitchCase {
+    /// Builds an **unbound** case (no payload binding) — the pre-binding form.
+    ///
+    /// This is the churn-free constructor for the common no-binding case: it
+    /// sets `bindings` to [`CaseBindings::None`] and `meta` to the empty map, so
+    /// it renders byte-identically to a case built before payload binding
+    /// existed. Use [`SwitchCase::with_bindings`] to introduce a payload
+    /// binding.
+    pub fn new(value: Expr, body: Vec<Statement>) -> Self {
+        SwitchCase {
+            value,
+            body,
+            bindings: CaseBindings::None,
+            meta: Meta::new(),
+        }
+    }
+
+    /// Builds a case that binds the matched variant's payload into arm-scoped
+    /// locals (see [`CaseBindings`]); `meta` is the empty map.
+    pub fn with_bindings(value: Expr, body: Vec<Statement>, bindings: CaseBindings) -> Self {
+        SwitchCase {
+            value,
+            body,
+            bindings,
+            meta: Meta::new(),
+        }
+    }
+}
+
 impl PartialEq for SwitchCase {
     fn eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.body == other.body
+        self.value == other.value && self.body == other.body && self.bindings == other.bindings
     }
 }
 
 impl Eq for SwitchCase {}
+
+/// The payload binding a [`SwitchCase`] head introduces for the matched enum
+/// variant, scoped to that arm's body.
+///
+/// This is the closed kernel set of case-binding shapes, mirroring the enum
+/// variant payload shapes ([`VariantPayload`]):
+/// - [`CaseBindings::None`] — no payload binding (the pre-binding behavior and
+///   the **default**); answers `case binds none` and leaves `case has_bindings`
+///   false. Renders byte-identically to a case built before binding existed.
+/// - [`CaseBindings::Positional`] — a tuple payload bound positionally
+///   (`case Circle(r)` → `["r"]`); answers `case binds positional`. Each bound
+///   name is exposed in the per-element [`SlotScope::CaseBinding`] scope with
+///   its 0-based `{index}` ordinal.
+/// - [`CaseBindings::Named`] — a struct payload bound by field name
+///   (`case Rect { w, h }` → `[{field: "w", bind: "w"}, {field: "h", bind:
+///   "h"}]`); answers `case binds named`. Each binding exposes both the source
+///   field name and the local bind name.
+///
+/// The engine stays **dumb**: it exposes the binding *data* (names, kind,
+/// ordinal, source field) via the `case binds <kind>` / `case has_bindings`
+/// facts and the `{bindings:binding}` projection; whether a target renders the
+/// binding as a native pattern (`Circle(r) =>`) or a generated extraction
+/// (`int32_t r = s.data.Circle._0;`) is entirely the language definition's
+/// choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseBindings {
+    /// No payload binding — the pre-binding behavior and the default.
+    None,
+    /// A tuple payload bound positionally: the ordered local names
+    /// (`case Circle(r, s)` → `["r", "s"]`).
+    Positional(Vec<String>),
+    /// A struct payload bound by field name (see [`CaseFieldBind`]).
+    Named(Vec<CaseFieldBind>),
+}
+
+impl Default for CaseBindings {
+    /// The default binding is [`CaseBindings::None`] (no payload binding), so a
+    /// case built without specifying `bindings` is byte-identical to one built
+    /// before the field existed.
+    fn default() -> Self {
+        CaseBindings::None
+    }
+}
+
+impl CaseBindings {
+    /// The dispatch kind of this binding, for the `case binds <kind>` fact.
+    pub fn kind(&self) -> CaseBindingKind {
+        match self {
+            CaseBindings::None => CaseBindingKind::None,
+            CaseBindings::Positional(_) => CaseBindingKind::Positional,
+            CaseBindings::Named(_) => CaseBindingKind::Named,
+        }
+    }
+
+    /// Whether this case introduces any payload binding (the `case
+    /// has_bindings` fact). `false` for [`CaseBindings::None`]; `true`
+    /// otherwise (even for an empty positional/named list, which is a binding
+    /// shape the parser would not produce but is handled consistently).
+    pub fn has_bindings(&self) -> bool {
+        !matches!(self, CaseBindings::None)
+    }
+
+    /// The number of bound locals (0 for [`CaseBindings::None`]). Used by the
+    /// engine to loop the `{bindings:binding}` projection.
+    pub fn len(&self) -> usize {
+        match self {
+            CaseBindings::None => 0,
+            CaseBindings::Positional(names) => names.len(),
+            CaseBindings::Named(fields) => fields.len(),
+        }
+    }
+
+    /// Whether there are no bound locals (always `true` for
+    /// [`CaseBindings::None`]).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The dispatch kind of a [`CaseBindings`], answering `case binds <kind>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseBindingKind {
+    /// No payload binding (`case binds none`).
+    None,
+    /// A positional (tuple) payload binding (`case binds positional`).
+    Positional,
+    /// A named (struct) payload binding (`case binds named`).
+    Named,
+}
+
+impl CaseBindingKind {
+    /// The canonical `case binds <kind>` value spelling for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaseBindingKind::None => "none",
+            CaseBindingKind::Positional => "positional",
+            CaseBindingKind::Named => "named",
+        }
+    }
+}
+
+/// One field binding of a [`CaseBindings::Named`] struct-payload binding: the
+/// source variant field name and the local name it is bound to.
+///
+/// For the `{ w, h }` shorthand where the local name equals the field name,
+/// `field` and `bind` are identical; for an explicit rename the parser would
+/// set them independently. The engine never interprets either name — it only
+/// exposes them to the def's `### binding` item slot (via the `name` / `field`
+/// scalar slots).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseFieldBind {
+    /// The variant's field name this binding reads from.
+    pub field: String,
+    /// The local name the field value is bound to in the arm.
+    pub bind: String,
+}
+
+impl CaseFieldBind {
+    /// Builds a field binding from an explicit source field and local name.
+    pub fn new(field: impl Into<String>, bind: impl Into<String>) -> Self {
+        CaseFieldBind {
+            field: field.into(),
+            bind: bind.into(),
+        }
+    }
+
+    /// Builds a shorthand field binding where the local name equals the field
+    /// name (the `{ w, h }` form).
+    pub fn shorthand(field: impl Into<String>) -> Self {
+        let field = field.into();
+        CaseFieldBind {
+            bind: field.clone(),
+            field,
+        }
+    }
+}
 
 impl Statement {
     /// This statement's engine-transparent [`Meta`] (see [`Meta`]).
@@ -2424,8 +2603,21 @@ pub enum SlotScope {
     /// Resolving slots of a single [`SwitchCase`] element (one element of a
     /// [`Statement::Switch`]'s `cases`). Exposes `value` (the matched
     /// expression) and `body` (the case's statement sequence); loop facts let
-    /// the item template supply its own separator.
+    /// the item template supply its own separator. When the case binds a
+    /// variant payload (see [`CaseBindings`]) it also exposes the `bindings`
+    /// sequence (looping the `binding` item slot in [`SlotScope::CaseBinding`]),
+    /// guarded by the `case has_bindings` / `case binds <kind>` facts.
     SwitchCase,
+    /// Resolving slots of a single payload-binding element (one element of a
+    /// bound [`SwitchCase`]'s `bindings`). Exposes `name` (the local bind name
+    /// — for a positional binding the sole name, for a named binding the local
+    /// name), `field` (the source variant field name — meaningful only for a
+    /// named binding, equal to `name` for the `{ w, h }` shorthand), and
+    /// `index` (the 0-based ordinal, the tuple-member position for a positional
+    /// binding); loop facts (`first`/`last`) let the item template supply its
+    /// own separator. The engine exposes only this binding data — whether the
+    /// def renders a native pattern or a generated extraction is its choice.
+    CaseBinding,
     /// Resolving slots of a [`Item::Struct`] declaration itself: its `name`
     /// (scalar) and `fields` (a sequence looping the `field` item slot).
     Struct,
@@ -2611,7 +2803,8 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             _ => None,
         },
         // A single switch-case element: `value` is the matched expression,
-        // `body` the case's statement sequence.
+        // `body` the case's statement sequence, `bindings` the optional
+        // variant-payload binding looped through the `binding` item slot.
         SlotScope::SwitchCase => match name {
             "value" => Some(SlotShape::Scalar),
             // 0-based loop ordinal (see [`RenderContext::index`]).
@@ -2620,6 +2813,21 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
                 item_slot: "statement".to_string(),
                 item_scope: SlotScope::Statement,
             }),
+            "bindings" => Some(SlotShape::Sequence {
+                item_slot: "binding".to_string(),
+                item_scope: SlotScope::CaseBinding,
+            }),
+            _ => None,
+        },
+        // A single payload-binding element: `name` is the local bind name,
+        // `field` the source variant field name (named bindings only — equal to
+        // `name` for the `{ w, h }` shorthand), `index` the 0-based ordinal.
+        SlotScope::CaseBinding => match name {
+            "name" => Some(SlotShape::Scalar),
+            "field" => Some(SlotShape::Scalar),
+            // 0-based loop ordinal (the tuple-member position for a positional
+            // binding; see [`RenderContext::index`]).
+            "index" => Some(SlotShape::Scalar),
             _ => None,
         },
         // A compound type's sub-slots. `pointee` and `ret` are single nested
@@ -3939,5 +4147,88 @@ mod tests {
             meta: crate::ast::Meta::new(),
         };
         assert_eq!(enum_plain, enum_derived);
+    }
+
+    // ---- Switch case payload bindings (spec 07) -----------------------
+
+    #[test]
+    fn case_bindings_default_is_none() {
+        assert_eq!(CaseBindings::default(), CaseBindings::None);
+        assert_eq!(CaseBindings::None.kind(), CaseBindingKind::None);
+        assert!(!CaseBindings::None.has_bindings());
+        assert!(CaseBindings::None.is_empty());
+        assert_eq!(CaseBindings::None.len(), 0);
+    }
+
+    #[test]
+    fn case_bindings_positional_shape() {
+        let b = CaseBindings::Positional(vec!["r".into(), "s".into()]);
+        assert_eq!(b.kind(), CaseBindingKind::Positional);
+        assert!(b.has_bindings());
+        assert_eq!(b.len(), 2);
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn case_bindings_named_shape_and_field_binds() {
+        let explicit = CaseFieldBind::new("w", "width");
+        assert_eq!(explicit.field, "w");
+        assert_eq!(explicit.bind, "width");
+        let short = CaseFieldBind::shorthand("h");
+        assert_eq!(short.field, "h");
+        assert_eq!(short.bind, "h");
+        let b = CaseBindings::Named(vec![explicit, short]);
+        assert_eq!(b.kind(), CaseBindingKind::Named);
+        assert!(b.has_bindings());
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn case_binding_kind_spellings() {
+        assert_eq!(CaseBindingKind::None.as_str(), "none");
+        assert_eq!(CaseBindingKind::Positional.as_str(), "positional");
+        assert_eq!(CaseBindingKind::Named.as_str(), "named");
+    }
+
+    #[test]
+    fn switch_case_new_is_unbound_and_eq_matches_literal() {
+        // `SwitchCase::new` yields an unbound case; it must be structurally
+        // equal to a hand-built literal with `CaseBindings::None` (the
+        // byte-identical-to-before guarantee for equality).
+        let via_new = SwitchCase::new(
+            Expr::IntLiteral("1".into()),
+            vec![Statement::Break],
+        );
+        let via_literal = SwitchCase {
+            value: Expr::IntLiteral("1".into()),
+            body: vec![Statement::Break],
+            bindings: CaseBindings::None,
+            meta: Meta::new(),
+        };
+        assert_eq!(via_new, via_literal);
+        assert_eq!(via_new.bindings, CaseBindings::None);
+    }
+
+    #[test]
+    fn switch_case_eq_includes_bindings_but_ignores_meta() {
+        let base = SwitchCase::new(Expr::IntLiteral("1".into()), vec![Statement::Break]);
+        // Same value/body but a different binding ⇒ NOT equal.
+        let bound = SwitchCase::with_bindings(
+            Expr::IntLiteral("1".into()),
+            vec![Statement::Break],
+            CaseBindings::Positional(vec!["r".into()]),
+        );
+        assert_ne!(base, bound);
+        // Metadata still ignored by equality (two unbound cases differing only
+        // in meta are equal).
+        let mut meta = Meta::new();
+        meta.set("origin", "test");
+        let with_meta = SwitchCase {
+            value: Expr::IntLiteral("1".into()),
+            body: vec![Statement::Break],
+            bindings: CaseBindings::None,
+            meta,
+        };
+        assert_eq!(base, with_meta);
     }
 }

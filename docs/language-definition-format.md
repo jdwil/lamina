@@ -282,7 +282,8 @@ tuple-member convention) and is a **slot** (rendered), not a fact — there is n
 `index is <n>` predicate, keeping the engine dumb. `{index}` is bound only in
 the looped element scopes that also carry `first`/`last` (`param`, `field`,
 `variant`, `payload_type` / `payload_field`, `attribute`, `use_item`,
-`switch_case`, and the expression-collection element scopes `expr_arg`,
+`switch_case`, `binding` (a switch case's payload binding), and the
+expression-collection element scopes `expr_arg`,
 `field_init`, `attr`, `child`, `array_elem`); referencing `{index}` in a
 non-looped scope (e.g. on the struct node itself) is a load-time unknown-slot
 error, keeping binding and resolution consistent. Adding `{index}` to a
@@ -521,6 +522,8 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `stmt is <kind>` | enum | the statement being rendered is that kind (`block` `let` `return` `if` `while` `for` `foreach` `switch` `break` `continue` `assign` `expr`) |
 | `item is <kind>` | enum | the top-level item being rendered is that kind (`function` `struct` `enum` `typedef` `const` `use` `tree`) |
 | `variant is <kind>` | enum | the enum variant being rendered has that payload shape (`unit` `tuple` `struct`) |
+| `case_has_bindings` | bool | (inside a `### switch_case` item slot) the `switch` case being rendered binds a matched variant's payload into arm-scoped locals (`case Circle(r)`, `case Rect { w, h }`) — lets a target branch between a plain case and one that introduces payload bindings |
+| `case_binds is <kind>` | enum | (inside a `### switch_case` item slot) the **shape** of the case's payload binding (`none` · `positional` · `named`): `none` for an unbound case (byte-identical to a case built before binding existed), `positional` for a tuple payload bound by position (`case Circle(r)`), `named` for a struct payload bound by field name (`case Rect { w, h }`). A closed engine-provided dispatch fact (mirroring `variant is <kind>`); an unknown binding-shape spelling is a load-time error. The engine exposes only the binding SHAPE — native-pattern vs generated-extraction is the def's choice. See [Switch Case Payload Binding](#switch-case-payload-binding) |
 | `has_value` `has_type` `has_else` `has_init` `has_cond` `has_step` `has_default` | bool | the statement carries that optional sub-part |
 | `has_len` | bool | (array type) the array being rendered carries an explicit length (sized `[T; N]` vs unsized `[T]`) |
 | `has_items` | bool | (`use` import) the import carries a selective item list (`use path::{a, b}`) |
@@ -683,6 +686,104 @@ fixed array lives in the kernel.
   each with its own `has_alias` fact for the `name as alias` form) and `{alias}`;
   TypeScript spells the three forms `import path;`, `import * as p from path;`,
   `import { a, b as c } from path;`.
+
+### Switch Case Payload Binding
+
+A `switch` case may **bind the matched enum variant's payload** into locals
+scoped to that arm's body — a tuple payload positionally (`case Circle(r)`) or a
+struct payload by field name (`case Rect { w, h }`). The kernel exposes the
+binding **data** only; whether a target renders a **native pattern** (the
+binding appears in the case head, e.g. Rust `Shape::Circle(r) =>`, Swift
+`case .circle(let r):`, Haskell `Circle r ->`) or a **generated extraction** (a
+local declaration at arm entry read from the already-certified tagged-union /
+sealed / discriminated encoding, e.g. C `int32_t r = s.data.Circle._0;`, Go
+`r := v._0`) is **100% the definition's choice**. The engine does no
+pattern/extraction logic.
+
+A `### switch_case` item slot dispatches on two closed facts:
+
+- **`case_has_bindings`** (bool) — the case introduces a payload binding
+  (positional or named). `false` for an unbound case, so an unbound case renders
+  **byte-identically** to one built before binding existed.
+- **`case_binds is none|positional|named`** (enum) — the binding **shape**:
+  `none` (unbound), `positional` (tuple payload), `named` (struct payload). A
+  closed dispatch fact mirroring `variant is <kind>`; an unknown binding-shape
+  spelling is a load-time error.
+
+The bound locals render through a **projected sequence** `{bindings:binding}`
+that loops a `### binding` item slot in the **`binding`** element scope
+(`SlotScope::CaseBinding`), reusing the ordinary projected-collection +
+`{index}` machinery (no new primitive). The element scope exposes:
+
+- **`{name}`** — the local bind name (for a positional binding the sole name;
+  for a named binding the local name, equal to the field name for the
+  `{ w, h }` shorthand).
+- **`{field}`** — the **source variant field name**, meaningful only for a
+  **named** binding (where it names the field the local reads from). Referencing
+  `{field}` on a positional binding is an `UnknownSlot` error, so a def guards
+  it with `case_binds is named`.
+- **`{index}`** — the 0-based ordinal (the **tuple-member position** for a
+  positional binding), alongside the usual `first`/`last` loop facts so the item
+  template supplies its own separator.
+
+The bound **names are plain value refs**: a statement in the arm body that
+references a bound name (`r`, `w`, `h`) is an ordinary `expr is ref` rendering
+the identifier text, so the name resolves whether the target bound it by a
+native pattern or declared it as an extraction local. The def need only ensure
+the name is in scope in the emitted target code (the pattern binds it, or the
+extraction `let`/declaration introduces it).
+
+```text
+### switch_case
+| When                     | Template |
+|--------------------------|----------|
+| case_binds is positional | "case {value}({bindings:binding}) => {{ {body} }}"      |
+| case_binds is named      | "case {value} {{ {bindings:field_bind} }} => {{ {body} }}" |
+| else                     | "case {value} => {{ {body} }}" |
+
+### binding                 (native positional pattern: just the name)
+| When  | Template |
+|-------|----------|
+| first | "{name}"   |
+| else  | ", {name}" |
+
+### field_bind              (native named pattern: field: local)
+| When  | Template |
+|-------|----------|
+| first | "{field}: {name}"   |
+| else  | ", {field}: {name}" |
+```
+
+A **generated-extraction** target instead renders the bindings as locals at the
+top of the arm body (projecting the same sequence through its own extraction
+item slot), reading each from the certified payload encoding and numbering tuple
+members via `{index}`:
+
+```text
+### switch_case
+| When              | Template |
+|-------------------|----------|
+| case_has_bindings | @extract_case |
+| else              | "case {value}: {{\n    {body}\n}}" |
+
+### extract_case
+​```template
+case {value}: {{
+    {bindings:extract}
+    {body}
+}}
+​```
+
+### extract                 (tuple member: s.data.<Variant>._<index>)
+| When  | Template |
+|-------|----------|
+| first | "int32_t {name} = s.data.{value}._{index};" |
+| else  | "\n    int32_t {name} = s.data.{value}._{index};" |
+```
+
+Adding payload binding is **strictly additive**: a `case_binds is none` case
+never selects a binding row and never loops `{bindings}`, so its output is
+byte-identical to a case authored before the feature existed.
 
 ### Lambda (the functional-core primitive)
 

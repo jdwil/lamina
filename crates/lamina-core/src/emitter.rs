@@ -221,7 +221,17 @@ fn emit_function(
         ctx,
         scope: Scope::Function,
     };
-    lang.function.entry.render(&mut resolver)
+    // Push this function's lexical value-type frame (parameters + type-annotated
+    // `let` bindings) so a `switch` scrutinee that is a bare name of a typed
+    // binding can be resolved to its declared type while the body renders. The
+    // frame is popped before returning so sibling functions never see it. This
+    // backs the closed `scrutinee is payload_enum` fact; nothing else reads it,
+    // so an unused frame is harmless and the behavior stays byte-identical for
+    // every switch whose scrutinee does not resolve to a payload-bearing enum.
+    index.push_value_types(crate::index::function_value_types(function));
+    let result = lang.function.entry.render(&mut resolver);
+    index.pop_value_types();
+    result
 }
 
 /// Builds the base fact context the `When` predicates read for a function.
@@ -1095,8 +1105,13 @@ fn pred_stmt_kind(kind: StatementKind) -> PredStmtKind {
 /// fact, the `has value`/`has else`/… optional-part flags, the inherited
 /// `caller` synchrony, and the `first`/`last` loop facts for this position in
 /// its sequence.
+///
+/// For a `switch`, it also computes the closed `scrutinee is payload_enum`
+/// fact from `index` (the per-unit value-type scope the emitter maintains),
+/// which is why the `index` is threaded in here alongside the statement.
 fn statement_context(
     stmt: &Statement,
+    index: &UnitIndex,
     caller: Option<CallerKind>,
     first: bool,
     last: bool,
@@ -1123,7 +1138,22 @@ fn statement_context(
             ctx.has_cond = cond.is_some();
             ctx.has_step = step.is_some();
         }
-        Statement::Switch { default, .. } => ctx.has_default = default.is_some(),
+        Statement::Switch {
+            scrutinee,
+            default,
+            ..
+        } => {
+            ctx.has_default = default.is_some();
+            // Closed switch-scrutinee signal: `scrutinee is payload_enum` is
+            // true iff the scrutinee resolves (via the lexical value-type scope
+            // the emitter pushed for the enclosing function) to a payload-bearing
+            // enum type. A target that realizes such an enum as a tagged union /
+            // sealed interface / discriminated union branches its switch header
+            // to dispatch on the discriminant. Every other scrutinee (an integer,
+            // a payloadless enum, an unresolvable expression) leaves this false,
+            // so an ordinary `switch` renders byte-identically to before.
+            ctx.scrutinee_is_payload_enum = index.scrutinee_is_payload_enum(scrutinee);
+        }
         // An `assign` exposes its `value` sub-part for one-level structural
         // predicates (Part 2): `value is <kind>`, `value.op is <op>` (when the
         // value is a binary), and `target eq value.lhs` (structural equality of
@@ -1175,7 +1205,7 @@ fn emit_statement_via(
     first: bool,
     last: bool,
 ) -> Result<Rendered, EmitError> {
-    let ctx = statement_context(stmt, caller, first, last);
+    let ctx = statement_context(stmt, index, caller, first, last);
     let mut resolver = StmtResolver {
         stmt,
         lang,
@@ -1199,7 +1229,7 @@ fn emit_statement_clause(
     index: &UnitIndex,
     caller: Option<CallerKind>,
 ) -> Result<Rendered, EmitError> {
-    let ctx = statement_context(stmt, caller, true, true);
+    let ctx = statement_context(stmt, index, caller, true, true);
     let mut resolver = StmtResolver {
         stmt,
         lang,

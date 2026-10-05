@@ -525,6 +525,7 @@ the structural facts below — only one `.` is allowed, so deeper paths
 | `case_has_bindings` | bool | (inside a `### switch_case` item slot) the `switch` case being rendered binds a matched variant's payload into arm-scoped locals (`case Circle(r)`, `case Rect { w, h }`) — lets a target branch between a plain case and one that introduces payload bindings |
 | `case_binds is <kind>` | enum | (inside a `### switch_case` item slot) the **shape** of the case's payload binding (`none` · `positional` · `named`): `none` for an unbound case (byte-identical to a case built before binding existed), `positional` for a tuple payload bound by position (`case Circle(r)`), `named` for a struct payload bound by field name (`case Rect { w, h }`). A closed engine-provided dispatch fact (mirroring `variant is <kind>`); an unknown binding-shape spelling is a load-time error. The engine exposes only the binding SHAPE — native-pattern vs generated-extraction is the def's choice. See [Switch Case Payload Binding](#switch-case-payload-binding) |
 | `has_value` `has_type` `has_else` `has_init` `has_cond` `has_step` `has_default` | bool | the statement carries that optional sub-part |
+| `scrutinee is payload_enum` | enum | (inside a `### statement` / `### stmt` row dispatched on `stmt is switch`) the `switch` being rendered dispatches over a **payload-bearing enum** scrutinee — an enum value whose declaration carries at least one tuple/struct variant — as opposed to a plain integer/other scrutinee. Lets a target that realizes such an enum as a tagged union / sealed interface / discriminated union branch its switch **header** to dispatch on the discriminant (`switch (s.tag)`, `switch v := s.(type)`), while a plain integer `switch` keeps the bare `switch (s)` form. A closed, engine-computed single-value dispatch fact; an unknown value spelling is a load-time error. The engine computes it **conservatively** from existing type resolution: it is `true` only when the scrutinee is a bare name (`expr is ref`) whose declared type resolves — via the enclosing function's parameter / type-annotated `let` scope, or a top-level `const` — to a payload-bearing `enum`. Any scrutinee whose type cannot be resolved (a complex expression, an untyped `let`) answers `false`, so the engine **never guesses tagged**. Default `false` ⇒ byte-identical to a `switch` rendered before this fact existed. See [Switch Scrutinee Dispatch Signal](#switch-scrutinee-dispatch-signal-scrutinee-is-payload_enum) |
 | `has_len` | bool | (array type) the array being rendered carries an explicit length (sized `[T; N]` vs unsized `[T]`) |
 | `has_items` | bool | (`use` import) the import carries a selective item list (`use path::{a, b}`) |
 | `has_alias` | bool | (`use` import / import item) the module — or a selectively-imported item — carries an alias (`use path as p`, `a as b`) |
@@ -784,6 +785,51 @@ case {value}: {{
 Adding payload binding is **strictly additive**: a `case_binds is none` case
 never selects a binding row and never loops `{bindings}`, so its output is
 byte-identical to a case authored before the feature existed.
+
+### Switch Scrutinee Dispatch Signal (`scrutinee is payload_enum`)
+
+A target that realizes a payload-bearing `enum` as a **tagged union / sealed
+interface / discriminated union** (C, Go, JavaScript, TypeScript) cannot
+`switch` on the bare enum value: it must dispatch on the **discriminant** in the
+header — `switch (s.tag)`, Go `switch v := s.(type)`, `switch (s.tag)` — while a
+plain integer `switch` keeps the bare `switch (s)` form. The two are *mutually
+exclusive* for the same `### statement` row, so the def needs a fact to tell
+them apart; making the header `.tag`-aware unconditionally would corrupt every
+ordinary integer `switch`.
+
+The closed, switch-level fact **`scrutinee is payload_enum`** answers exactly
+this: it is `true` iff the `switch` being rendered dispatches over a
+payload-bearing-enum value. A def branches its `stmt is switch` row (or a block
+slot it references) on it:
+
+```text
+### stmt
+| When                                        | Template |
+|---------------------------------------------|----------|
+| stmt is switch && scrutinee is payload_enum | @tagged_switch |
+| stmt is switch                              | @plain_switch  |
+| …                                           | …              |
+```
+
+The engine computes the fact **conservatively** from the type resolution it
+already performs — it never guesses. It maintains a per-unit lexical
+**value-type scope** (each function's parameters plus its type-annotated `let`
+bindings, pushed while that function's body renders) and the top-level `const`s.
+The fact is `true` only when the scrutinee is a **bare name** (`expr is ref`)
+whose declared type, resolved through that scope, is a `Type::Named` naming an
+`enum` with **at least one** tuple/struct variant. Every other scrutinee — a
+complex expression, an untyped `let`, an unknown name, an integer, a payloadless
+enum — answers **`false`**, which keeps the ordinary bare-dispatch form. An
+unknown value spelling after `scrutinee is` is a **load-time** error (the fact is
+closed, exactly like `variant is <kind>` / `case_binds is <kind>`).
+
+Adding `scrutinee is payload_enum` is **strictly additive**: a definition that
+never references it, and any `switch` whose scrutinee is not a resolvable
+payload-bearing enum, renders byte-identically to before the fact existed (the
+default is `false`). The per-case payload **extraction** inside such a switch
+reuses the existing [Switch Case Payload Binding](#switch-case-payload-binding)
+machinery (the `{bindings:…}` projection, bind name, source field, and
+`{index}`); this fact only gates the switch **header**.
 
 ### Lambda (the functional-core primitive)
 

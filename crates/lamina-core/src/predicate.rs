@@ -177,6 +177,21 @@ pub struct RenderContext {
     pub has_step: bool,
     /// `has_default` — a `switch` carries a `default` branch.
     pub has_default: bool,
+    /// Answers `scrutinee is payload_enum` — whether the `switch` being
+    /// rendered dispatches over a **payload-bearing enum** scrutinee (an enum
+    /// value whose declaration carries at least one tuple/struct variant), as
+    /// opposed to a plain integer/other scrutinee.
+    ///
+    /// A target that realizes a payload-bearing enum as a tagged union / sealed
+    /// interface / discriminated union must dispatch its `switch` on the
+    /// discriminant in the header (`switch (s.tag)`); this closed fact lets its
+    /// `### statement` switch row branch to that form only when warranted. The
+    /// engine computes it conservatively from the per-unit value-type scope (a
+    /// scrutinee that is a bare name of a typed parameter / `let` binding /
+    /// top-level `const` of a payload-bearing enum type); any scrutinee whose
+    /// type cannot be resolved leaves this `false`. Default `false` keeps an
+    /// ordinary integer `switch` byte-identical to before this fact existed.
+    pub scrutinee_is_payload_enum: bool,
     /// `has_len` — an array type carries an explicit length (rendering the
     /// sized form `[T; N]` rather than the unsized/slice form `[T]`). Set when
     /// rendering a [`Type::Array`](crate::ast::Type::Array) with `len: Some(_)`.
@@ -588,6 +603,11 @@ impl RenderContext {
             ("has_cond", None) => self.has_cond,
             ("has_step", None) => self.has_step,
             ("has_default", None) => self.has_default,
+            // Switch-scrutinee dispatch signal: `scrutinee is payload_enum` —
+            // the switch being rendered dispatches over a payload-bearing enum
+            // value (so a tagged-union/sealed/discriminated target emits a
+            // discriminant-dispatch header). Closed single-value enum query.
+            ("scrutinee", Some("payload_enum")) => self.scrutinee_is_payload_enum,
             ("has_len", None) => self.has_len,
             ("has_items", None) => self.has_items,
             ("has_alias", None) => self.has_alias,
@@ -842,6 +862,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_cond", None)
             | ("has_step", None)
             | ("has_default", None)
+            | ("scrutinee", Some("payload_enum"))
             | ("has_len", None)
             | ("has_items", None)
             | ("has_alias", None)
@@ -1351,6 +1372,27 @@ mod tests {
     #[test]
     fn rejects_unknown_fact() {
         let err = parse_predicate("frobnicate").expect_err("unknown");
+        assert!(matches!(err, PredicateError::UnknownFact { .. }));
+    }
+
+    #[test]
+    fn scrutinee_payload_enum_fact() {
+        // `scrutinee is payload_enum` reads the closed switch-scrutinee signal.
+        let p = parse_predicate("scrutinee is payload_enum").expect("parse");
+        let tagged = RenderContext {
+            scrutinee_is_payload_enum: true,
+            ..Default::default()
+        };
+        assert!(tagged.eval(&p), "payload-enum scrutinee matches");
+        // Default (every integer / unresolvable scrutinee) is false.
+        assert!(!ctx().eval(&p), "non-payload-enum scrutinee does not match");
+    }
+
+    #[test]
+    fn rejects_unknown_scrutinee_value() {
+        // The scrutinee fact is a closed single-value enum query; any other
+        // value spelling is rejected at parse time.
+        let err = parse_predicate("scrutinee is integer").expect_err("unknown value");
         assert!(matches!(err, PredicateError::UnknownFact { .. }));
     }
 

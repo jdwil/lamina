@@ -270,6 +270,26 @@ impl Item {
             Item::Raw { meta, .. } => meta,
         }
     }
+
+    /// Whether this item is an [`Item::Enum`] whose declaration carries at
+    /// least one payload-bearing variant (tuple or struct — i.e. any variant
+    /// that is not [`VariantPayload::None`]).
+    ///
+    /// This is the enum-declaration side of the closed `scrutinee is
+    /// payload_enum` switch fact: such an enum is the one a tagged-union /
+    /// sealed / discriminated target realizes by dispatching a `switch` on the
+    /// discriminant rather than on the bare value. A payloadless enum (every
+    /// variant unit) answers `false`, so a plain integer-style `switch` over it
+    /// keeps its byte-identical bare-dispatch rendering. A non-enum item always
+    /// answers `false`.
+    pub fn is_payload_bearing_enum(&self) -> bool {
+        match self {
+            Item::Enum { variants, .. } => variants
+                .iter()
+                .any(|v| !matches!(v.payload, VariantPayload::None)),
+            _ => false,
+        }
+    }
 }
 
 /// Structural equality of items **ignores metadata** (see [`Meta`]) **and

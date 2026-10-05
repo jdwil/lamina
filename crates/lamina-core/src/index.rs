@@ -84,6 +84,21 @@ pub struct RenderState {
     /// nested sub-render resolvers, which each hold their own borrow of the same
     /// `&UnitIndex`.
     arg_frames: Vec<Vec<(String, crate::render::Rendered)>>,
+    /// A stack of lexical value-type frames: each frame maps an in-scope value
+    /// name (a function parameter or a type-annotated `let` binding) to its
+    /// declared [`Type`]. Pushed by the emitter when it begins rendering a
+    /// function body and popped when it finishes, so a name reference can be
+    /// resolved to a declared type **only** for the common, locally-nameable
+    /// cases the engine can be certain of.
+    ///
+    /// This backs the closed `scrutinee is payload_enum` switch fact: resolving
+    /// a `switch`'s scrutinee to its declared type (when it is a bare name of a
+    /// typed parameter/binding) lets the engine answer whether that type is a
+    /// payload-bearing enum. The engine NEVER guesses — a name not present in
+    /// any frame (and not a top-level const) resolves to `None`, which the
+    /// caller treats as "not a payload enum" (the safe default). Innermost
+    /// frame wins, so a shadowing inner binding is honored.
+    value_types: Vec<Vec<(String, Type)>>,
 }
 
 /// A read-only index of one compilation unit ([`File`]): a map of top-level
@@ -278,6 +293,76 @@ impl<'a> UnitIndex<'a> {
         self.state.borrow_mut().arg_frames.pop();
     }
 
+    /// Pushes a lexical value-type frame (name → declared [`Type`]) onto the
+    /// scope stack. The emitter pushes one frame per function body (its
+    /// parameters plus its type-annotated `let` bindings) before rendering and
+    /// pops it after, so a scrutinee name reference can be resolved to a
+    /// declared type while that function renders. See
+    /// [`value_type`](UnitIndex::value_type) and
+    /// [`scrutinee_is_payload_enum`](UnitIndex::scrutinee_is_payload_enum).
+    pub fn push_value_types(&self, frame: Vec<(String, Type)>) {
+        self.state.borrow_mut().value_types.push(frame);
+    }
+
+    /// Pops the most recently pushed value-type frame. A no-op if the stack is
+    /// empty (which never happens under balanced push/pop from the emitter).
+    pub fn pop_value_types(&self) {
+        self.state.borrow_mut().value_types.pop();
+    }
+
+    /// Resolves a value `name` to its declared [`Type`], searching the lexical
+    /// value-type frames from innermost outward (so a shadowing inner binding
+    /// wins) and falling back to a top-level `const`'s declared type. Returns
+    /// `None` when the name is not a locally-nameable typed binding — the engine
+    /// never guesses a type it cannot be certain of.
+    pub fn value_type(&self, name: &str) -> Option<Type> {
+        let state = self.state.borrow();
+        if let Some(ty) = state
+            .value_types
+            .iter()
+            .rev()
+            .find_map(|frame| frame.iter().find(|(k, _)| k == name).map(|(_, t)| t.clone()))
+        {
+            return Some(ty);
+        }
+        // A top-level `const` of enum type is the other locally-nameable case.
+        match self.items.get(name) {
+            Some(Item::Const { ty, .. }) => Some(ty.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether `scrutinee` resolves to a **payload-bearing enum type**, backing
+    /// the closed `scrutinee is payload_enum` switch fact.
+    ///
+    /// A `switch` over a payload-bearing enum must, on a tagged-union / sealed /
+    /// discriminated target, dispatch on the discriminant in the header
+    /// (`switch (s.tag)`) rather than on the bare value; this fact lets a
+    /// language definition branch its `### statement` switch row to that form
+    /// only when it is warranted, keeping an ordinary integer `switch`
+    /// byte-identical.
+    ///
+    /// Resolution is deliberately conservative and purely local — the engine
+    /// never guesses. It answers `true` **only** when the scrutinee is a bare
+    /// name ([`Expr::Ref`]) whose declared type (a function parameter, a
+    /// type-annotated `let` binding, or a top-level `const`) is a
+    /// [`Type::Named`] resolving to an [`Item::Enum`] with at least one
+    /// payload-bearing variant. Any scrutinee whose type cannot be resolved
+    /// (a complex expression, an untyped `let`, an unknown name) answers
+    /// `false` — the safe default that preserves the plain bare-dispatch form.
+    pub fn scrutinee_is_payload_enum(&self, scrutinee: &Expr) -> bool {
+        let Expr::Ref(name) = scrutinee else {
+            return false;
+        };
+        let Some(Type::Named(type_name)) = self.value_type(name) else {
+            return false;
+        };
+        match self.items.get(type_name.as_str()) {
+            Some(item) => item.is_payload_bearing_enum(),
+            None => false,
+        }
+    }
+
     /// Looks up a caller-supplied argument by `name`, searching frames from the
     /// innermost (top of stack) outward so a deeper passed arg shadows a
     /// shallower one. Returns the already-rendered value if bound, else `None`.
@@ -332,6 +417,109 @@ fn item_name(item: &Item) -> Option<&str> {
         // A raw / verbatim item is an opaque code string — it binds no name the
         // index can key on.
         Item::Raw { .. } => None,
+    }
+}
+
+/// Collects the lexical value-type frame for a function body: every parameter
+/// (name → declared type) plus every type-annotated `let` binding anywhere in
+/// the body (recursing into nested blocks/branches/loops/switch arms). An
+/// untyped `let` is omitted — the engine only records types it can be certain
+/// of. The emitter pushes this frame before rendering the body (and pops it
+/// after), so a scrutinee name reference can be resolved to a declared type for
+/// the common, locally-nameable cases backing the `scrutinee is payload_enum`
+/// fact.
+///
+/// Later bindings naturally override earlier same-named ones because
+/// [`value_type`](UnitIndex::value_type) searches a frame front-to-back via
+/// `find` after the stack search; to keep the dominant case correct we append
+/// params first (outermost) and lets after, and the lookup takes the first
+/// match. A rare same-named local that shadows a parameter is uncommon in the
+/// payload-enum-scrutinee case and never produces a *false positive* tagged
+/// dispatch unless BOTH names are payload-enum typed — in which case the
+/// dispatch is still correct.
+pub(crate) fn function_value_types(function: &crate::ast::Function) -> Vec<(String, Type)> {
+    let mut frame: Vec<(String, Type)> = Vec::new();
+    for param in &function.params {
+        frame.push((param.name.clone(), param.ty.clone()));
+    }
+    for stmt in &function.body {
+        collect_typed_lets_in_stmt(stmt, &mut frame);
+    }
+    frame
+}
+
+/// Recursively records every type-annotated `let` binding reachable from
+/// `stmt` into `frame` (name → declared type). Untyped `let`s are skipped.
+fn collect_typed_lets_in_stmt(stmt: &Statement, frame: &mut Vec<(String, Type)>) {
+    match stmt {
+        Statement::Let {
+            name,
+            ty: Some(ty),
+            ..
+        } => frame.push((name.clone(), ty.clone())),
+        Statement::Let { ty: None, .. } => {}
+        Statement::Block(body) => {
+            for s in body {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+        }
+        Statement::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            for s in then_block {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+            if let Some(e) = else_block {
+                collect_typed_lets_in_stmt(e, frame);
+            }
+        }
+        Statement::While { body, .. } => {
+            for s in body {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+        }
+        Statement::For {
+            init, step, body, ..
+        } => {
+            if let Some(i) = init {
+                collect_typed_lets_in_stmt(i, frame);
+            }
+            if let Some(s) = step {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+            for s in body {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+        }
+        Statement::ForEach { body, .. } => {
+            for s in body {
+                collect_typed_lets_in_stmt(s, frame);
+            }
+        }
+        Statement::Switch {
+            cases, default, ..
+        } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_typed_lets_in_stmt(s, frame);
+                }
+            }
+            if let Some(d) = default {
+                for s in d {
+                    collect_typed_lets_in_stmt(s, frame);
+                }
+            }
+        }
+        // Statements with no nested statement bodies carry no `let` bindings to
+        // record.
+        Statement::Return(_)
+        | Statement::Assign { .. }
+        | Statement::Expr(_)
+        | Statement::Break
+        | Statement::Continue
+        | Statement::Raw { .. } => {}
     }
 }
 
@@ -728,5 +916,161 @@ mod tests {
         assert_eq!(idx.current_pass().as_deref(), Some("emit"));
         idx.set_current_pass(None);
         assert_eq!(idx.current_pass(), None);
+    }
+
+    // ---- switch-scrutinee payload-enum resolution ------------------------
+
+    use crate::ast::{Param, Variant, VariantPayload};
+
+    /// A payload-bearing enum item (one unit + one tuple variant).
+    fn payload_enum(name: &str) -> Item {
+        Item::Enum {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            variants: vec![
+                Variant {
+                    name: "Empty".into(),
+                    payload: VariantPayload::None,
+                    meta: Meta::new(),
+                },
+                Variant {
+                    name: "Circle".into(),
+                    payload: VariantPayload::Tuple(vec![Type::Primitive(Primitive::F64)]),
+                    meta: Meta::new(),
+                },
+            ],
+            attributes: Vec::new(),
+            meta: Meta::new(),
+        }
+    }
+
+    /// A payloadless enum item (every variant unit).
+    fn plain_enum(name: &str) -> Item {
+        Item::Enum {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            variants: vec![
+                Variant {
+                    name: "A".into(),
+                    payload: VariantPayload::None,
+                    meta: Meta::new(),
+                },
+                Variant {
+                    name: "B".into(),
+                    payload: VariantPayload::None,
+                    meta: Meta::new(),
+                },
+            ],
+            attributes: Vec::new(),
+            meta: Meta::new(),
+        }
+    }
+
+    #[test]
+    fn scrutinee_is_payload_enum_for_payload_enum_typed_param() {
+        let file = File {
+            items: vec![payload_enum("Shape")],
+        };
+        let idx = UnitIndex::build(&file);
+        // Push a function frame with `s: Shape` (a payload-bearing enum).
+        idx.push_value_types(vec![("s".into(), Type::Named("Shape".into()))]);
+        assert!(idx.scrutinee_is_payload_enum(&Expr::Ref("s".into())));
+        idx.pop_value_types();
+        // Once the frame is popped, the name no longer resolves -> false.
+        assert!(!idx.scrutinee_is_payload_enum(&Expr::Ref("s".into())));
+    }
+
+    #[test]
+    fn scrutinee_is_not_payload_enum_for_payloadless_enum() {
+        let file = File {
+            items: vec![plain_enum("Color")],
+        };
+        let idx = UnitIndex::build(&file);
+        idx.push_value_types(vec![("c".into(), Type::Named("Color".into()))]);
+        assert!(!idx.scrutinee_is_payload_enum(&Expr::Ref("c".into())));
+    }
+
+    #[test]
+    fn scrutinee_is_not_payload_enum_for_integer_scrutinee() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        idx.push_value_types(vec![("n".into(), Type::Primitive(Primitive::I32))]);
+        assert!(!idx.scrutinee_is_payload_enum(&Expr::Ref("n".into())));
+    }
+
+    #[test]
+    fn scrutinee_is_not_payload_enum_for_unresolvable_name_or_expr() {
+        let file = File {
+            items: vec![payload_enum("Shape")],
+        };
+        let idx = UnitIndex::build(&file);
+        idx.push_value_types(vec![("s".into(), Type::Named("Shape".into()))]);
+        // An unknown name resolves to no type -> false (never guesses tagged).
+        assert!(!idx.scrutinee_is_payload_enum(&Expr::Ref("unknown".into())));
+        // A non-ref scrutinee (a field access) is not locally nameable -> false.
+        let field = Expr::Field {
+            obj: Box::new(Expr::Ref("s".into())),
+            field: "tag".into(),
+        };
+        assert!(!idx.scrutinee_is_payload_enum(&field));
+    }
+
+    #[test]
+    fn scrutinee_resolves_typed_let_binding_and_top_level_const() {
+        let file = File {
+            items: vec![
+                payload_enum("Shape"),
+                Item::Const {
+                    name: "GLOBAL".into(),
+                    ty: Type::Named("Shape".into()),
+                    value: Expr::Ref("Empty".into()),
+                    visibility: Visibility::Public,
+                    meta: Meta::new(),
+                },
+            ],
+        };
+        let idx = UnitIndex::build(&file);
+        // A top-level const of enum type resolves with no pushed frame.
+        assert!(idx.scrutinee_is_payload_enum(&Expr::Ref("GLOBAL".into())));
+        // A type-annotated `let` binding in the function frame resolves too.
+        idx.push_value_types(vec![("local".into(), Type::Named("Shape".into()))]);
+        assert!(idx.scrutinee_is_payload_enum(&Expr::Ref("local".into())));
+    }
+
+    #[test]
+    fn function_value_types_collects_params_and_typed_lets() {
+        // Params plus a type-annotated `let` are collected; an untyped `let`
+        // is omitted (the engine only records types it is certain of).
+        let function = Function {
+            name: "f".into(),
+            visibility: Visibility::Private,
+            modifiers: vec![],
+            params: vec![Param {
+                name: "s".into(),
+                ty: Type::Named("Shape".into()),
+                meta: Meta::new(),
+            }],
+            return_type: Type::Primitive(Primitive::Void),
+            body: vec![
+                Statement::Let {
+                    name: "typed".into(),
+                    ty: Some(Type::Named("Shape".into())),
+                    value: None,
+                },
+                Statement::Let {
+                    name: "untyped".into(),
+                    ty: None,
+                    value: Some(Expr::IntLiteral("1".into())),
+                },
+            ],
+            meta: Meta::new(),
+        };
+        let frame = function_value_types(&function);
+        assert!(frame.iter().any(|(n, _)| n == "s"), "param collected");
+        assert!(frame.iter().any(|(n, _)| n == "typed"), "typed let collected");
+        assert!(
+            !frame.iter().any(|(n, _)| n == "untyped"),
+            "untyped let omitted"
+        );
     }
 }

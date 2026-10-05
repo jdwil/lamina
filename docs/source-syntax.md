@@ -258,12 +258,19 @@ public fn fast_sqrt(x: f64): f64 {
 
 ## Open / deferred (NOT part of this spec)
 
-- **Lambda surface spelling** shown above (`(params): ret => { body }`) is a
-  provisional sketch — the lambda expression form was not explicitly ratified in
-  the interview; confirm before parser implementation.
-- **Pattern-binding in `switch` arms** over enum payloads (`case Circle(r)`) is
-  shown provisionally; the exact binding syntax for destructuring a variant
-  payload needs ratification (the kernel switch dispatches on variant kind; how
-  the payload binds to names in source is a detail to confirm).
+- **Lambda surface spelling: RATIFIED** — `(params): ret => { body }`, with the
+  return type OPTIONAL when inferable (`(x: i32) => { ... }`), since the kernel's
+  `Expr::Lambda.return_type` is optional. Shown in the worked example.
+- **Enum-payload binding in `switch` arms: RATIFIED (Option A)** —
+  `case Circle(r) { ... }` binds a tuple payload positionally; `case Rect { w, h }
+  { ... }` binds a struct payload by field name; the bound names are in scope
+  within that arm's block. This REQUIRES a small, well-scoped KERNEL EXTENSION:
+  a switch `case` must carry an optional payload-binding list (positional or
+  named), and the emitter + every target def must render it (native pattern-match
+  on Rust/Swift/Haskell/Kotlin; generated local-variable extraction from the
+  tagged-union/sealed encodings on C/Go/etc.). This is its OWN implementation arc
+  (kernel AST + emitter + all-16-def rendering + compiler-verified tests), done
+  under the disclosed-not-hacked + independent-audit discipline — NOT folded
+  silently into the parser work.
 - **Rich SDK binding, dependency versioning, profiles' manifest mechanics** — all
   layer/tooling-arc concerns, deferred (see the layer-ecosystem wiki).

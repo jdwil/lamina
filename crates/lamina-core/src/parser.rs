@@ -48,12 +48,13 @@
 //!   `name: Type` parameters followed by `)` then either `:` (a return type) or
 //!   `=>`. The parser speculatively scans the parenthesized region for this
 //!   shape before committing; otherwise `(` is an ordinary grouped expression.
-//! - **`//`** is always a line comment (see the lexer): floor division has no
-//!   source spelling.
+//! - **`//`** is always a line comment (see the lexer); floor division is
+//!   spelled **`~/`** (Dart-style) and maps to [`BinaryOp::FloorDiv`] at
+//!   multiplicative precedence.
 
 use crate::ast::{
     is_lvalue, Attr, BinaryOp, CaseBindings, CaseFieldBind, Expr, Field, FieldInit, File, Function,
-    Item, Meta, Modifier, Param, Primitive, Statement, SwitchCase, Type, TypeAttribute,
+    Item, Meta, Modifier, Param, Primitive, RawArm, Statement, SwitchCase, Type, TypeAttribute,
     UnaryOp, UseItem, Variant, VariantPayload, Visibility,
 };
 use crate::error::ParseError;
@@ -68,8 +69,9 @@ use crate::lexer::{lex, SpannedToken, Token};
 ///
 /// Returns a [`ParseError`] if the source does not conform to the ratified
 /// grammar (`docs/source-syntax.md`), with the offending source position where
-/// available. The `raw` escape hatch is a deliberate deferred error
-/// ([`ParseError::RawDeferred`]).
+/// available. The `raw` escape hatch is fully parsed into a multi-arm raw node
+/// (its verbatim arm bodies are captured by the lexer); target resolution
+/// happens later, in [`lower`](crate::lower).
 pub fn parse(src: &str) -> Result<File, ParseError> {
     let tokens = lex(src)?;
     let mut parser = Parser { tokens, pos: 0 };
@@ -189,7 +191,14 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 Ok(Item::Tree(expr))
             }
-            Some(Token::Raw) => Err(self.raw_deferred()),
+            Some(Token::RawConstruct { .. }) => {
+                let (arms, default) = self.take_raw_construct()?;
+                Ok(Item::Raw {
+                    arms,
+                    default,
+                    meta: Meta::new(),
+                })
+            }
             _ => Err(self.error("a top-level item (fn/struct/enum/const/typedef/use/node)")),
         }
     }
@@ -675,7 +684,18 @@ impl Parser {
                 self.expect(&Token::Semicolon, "`;` after `continue`")?;
                 Ok(Statement::Continue)
             }
-            Some(Token::Raw) => Err(self.raw_deferred()),
+            Some(Token::RawConstruct { .. }) => {
+                let (arms, default) = self.take_raw_construct()?;
+                // A raw statement supplies its own terminator inside the
+                // verbatim body; a trailing `;` after the construct is optional
+                // (mirroring how a brace-bodied statement self-terminates).
+                self.eat(&Token::Semicolon);
+                Ok(Statement::Raw {
+                    arms,
+                    default,
+                    meta: Meta::new(),
+                })
+            }
             // A tree-core node/text at statement position is an
             // expression-statement whose brace/standalone form makes a trailing
             // `;` OPTIONAL (matching the worked example's `render` body, where a
@@ -977,10 +997,20 @@ impl Parser {
         self.parse_expr_no_struct()
     }
 
-    /// Produces a [`ParseError::RawDeferred`] at the current `raw` token.
-    fn raw_deferred(&self) -> ParseError {
-        let (line, column) = self.current_pos();
-        ParseError::RawDeferred { line, column }
+    /// Consumes the current [`Token::RawConstruct`] and returns its parsed arms
+    /// and optional `else` fallback.
+    ///
+    /// The lexer does all raw scanning (the arm bodies are verbatim target code,
+    /// captured as opaque text), so this is a trivial unpack shared by the three
+    /// raw positions (expr / statement / item). The three nodes differ only in
+    /// which `*::Raw` they wrap the identical `(arms, default)` payload in.
+    fn take_raw_construct(&mut self) -> Result<(Vec<RawArm>, Option<String>), ParseError> {
+        match self.advance() {
+            Some(Token::RawConstruct { arms, default }) => Ok((arms, default)),
+            other => Err(self.error(format!(
+                "a `raw` construct (internal: unexpected {other:?})"
+            ))),
+        }
     }
 
     // ---- Expressions (precedence climbing) ----------------------------
@@ -1140,7 +1170,14 @@ impl Parser {
             Some(Token::LBracket) => self.parse_array_literal(),
             Some(Token::Node) => self.parse_node(),
             Some(Token::Text) => self.parse_text(),
-            Some(Token::Raw) => Err(self.raw_deferred()),
+            Some(Token::RawConstruct { .. }) => {
+                let (arms, default) = self.take_raw_construct()?;
+                Ok(Expr::Raw {
+                    arms,
+                    default,
+                    meta: Meta::new(),
+                })
+            }
             Some(Token::LParen) => {
                 if self.looks_like_lambda() {
                     self.parse_lambda()
@@ -1377,6 +1414,7 @@ fn binary_op(token: &Token) -> Option<BinaryOp> {
         Token::Minus => BinaryOp::Sub,
         Token::Star => BinaryOp::Mul,
         Token::Slash => BinaryOp::Div,
+        Token::TildeSlash => BinaryOp::FloorDiv,
         Token::Percent => BinaryOp::Rem,
         Token::StarStar => BinaryOp::Pow,
         _ => return None,
@@ -1399,11 +1437,8 @@ fn binding_power(op: BinaryOp) -> (u8, u8, bool) {
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => 7,
         BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr => 8,
         BinaryOp::Add | BinaryOp::Sub => 9,
-        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 10,
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::FloorDiv => 10,
         BinaryOp::Pow => 11,
-        // `//` (FloorDiv) has no source spelling (see the lexer); give it the
-        // multiplicative level for completeness of the exhaustive match.
-        BinaryOp::FloorDiv => 10,
     };
     let right_assoc = matches!(op, BinaryOp::Pow);
     (level, level, right_assoc)
@@ -1524,9 +1559,23 @@ mod tests {
     }
 
     #[test]
-    fn raw_is_deferred_error() {
-        let err = parse("fn f(): void { raw rust \"x\"; }").expect_err("raw deferred");
-        assert!(matches!(err, ParseError::RawDeferred { .. }));
+    fn raw_single_arm_string_parses() {
+        // `raw` now parses (the deferral is removed): a single-arm string form
+        // yields a one-arm `Statement::Raw` with the verbatim contents.
+        let f = parse("fn f(): void { raw rust \"x\"; }").expect("raw parses");
+        let body = &as_function(&f.items[0]).body;
+        assert_eq!(
+            body[0],
+            Statement::Raw {
+                arms: vec![RawArm {
+                    target: "rust".into(),
+                    version: None,
+                    code: "x".into(),
+                }],
+                default: None,
+                meta: Meta::new(),
+            }
+        );
     }
 
     #[test]

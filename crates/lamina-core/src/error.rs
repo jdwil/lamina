@@ -67,20 +67,6 @@ pub enum ParseError {
         /// 1-based column of the assignment.
         column: usize,
     },
-
-    /// The source used the `raw` escape hatch, whose parsing is deliberately
-    /// deferred pending the raw-lowering architectural decision (see spec
-    /// `09-parser.md`). It is a hard error rather than a silent drop.
-    #[error(
-        "raw parsing is deferred pending the raw-lowering decision \
-         (encountered `raw` at line {line}, column {column})"
-    )]
-    RawDeferred {
-        /// 1-based line of the `raw` keyword.
-        line: usize,
-        /// 1-based column of the `raw` keyword.
-        column: usize,
-    },
 }
 
 /// An error produced while parsing a rigid `.mdl` language-definition document.
@@ -461,5 +447,49 @@ pub enum EmitError {
         target: String,
         /// A human-readable description of the template problem.
         detail: String,
+    },
+
+    /// A raw node reached the emitter still carrying multiple arms (or an
+    /// `else` fallback) — i.e. unresolved for the current target.
+    ///
+    /// This is an **internal invariant violation**, never a user error: the
+    /// [`lower`](crate::lower) pass always runs before emission and collapses
+    /// every raw node to a single resolved arm. Reaching this means `lower` was
+    /// not run (or a code path built an emitter over an un-lowered AST); it is
+    /// surfaced loudly rather than silently emitting the wrong arm.
+    #[error(
+        "internal error: raw node reached the emitter unresolved \
+         ({arms} arms, default present: {has_default}) — lower() must run first"
+    )]
+    UnresolvedRaw {
+        /// How many target arms the un-lowered raw node still carried.
+        arms: usize,
+        /// Whether the un-lowered raw node still carried an `else` fallback.
+        has_default: bool,
+    },
+}
+
+/// An error produced while **lowering** a parsed AST for a concrete target
+/// (see [`lower`](crate::lower)).
+///
+/// Lowering today does one job: it resolves every multi-arm `raw` node to the
+/// current target's single arm. The only way that fails is a raw construct with
+/// no arm matching the target and no `else` fallback — which is a hard error,
+/// because raw code must never be silently dropped (the source author declared
+/// a construct the engine cannot satisfy for this target).
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LowerError {
+    /// A `raw` node had no arm whose target matched the build target, and no
+    /// `else { … }` fallback to fall back on.
+    #[error(
+        "no raw arm for target {target:?}: the raw node declares targets \
+         [{declared}] but none match and there is no `else` fallback"
+    )]
+    NoRawArmForTarget {
+        /// The build target name that failed to match any arm.
+        target: String,
+        /// A comma-separated list of the arm targets that were declared, for a
+        /// legible diagnostic.
+        declared: String,
     },
 }

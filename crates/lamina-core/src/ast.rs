@@ -97,6 +97,38 @@ impl Meta {
     }
 }
 
+/// One **target-tagged arm** of a multi-arm raw node (see [`Expr::Raw`],
+/// [`Statement::Raw`], [`Item::Raw`]).
+///
+/// A raw node is the layer escape hatch: it holds verbatim target code the
+/// engine emits UNCHANGED. In source it is written as a `switch`-shaped
+/// construct over the build target — a single-arm `raw python { … }` or a
+/// grouped `raw { python { … } rust { … } else { … } }` — so the AST keeps
+/// **all** target arms and resolution to the current target happens later, in
+/// the [`lower`](crate::lower) pass. Each arm pairs a `target` name with the
+/// verbatim `code` that target emits, plus an optional, *opaque* version
+/// constraint.
+///
+/// Structural equality is derived: two arms are equal iff their `target`,
+/// `version`, and `code` all match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawArm {
+    /// The target language this arm applies to (e.g. `"python"`, `"rust"`).
+    ///
+    /// [`lower`](crate::lower) selects an arm by comparing this verbatim to the
+    /// language definition's `target` name (target-only match today).
+    pub target: String,
+    /// An **opaque** version constraint (e.g. `">=3.10"`, `"2021"`), parsed from
+    /// the source arm head but NOT matched on yet — version-range resolution is
+    /// deferred to the later dependency/version arc, consistent with the
+    /// opaque-version-token decision. `None` when the arm head carries no
+    /// constraint.
+    pub version: Option<String>,
+    /// The verbatim target-code fragment this arm contributes, emitted
+    /// UNCHANGED once the arm is selected.
+    pub code: String,
+}
+
 /// A parsed Lamina source unit (the contents of one `lamina` code block).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
@@ -218,20 +250,28 @@ pub enum Item {
     /// `### expr` dispatch, exactly as a tree expression embedded in imperative
     /// code would.
     Tree(Expr),
-    /// A **raw / verbatim top-level item**: a string of literal target code the
-    /// engine emits UNCHANGED (the ultimate layer escape hatch).
+    /// A **raw / verbatim top-level item**: literal target code the engine
+    /// emits UNCHANGED (the ultimate layer escape hatch).
     ///
-    /// Like [`Expr::Raw`] and [`Statement::Raw`], a raw item is NOT
-    /// target-keyed: it exists in the AST only when a layer lowered it *for the
-    /// current target*, so the engine passes the string through with no target
-    /// check, capability gating, or error path. It renders through the target's
-    /// `## Raw` item section (a trivial pass-through entry template that emits
-    /// the `value` scalar slot), consistent with how every other item kind
-    /// dispatches to its own `## <Item>` section. Structural equality compares
-    /// the string and ignores `meta`.
+    /// A raw node is **generic and target-keyed**: it holds one [`RawArm`] per
+    /// build target (plus an optional `else` fallback), exactly as written in
+    /// source (`raw python { … }` or a grouped `raw { … }`). The AST stays
+    /// target-agnostic; it is the [`lower`](crate::lower) pass that RESOLVES the
+    /// node to the current target's single arm BEFORE emission. By the time the
+    /// emitter sees a raw item it is a resolved single-arm node, so the
+    /// *emitter* still performs no target selection — the invariant holds, it
+    /// has merely moved to `lower`. A resolved raw item renders through the
+    /// target's `## Raw` item section (a trivial `{value}` pass-through) exactly
+    /// as every other item dispatches to its `## <Item>` section. Structural
+    /// equality compares `arms` + `default` and ignores `meta`.
     Raw {
-        /// The verbatim target-code fragment, emitted unchanged.
-        code: String,
+        /// The target-tagged verbatim arms, in source order. A single-arm raw
+        /// (`raw python { … }`) has exactly one; [`lower`](crate::lower)
+        /// collapses this to the one selected arm.
+        arms: Vec<RawArm>,
+        /// The `else { … }` fallback arm's verbatim code, used when no `arms`
+        /// target matches; `None` when the source had no `else`.
+        default: Option<String>,
         /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
         /// item is raiseable like any other node.
         meta: Meta,
@@ -288,6 +328,24 @@ impl Item {
                 .iter()
                 .any(|v| !matches!(v.payload, VariantPayload::None)),
             _ => false,
+        }
+    }
+
+    /// Builds a **resolved single-arm** raw item from verbatim `code`.
+    ///
+    /// This is the shape [`lower`](crate::lower) collapses a multi-arm raw to,
+    /// and the convenient way to hand-build an already-target-resolved raw node
+    /// (its `target` is irrelevant to the emitter, which only reads the one
+    /// arm's `code`): `arms = [one]`, `default = None`, empty metadata.
+    pub fn raw(code: impl Into<String>) -> Item {
+        Item::Raw {
+            arms: vec![RawArm {
+                target: String::new(),
+                version: None,
+                code: code.into(),
+            }],
+            default: None,
+            meta: Meta::new(),
         }
     }
 }
@@ -372,9 +430,20 @@ impl PartialEq for Item {
                 },
             ) => ap == bp && ai == bi && aa == ba,
             (Item::Tree(a), Item::Tree(b)) => a == b,
-            // A raw item's structural identity is its verbatim string; metadata
-            // is ignored (consistent with every other node).
-            (Item::Raw { code: a, .. }, Item::Raw { code: b, .. }) => a == b,
+            // A raw item's structural identity is its target arms and `else`
+            // fallback; metadata is ignored (consistent with every other node).
+            (
+                Item::Raw {
+                    arms: aa,
+                    default: ad,
+                    ..
+                },
+                Item::Raw {
+                    arms: ba,
+                    default: bd,
+                    ..
+                },
+            ) => aa == ba && ad == bd,
             _ => false,
         }
     }
@@ -1366,22 +1435,28 @@ pub enum Statement {
     },
     /// An expression-statement (e.g. a bare function call `f();`).
     Expr(Expr),
-    /// A **raw / verbatim statement**: a string of literal target code the
-    /// engine emits UNCHANGED at the slot position (the ultimate layer escape
-    /// hatch).
+    /// A **raw / verbatim statement**: literal target code the engine emits
+    /// UNCHANGED at the slot position (the ultimate layer escape hatch).
     ///
-    /// Like [`Expr::Raw`], a raw statement is NOT target-keyed: it exists in
-    /// the AST only when a layer lowered it *for the current target*, so the
-    /// engine passes the string through with no target check, capability
-    /// gating, or error path. The verbatim string is exposed to the target's
-    /// `### statement` `stmt is raw` row via the `value` scalar slot; a
-    /// multi-line raw statement in an indented body is re-indented by the
-    /// renderer's ordinary column-derived continuation-line indentation, exactly
-    /// as any other multi-line rendered fragment (see the emitter's indentation
-    /// docs). Structural equality compares the string and ignores `meta`.
+    /// Like [`Expr::Raw`] and [`Item::Raw`], a raw statement is **generic and
+    /// target-keyed**: it holds one [`RawArm`] per build target (plus an
+    /// optional `else` fallback), exactly as written in source. The AST stays
+    /// target-agnostic; the [`lower`](crate::lower) pass RESOLVES the node to
+    /// the current target's single arm BEFORE emission, so the *emitter* still
+    /// performs no target selection (the invariant moved to `lower`). The
+    /// resolved verbatim string is exposed to the target's `### statement`
+    /// `stmt is raw` row via the `value` scalar slot; a multi-line raw statement
+    /// in an indented body is re-indented by the renderer's ordinary
+    /// column-derived continuation-line indentation, exactly as any other
+    /// multi-line rendered fragment. Structural equality compares `arms` +
+    /// `default` and ignores `meta`.
     Raw {
-        /// The verbatim target-code fragment, emitted unchanged.
-        code: String,
+        /// The target-tagged verbatim arms, in source order. A single-arm raw
+        /// has exactly one; [`lower`](crate::lower) collapses to the selected
+        /// arm.
+        arms: Vec<RawArm>,
+        /// The `else { … }` fallback verbatim code; `None` when absent.
+        default: Option<String>,
         /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
         /// statement is raiseable like any other node.
         meta: Meta,
@@ -1477,9 +1552,21 @@ impl PartialEq for Statement {
                 },
             ) => at == bt && av == bv,
             (Statement::Expr(a), Statement::Expr(b)) => a == b,
-            // A raw statement's structural identity is its verbatim string;
-            // metadata is ignored (consistent with every other node).
-            (Statement::Raw { code: a, .. }, Statement::Raw { code: b, .. }) => a == b,
+            // A raw statement's structural identity is its target arms and
+            // `else` fallback; metadata is ignored (consistent with every other
+            // node).
+            (
+                Statement::Raw {
+                    arms: aa,
+                    default: ad,
+                    ..
+                },
+                Statement::Raw {
+                    arms: ba,
+                    default: bd,
+                    ..
+                },
+            ) => aa == ba && ad == bd,
             _ => false,
         }
     }
@@ -1511,6 +1598,24 @@ impl Statement {
             Err(AstError::NotAnLvalue {
                 kind: target.kind().as_str(),
             })
+        }
+    }
+
+    /// Builds a **resolved single-arm** raw statement from verbatim `code`.
+    ///
+    /// This is the shape [`lower`](crate::lower) collapses a multi-arm raw to,
+    /// and the convenient way to hand-build an already-target-resolved raw node
+    /// (its `target` is irrelevant to the emitter): `arms = [one]`,
+    /// `default = None`, empty metadata.
+    pub fn raw(code: impl Into<String>) -> Statement {
+        Statement::Raw {
+            arms: vec![RawArm {
+                target: String::new(),
+                version: None,
+                code: code.into(),
+            }],
+            default: None,
+            meta: Meta::new(),
         }
     }
 }
@@ -2015,26 +2120,31 @@ pub enum Expr {
     /// distinctly from element children — e.g. HTML escapes text content but
     /// not element markup, and JSON quotes a string scalar.
     Text(Box<Expr>),
-    /// A **raw / verbatim expression fragment**: a string of literal target
-    /// code the engine emits UNCHANGED at the slot position (the ultimate
-    /// layer escape hatch).
+    /// A **raw / verbatim expression fragment**: literal target code the engine
+    /// emits UNCHANGED at the slot position (the ultimate layer escape hatch).
     ///
     /// A raw node lets a *layer* lower an expression that Lamina's kernel
     /// vocabulary plus the language definition cannot otherwise express,
     /// guaranteeing the layer can always produce the exact target code. It is
-    /// deliberately **not** target-keyed: a layer lowers differently per
-    /// target, so a raw node only ever exists in the AST when the layer lowered
-    /// *for the current target* — by the time the engine sees it, it is always
-    /// correct target code by construction. The engine therefore performs NO
-    /// target check, variant selection, capability gating, or error path; it
-    /// simply passes the string through.
+    /// **generic and target-keyed**: it holds one [`RawArm`] per build target
+    /// (plus an optional `else` fallback), exactly as written in source. The
+    /// AST stays target-agnostic; the [`lower`](crate::lower) pass RESOLVES the
+    /// node to the current target's single arm BEFORE emission. The *emitter*
+    /// therefore still performs NO target check, variant selection, or
+    /// capability gating — by the time it sees a raw node the node is already
+    /// resolved to one correct arm (the invariant simply moved to `lower`).
     ///
-    /// The verbatim string is exposed to the target's `### expr` `expr is raw`
-    /// row via the `value` scalar slot. Structural equality compares the string
-    /// and (like every other node) **ignores** the `meta` field.
+    /// The resolved verbatim string is exposed to the target's `### expr`
+    /// `expr is raw` row via the `value` scalar slot. Structural equality
+    /// compares `arms` + `default` and (like every other node) **ignores** the
+    /// `meta` field.
     Raw {
-        /// The verbatim target-code fragment, emitted unchanged.
-        code: String,
+        /// The target-tagged verbatim arms, in source order. A single-arm raw
+        /// has exactly one; [`lower`](crate::lower) collapses to the selected
+        /// arm.
+        arms: Vec<RawArm>,
+        /// The `else { … }` fallback verbatim code; `None` when absent.
+        default: Option<String>,
         /// Engine-transparent metadata (see [`Meta`]); default empty. A raw
         /// node is raiseable like any other node — it carries the standard
         /// metadata channel with no special-casing.
@@ -2222,9 +2332,20 @@ impl PartialEq for Expr {
                 },
             ) => an == bn && aa == ba && ac == bc,
             (Expr::Text(a), Expr::Text(b)) => a == b,
-            // A raw node's structural identity is its verbatim string; metadata
-            // is ignored (consistent with every other node).
-            (Expr::Raw { code: a, .. }, Expr::Raw { code: b, .. }) => a == b,
+            // A raw node's structural identity is its target arms and `else`
+            // fallback; metadata is ignored (consistent with every other node).
+            (
+                Expr::Raw {
+                    arms: aa,
+                    default: ad,
+                    ..
+                },
+                Expr::Raw {
+                    arms: ba,
+                    default: bd,
+                    ..
+                },
+            ) => aa == ba && ad == bd,
             // A lambda's structural identity is its params, return type, and
             // body; metadata is ignored (consistent with every other node).
             (
@@ -2249,6 +2370,24 @@ impl PartialEq for Expr {
 impl Eq for Expr {}
 
 impl Expr {
+    /// Builds a **resolved single-arm** raw expression from verbatim `code`.
+    ///
+    /// This is the shape [`lower`](crate::lower) collapses a multi-arm raw to,
+    /// and the convenient way to hand-build an already-target-resolved raw node
+    /// (its `target` is irrelevant to the emitter): `arms = [one]`,
+    /// `default = None`, empty metadata.
+    pub fn raw(code: impl Into<String>) -> Expr {
+        Expr::Raw {
+            arms: vec![RawArm {
+                target: String::new(),
+                version: None,
+                code: code.into(),
+            }],
+            default: None,
+            meta: Meta::new(),
+        }
+    }
+
     /// This expression's engine-transparent [`Meta`] (see [`Meta`]).
     ///
     /// Only [`Expr::StructLit`] carries inline metadata today (the Part 3

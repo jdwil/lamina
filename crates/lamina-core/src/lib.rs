@@ -26,6 +26,7 @@ pub mod index;
 pub mod lang;
 pub mod lang_doc;
 pub mod lexer;
+pub mod lower;
 pub mod parser;
 pub mod predicate;
 pub mod render;
@@ -34,7 +35,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-pub use error::{EmitError, LangDocError, ParseError, PredicateError};
+pub use error::{EmitError, LangDocError, LowerError, ParseError, PredicateError};
 
 /// An error from loading a language-definition document from disk.
 #[derive(Debug, Error)]
@@ -86,6 +87,9 @@ pub enum TranspileError {
     /// Parsing the Lamina source failed.
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
+    /// Lowering (target-aware raw resolution) failed.
+    #[error("lower error: {0}")]
+    Lower(#[from] LowerError),
     /// Emitting the target source failed.
     #[error("emit error: {0}")]
     Emit(#[from] EmitError),
@@ -94,14 +98,15 @@ pub enum TranspileError {
 /// Parses Lamina inner-code `src` and transpiles it to the target described by
 /// `lang`.
 ///
-/// This is the convenience entry point wrapping [`parser::parse`] and
-/// [`emitter::emit`].
+/// This is the convenience entry point wrapping [`parser::parse`],
+/// [`lower::lower`] (target-aware raw resolution), and [`emitter::emit`].
 ///
 /// # Errors
 ///
-/// Returns [`TranspileError`] if parsing or emission fails.
+/// Returns [`TranspileError`] if parsing, lowering, or emission fails.
 pub fn transpile(src: &str, lang: &lang::LanguageDef) -> Result<String, TranspileError> {
     let file = parser::parse(src)?;
+    let file = lower::lower(&file, &lang.target)?;
     let output = emitter::emit(&file, lang)?;
     Ok(output)
 }

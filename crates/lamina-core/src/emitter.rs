@@ -10,8 +10,8 @@
 
 use crate::ast::{
     slot_binding, Attr, BinaryOp, CaseBindings, Expr, ExprKind, Field, FieldInit, File, Function,
-    Item, ItemKind, Modifier, Param, Primitive, SlotScope, SlotShape, Statement, StatementKind,
-    SwitchCase, Type, TypeAttribute, UnaryOp, Variant, VariantKind as AstVariantKind,
+    Item, ItemKind, Modifier, Param, Primitive, RawArm, SlotScope, SlotShape, Statement,
+    StatementKind, SwitchCase, Type, TypeAttribute, UnaryOp, Variant, VariantKind as AstVariantKind,
     VariantPayload, Visibility,
 };
 use crate::error::EmitError;
@@ -506,8 +506,11 @@ impl<'a> ItemResolver<'a> {
                 Ok(Rendered::text(alias.clone().unwrap_or_default()))
             }
             // A raw top-level item's verbatim code, exposed as `value` and
-            // emitted UNCHANGED (the layer escape hatch).
-            (Item::Raw { code, .. }, "value") => Ok(Rendered::text(code.clone())),
+            // emitted UNCHANGED (the layer escape hatch). The node is resolved
+            // by `lower` to a single arm before it reaches the emitter.
+            (Item::Raw { arms, default, .. }, "value") => {
+                Ok(Rendered::text(resolved_raw_code(arms, default)?))
+            }
             _ => self.unknown_slot(name),
         }
     }
@@ -1437,8 +1440,11 @@ impl<'a> StmtResolver<'a> {
             // A raw statement's verbatim code, exposed as `value` and emitted
             // UNCHANGED. The renderer's ordinary column-derived indentation
             // re-indents continuation lines of a multi-line raw string, exactly
-            // as for any other multi-line rendered fragment.
-            (Statement::Raw { code, .. }, "value") => Ok(Rendered::text(code.clone())),
+            // as for any other multi-line rendered fragment. The node is
+            // resolved by `lower` to a single arm before it reaches the emitter.
+            (Statement::Raw { arms, default, .. }, "value") => {
+                Ok(Rendered::text(resolved_raw_code(arms, default)?))
+            }
             (Statement::If { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
             (Statement::While { cond, .. }, "cond") => emit_expr(cond, self.lang, self.index),
             (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang, self.index),
@@ -1969,6 +1975,25 @@ fn pred_expr_kind(kind: ExprKind) -> PredExprKind {
     }
 }
 
+/// Extracts the verbatim code of a **resolved** raw node (one with exactly one
+/// arm and no `else` fallback), surfacing [`EmitError::UnresolvedRaw`] when the
+/// node is still multi-arm.
+///
+/// The [`lower`](crate::lower) pass collapses every raw node to a single
+/// resolved arm before emission, so the emitter should only ever see this
+/// shape. Reaching the un-collapsed shape is an internal invariant violation
+/// (lower was not run), surfaced loudly rather than silently picking an arm —
+/// the emitter itself performs NO target selection.
+fn resolved_raw_code(arms: &[RawArm], default: &Option<String>) -> Result<String, EmitError> {
+    match (arms, default) {
+        ([only], None) => Ok(only.code.clone()),
+        _ => Err(EmitError::UnresolvedRaw {
+            arms: arms.len(),
+            has_default: default.is_some(),
+        }),
+    }
+}
+
 /// The textual leaf value of a literal expression, or `None` for a non-literal.
 ///
 /// Literals are preserved textually (their width/precision/escaping is a target
@@ -1986,10 +2011,9 @@ fn literal_value(expr: &Expr) -> Option<String> {
             "false".to_string()
         }),
         Expr::NullLiteral => Some("null".to_string()),
-        // A raw expression fragment: its verbatim code is exposed as `value`
-        // and emitted UNCHANGED (the layer escape hatch — no quoting, no
-        // transformation).
-        Expr::Raw { code, .. } => Some(code.clone()),
+        // A raw expression fragment is handled by the caller (it may surface an
+        // internal UnresolvedRaw error), so it is intentionally not a literal
+        // leaf here.
         _ => None,
     }
 }
@@ -2355,9 +2379,18 @@ impl<'a> ExprResolver<'a> {
                 Expr::Field { field, .. } => Ok(Rendered::text(field.clone())),
                 _ => self.unknown_slot(name),
             },
-            (ExprScope::Node, "value") => match literal_value(self.expr) {
-                Some(text) => Ok(Rendered::text(text)),
-                None => self.unknown_slot(name),
+            (ExprScope::Node, "value") => match self.expr {
+                // A raw expression fragment: emit its single resolved arm's
+                // verbatim code (the layer escape hatch). `lower` collapses a
+                // multi-arm raw to one arm before emission; an unresolved raw
+                // reaching here is an internal error, surfaced loudly.
+                Expr::Raw { arms, default, .. } => {
+                    Ok(Rendered::text(resolved_raw_code(arms, default)?))
+                }
+                _ => match literal_value(self.expr) {
+                    Some(text) => Ok(Rendered::text(text)),
+                    None => self.unknown_slot(name),
+                },
             },
             _ => self.unknown_slot(name),
         }

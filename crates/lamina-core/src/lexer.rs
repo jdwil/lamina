@@ -14,15 +14,19 @@
 //! position. Only genuine control-flow / declaration keywords and the boolean /
 //! `null` literals are lexed as distinct tokens.
 //!
-//! ## Resolved ambiguity: `//`
+//! ## Resolved ambiguity: `//` vs `~/`
 //!
-//! The ratified grammar lists `//` BOTH as the floor-division operator and as
-//! the line-comment introducer. This lexer adopts the conventional C/Rust/JS
-//! rule: **`//` is always a line comment** (discarded to end of line). Floor
-//! division therefore has no authored-source spelling in this slice; the kernel
-//! [`BinaryOp::FloorDiv`](crate::ast::BinaryOp::FloorDiv) operator remains in
-//! the AST and emitter but is only producible by hand-built ASTs / layers.
+//! The original grammar sketch overloaded `//` as both the floor-division
+//! operator and the line-comment introducer. The ratified decision splits them:
+//! **`//` is always a line comment** (the conventional C/Rust/JS rule,
+//! discarded to end of line), and **floor division is spelled `~/`**
+//! (Dart-style). The lexer emits [`Token::TildeSlash`] for `~/` — matched
+//! BEFORE a bare `~` ([`Token::Tilde`], bitwise NOT) so the two-char operator
+//! is never split — and the parser maps it to
+//! [`BinaryOp::FloorDiv`](crate::ast::BinaryOp::FloorDiv) at the multiplicative
+//! precedence level.
 
+use crate::ast::RawArm;
 use crate::error::ParseError;
 
 /// A 1-based source position (line and column), used for diagnostics.
@@ -101,9 +105,22 @@ pub enum Token {
     /// The `text` keyword (tree core).
     Text,
 
-    // ---- Escape-hatch keyword (parsing deferred) ----
-    /// The `raw` keyword — parsing is deferred (see the parser).
-    Raw,
+    // ---- Escape-hatch keyword (scanned specially) ----
+    /// The `raw` escape hatch, fully scanned at lex time.
+    ///
+    /// Raw arm bodies are VERBATIM target code (not Lamina), so the lexer
+    /// captures the entire construct — every target arm's brace-balanced /
+    /// quoted body plus the optional `else` fallback — as opaque text and
+    /// emits this single structured token. The parser merely assembles it into
+    /// an [`Expr::Raw`](crate::ast::Expr::Raw) /
+    /// [`Statement::Raw`](crate::ast::Statement::Raw) /
+    /// [`Item::Raw`](crate::ast::Item::Raw) node (same payload at every level).
+    RawConstruct {
+        /// The target-tagged verbatim arms, in source order.
+        arms: Vec<RawArm>,
+        /// The `else { … }` fallback's verbatim code, if present.
+        default: Option<String>,
+    },
 
     // ---- Literals ----
     /// An identifier or (contextual) type name.
@@ -194,6 +211,8 @@ pub enum Token {
     Caret,
     /// `~`
     Tilde,
+    /// `~/` (floor division — Dart-style spelling; `//` stays a line comment).
+    TildeSlash,
     /// `<<`
     Shl,
     /// `>>`
@@ -228,7 +247,7 @@ impl Token {
             Token::Continue => "keyword `continue`".to_string(),
             Token::Node => "keyword `node`".to_string(),
             Token::Text => "keyword `text`".to_string(),
-            Token::Raw => "keyword `raw`".to_string(),
+            Token::RawConstruct { .. } => "a `raw` construct".to_string(),
             Token::Ident(s) => format!("identifier `{s}`"),
             Token::Int(s) => format!("integer `{s}`"),
             Token::Float(s) => format!("float `{s}`"),
@@ -271,6 +290,7 @@ impl Token {
             Token::Pipe => "`|`".to_string(),
             Token::Caret => "`^`".to_string(),
             Token::Tilde => "`~`".to_string(),
+            Token::TildeSlash => "`~/`".to_string(),
             Token::Shl => "`<<`".to_string(),
             Token::Shr => "`>>`".to_string(),
             Token::UShr => "`>>>`".to_string(),
@@ -315,7 +335,6 @@ fn keyword(word: &str) -> Option<Token> {
         "continue" => Token::Continue,
         "node" => Token::Node,
         "text" => Token::Text,
-        "raw" => Token::Raw,
         "true" => Token::True,
         "false" => Token::False,
         "null" => Token::Null,
@@ -376,6 +395,363 @@ impl<'a> Cursor<'a> {
             .map(|&(b, _)| b)
             .unwrap_or(self.src.len())
     }
+
+    /// Skips ASCII whitespace and `//` line comments between the STRUCTURAL
+    /// tokens of a `raw` construct (target names, braces, `else`). Verbatim arm
+    /// bodies are captured separately and are never subject to this.
+    fn skip_raw_trivia(&mut self) {
+        loop {
+            match self.peek() {
+                Some(c) if c.is_ascii_whitespace() => {
+                    self.bump();
+                }
+                Some('/') if self.peek_at(1) == Some('/') => {
+                    self.bump();
+                    self.bump();
+                    while let Some(ch) = self.peek() {
+                        if ch == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Scans a complete `raw` escape-hatch construct, starting just AFTER the
+/// `raw` keyword, into a single [`Token::RawConstruct`].
+///
+/// Two surface forms are accepted (per `docs/source-syntax.md`):
+///
+/// - **single-arm**: `raw <target> [<ver>] "string"` or
+///   `raw <target> [<ver>] { verbatim-block }` — one arm, no `else`.
+/// - **grouped**: `raw { <target> [<ver>] { … } … [else { … }] }` — many arms
+///   plus an optional `else` fallback.
+///
+/// A `<ver>` is an OPAQUE npm/Cargo-style constraint (a comparator
+/// `^ ~ >= <= > < =` or a hyphen range, plus a version token like `3.10` or
+/// `2021`); it is captured verbatim into [`RawArm::version`] but NOT matched on
+/// — target-only matching happens later, in `lower`.
+///
+/// The one subtlety is **verbatim block capture**: an arm body is target code,
+/// NOT Lamina, so it is captured as the opaque, brace-balanced text between its
+/// delimiting braces (see [`capture_raw_block`]).
+fn lex_raw_construct(cursor: &mut Cursor<'_>, span: Span) -> Result<Token, ParseError> {
+    cursor.skip_raw_trivia();
+    match cursor.peek() {
+        // Grouped form: `raw { arm* else? }`.
+        Some('{') => {
+            cursor.bump();
+            let mut arms = Vec::new();
+            let mut default = None;
+            loop {
+                cursor.skip_raw_trivia();
+                match cursor.peek() {
+                    Some('}') => {
+                        cursor.bump();
+                        break;
+                    }
+                    None => return Err(ParseError::UnterminatedLiteral {
+                        kind: "raw",
+                        line: span.line,
+                        column: span.column,
+                    }),
+                    _ => {}
+                }
+                let head = lex_raw_arm_head(cursor)?;
+                cursor.skip_raw_trivia();
+                let body = capture_raw_block(cursor, span)?;
+                match head {
+                    RawArmHead::Else => default = Some(body),
+                    RawArmHead::Target { target, version } => arms.push(RawArm {
+                        target,
+                        version,
+                        code: body,
+                    }),
+                }
+            }
+            Ok(Token::RawConstruct { arms, default })
+        }
+        // Single-arm form: `raw <target> [ver] ("str" | { block })`.
+        _ => {
+            let (target, version) = match lex_raw_arm_head(cursor)? {
+                RawArmHead::Target { target, version } => (target, version),
+                RawArmHead::Else => {
+                    return Err(ParseError::UnterminatedLiteral {
+                        kind: "raw",
+                        line: span.line,
+                        column: span.column,
+                    })
+                }
+            };
+            cursor.skip_raw_trivia();
+            let code = match cursor.peek() {
+                Some('"') => capture_raw_string(cursor, span)?,
+                Some('{') => capture_raw_block(cursor, span)?,
+                _ => {
+                    return Err(ParseError::UnterminatedLiteral {
+                        kind: "raw",
+                        line: span.line,
+                        column: span.column,
+                    })
+                }
+            };
+            Ok(Token::RawConstruct {
+                arms: vec![RawArm {
+                    target,
+                    version,
+                    code,
+                }],
+                default: None,
+            })
+        }
+    }
+}
+
+/// The parsed head of one `raw` arm: either the `else` fallback marker or a
+/// target name with an optional opaque version constraint.
+enum RawArmHead {
+    /// The `else { … }` fallback arm.
+    Else,
+    /// A target arm head (`<target> [<version>]`).
+    Target {
+        /// The arm's target language name.
+        target: String,
+        /// The opaque version constraint, if any.
+        version: Option<String>,
+    },
+}
+
+/// Lexes one `raw` arm head — the `else` keyword, or a `<target> [<version>]`
+/// pair — leaving the cursor just before the arm body (`{` or `"`).
+fn lex_raw_arm_head(cursor: &mut Cursor<'_>) -> Result<RawArmHead, ParseError> {
+    cursor.skip_raw_trivia();
+    let word = lex_raw_word(cursor);
+    if word.is_empty() {
+        return Err(ParseError::UnexpectedChar {
+            ch: cursor.peek().unwrap_or(' '),
+            offset: cursor.byte_offset(),
+        });
+    }
+    if word == "else" {
+        return Ok(RawArmHead::Else);
+    }
+    cursor.skip_raw_trivia();
+    let version = lex_raw_version(cursor);
+    Ok(RawArmHead::Target {
+        target: word,
+        version,
+    })
+}
+
+/// Lexes an identifier-shaped word (`[A-Za-z_][A-Za-z0-9_.]*`) in raw-head
+/// position — the target name. A `.` is permitted so a dotted target band like
+/// `python3.13` reads as one word.
+fn lex_raw_word(cursor: &mut Cursor<'_>) -> String {
+    let mut word = String::new();
+    while let Some(c) = cursor.peek() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            word.push(c);
+            cursor.bump();
+        } else {
+            break;
+        }
+    }
+    word
+}
+
+/// Lexes an OPTIONAL opaque npm/Cargo-style version constraint following a
+/// target name (e.g. `>= 3.10`, `^1.2`, `1.0 - 2.0`), returning the verbatim
+/// constraint text or `None` when the next non-trivia char begins the arm body
+/// (`{` or `"`).
+///
+/// The comparator grammar is recognized only loosely: this collects the run of
+/// constraint characters (comparators `^ ~ > < = -` and version tokens
+/// `[0-9A-Za-z._]`, plus internal spaces for hyphen ranges) up to the body
+/// delimiter. The token is OPAQUE — it is stored, never parsed or compared.
+fn lex_raw_version(cursor: &mut Cursor<'_>) -> Option<String> {
+    // A version constraint only begins with a comparator or a version-token
+    // char; `{` or `"` means there is no constraint.
+    let is_constraint_start = |c: char| {
+        matches!(c, '^' | '~' | '>' | '<' | '=' | '-')
+            || c.is_ascii_digit()
+            || c.is_ascii_alphabetic()
+    };
+    match cursor.peek() {
+        Some(c) if is_constraint_start(c) => {}
+        _ => return None,
+    }
+    let mut text = String::new();
+    // Collect constraint chars; allow single interior spaces (hyphen ranges)
+    // but stop at the body delimiter or a newline.
+    loop {
+        match cursor.peek() {
+            Some('{') | Some('"') | None => break,
+            Some('\n') => break,
+            Some(c) if c.is_ascii_whitespace() => {
+                // Peek past the whitespace: keep it only if more constraint
+                // follows on the same construct (a hyphen range `A - B`).
+                let mut lookahead = 1;
+                while matches!(cursor.peek_at(lookahead), Some(c2) if c2 == ' ' || c2 == '\t') {
+                    lookahead += 1;
+                }
+                match cursor.peek_at(lookahead) {
+                    Some(c2) if c2 != '{' && c2 != '"' && c2 != '\n' => {
+                        text.push(' ');
+                        for _ in 0..lookahead {
+                            cursor.bump();
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            Some(c) => {
+                text.push(c);
+                cursor.bump();
+            }
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Captures a VERBATIM, brace-balanced arm body, starting at its opening `{`
+/// and consuming through the matching `}`. Returns the inner text (between the
+/// braces), with one leading and one trailing newline trimmed if present, but
+/// otherwise byte-for-byte as authored.
+///
+/// Target code is NOT Lamina, so this does not lex it. To avoid miscounting
+/// braces that appear inside the target's own string/char literals or comments,
+/// the scan skips over: double-quoted strings, single-quoted chars (both with
+/// `\`-escapes), `//` and `#` line comments, and `/* … */` block comments. A
+/// `{`/`}` inside any of those does not change depth. This covers the C-family,
+/// Rust, Python, Go, and JS/TS bodies the kernel targets; a body with braces
+/// hidden in a more exotic literal form should use the `"string"` arm instead.
+fn capture_raw_block(cursor: &mut Cursor<'_>, span: Span) -> Result<String, ParseError> {
+    if cursor.peek() != Some('{') {
+        return Err(ParseError::ExpectedAt {
+            expected: "`{` to open a raw arm body".to_string(),
+            found: cursor
+                .peek()
+                .map_or_else(|| "end of input".to_string(), |c| format!("`{c}`")),
+            line: cursor.line,
+            column: cursor.column,
+        });
+    }
+    cursor.bump(); // consume opening `{`
+    let mut depth: usize = 1;
+    let mut body = String::new();
+    while let Some(c) = cursor.peek() {
+        match c {
+            '{' => {
+                depth += 1;
+                body.push(c);
+                cursor.bump();
+            }
+            '}' => {
+                depth -= 1;
+                cursor.bump();
+                if depth == 0 {
+                    return Ok(trim_block_edges(&body));
+                }
+                body.push('}');
+            }
+            '"' | '\'' => capture_verbatim_literal(cursor, &mut body, c),
+            '/' if cursor.peek_at(1) == Some('/') => capture_verbatim_line_comment(cursor, &mut body),
+            '#' => capture_verbatim_line_comment(cursor, &mut body),
+            '/' if cursor.peek_at(1) == Some('*') => {
+                capture_verbatim_block_comment(cursor, &mut body)
+            }
+            _ => {
+                body.push(c);
+                cursor.bump();
+            }
+        }
+    }
+    Err(ParseError::UnterminatedLiteral {
+        kind: "raw",
+        line: span.line,
+        column: span.column,
+    })
+}
+
+/// Trims a single leading and trailing newline (and the trailing line's
+/// indentation) from a captured block body, so `rust { return x; }` written on
+/// one line and the multi-line brace form both yield clean inner text without
+/// the author's delimiter whitespace. Interior formatting is preserved.
+fn trim_block_edges(body: &str) -> String {
+    let trimmed = body.strip_prefix('\n').unwrap_or(body);
+    // Drop a trailing newline + any trailing spaces/tabs (the closing brace's
+    // own indentation line), but keep interior content intact.
+    let bytes_trimmed = trimmed.trim_end_matches([' ', '\t']);
+    let bytes_trimmed = bytes_trimmed.strip_suffix('\n').unwrap_or(trimmed);
+    bytes_trimmed.trim_matches(|c| c == ' ' || c == '\t').to_string()
+}
+
+/// Appends a verbatim string/char literal (opened by `quote`) to `body`,
+/// honoring `\`-escapes, so a brace inside the literal is not counted.
+fn capture_verbatim_literal(cursor: &mut Cursor<'_>, body: &mut String, quote: char) {
+    body.push(quote);
+    cursor.bump();
+    while let Some(c) = cursor.peek() {
+        body.push(c);
+        cursor.bump();
+        if c == '\\' {
+            if let Some(escaped) = cursor.peek() {
+                body.push(escaped);
+                cursor.bump();
+            }
+        } else if c == quote {
+            break;
+        }
+    }
+}
+
+/// Appends a verbatim line comment (through end of line) to `body`.
+fn capture_verbatim_line_comment(cursor: &mut Cursor<'_>, body: &mut String) {
+    while let Some(c) = cursor.peek() {
+        if c == '\n' {
+            break;
+        }
+        body.push(c);
+        cursor.bump();
+    }
+}
+
+/// Appends a verbatim `/* … */` block comment to `body`.
+fn capture_verbatim_block_comment(cursor: &mut Cursor<'_>, body: &mut String) {
+    body.push('/');
+    body.push('*');
+    cursor.bump();
+    cursor.bump();
+    while let Some(c) = cursor.peek() {
+        if c == '*' && cursor.peek_at(1) == Some('/') {
+            body.push('*');
+            body.push('/');
+            cursor.bump();
+            cursor.bump();
+            break;
+        }
+        body.push(c);
+        cursor.bump();
+    }
+}
+
+/// Captures a VERBATIM single-arm raw string body (`raw target "contents"`),
+/// honoring `\`-escapes while scanning, and returns the UNESCAPED contents
+/// (`\n`, `\t`, `\\`, `\"` resolved) so the stored code matches how the AST
+/// stores literal contents elsewhere.
+fn capture_raw_string(cursor: &mut Cursor<'_>, span: Span) -> Result<String, ParseError> {
+    // Reuse the ordinary string lexer: a raw string arm IS an ordinary
+    // double-quoted literal (the target code is its contents), unescaped once.
+    lex_string(cursor, span)
 }
 
 /// Tokenizes `src` into a flat list of [`SpannedToken`]s.
@@ -400,16 +776,10 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
             continue;
         }
 
-        // `//` begins a line comment (consumed to end of line). This resolves
-        // the one genuine lexical ambiguity in the ratified grammar — `//` is
-        // listed BOTH as the floor-division operator and as the line-comment
-        // introducer. We adopt the conventional C/Rust/JS rule: `//` is ALWAYS
-        // a line comment. The floor-division operator remains reachable by its
-        // explicit multi-character form only where a lexer could not read it as
-        // a comment, which never arises in authored source; a program needing
-        // floor division spells it via the dedicated expression path (and the
-        // `**`/`>>>` exotic operators cover the analogous cases). See the
-        // module docs and the parser's reported ambiguity resolutions.
+        // `//` begins a line comment (consumed to end of line). The ratified
+        // grammar separates the two historical meanings of `//`: it is ALWAYS a
+        // line comment here (the conventional C/Rust/JS rule), while floor
+        // division is spelled `~/` (see the `~` arm below and the module docs).
         if c == '/' && cursor.peek_at(1) == Some('/') {
             // Consume both slashes and the rest of the line.
             cursor.bump();
@@ -435,7 +805,18 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
             ',' => punct(&mut cursor, &mut tokens, Token::Comma),
             ';' => punct(&mut cursor, &mut tokens, Token::Semicolon),
             '@' => punct(&mut cursor, &mut tokens, Token::At),
-            '~' => punct(&mut cursor, &mut tokens, Token::Tilde),
+            '~' => {
+                // `~/` is floor division (Dart-style); a bare `~` is bitwise
+                // NOT. The two-char form is matched FIRST so `~/` never lexes as
+                // `~` followed by `/`.
+                cursor.bump();
+                if cursor.peek() == Some('/') {
+                    cursor.bump();
+                    push(&mut tokens, Token::TildeSlash, span);
+                } else {
+                    push(&mut tokens, Token::Tilde, span);
+                }
+            }
             '^' => punct(&mut cursor, &mut tokens, Token::Caret),
             '%' => punct(&mut cursor, &mut tokens, Token::Percent),
             '.' => punct(&mut cursor, &mut tokens, Token::Dot),
@@ -560,8 +941,19 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
             }
             _ if c.is_ascii_alphabetic() || c == '_' => {
                 let word = lex_word(&mut cursor);
-                let token = keyword(&word).unwrap_or(Token::Ident(word));
-                push(&mut tokens, token, span);
+                // The `raw` escape hatch is special: its arm bodies are VERBATIM
+                // target code (not Lamina), so they must be captured as opaque
+                // text rather than lexed as Lamina tokens. On seeing `raw` the
+                // lexer scans the whole construct char-by-char and emits a
+                // single structured [`Token::RawConstruct`] carrying the parsed
+                // arms; the parser only assembles it into the right node.
+                if word == "raw" {
+                    let construct = lex_raw_construct(&mut cursor, span)?;
+                    push(&mut tokens, construct, span);
+                } else {
+                    let token = keyword(&word).unwrap_or(Token::Ident(word));
+                    push(&mut tokens, token, span);
+                }
             }
             _ => {
                 return Err(ParseError::UnexpectedChar {

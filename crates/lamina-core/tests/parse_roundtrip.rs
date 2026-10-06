@@ -15,7 +15,7 @@
 
 use lamina_core::ast::{
     Attr, BinaryOp, CaseBindings, CaseFieldBind, Expr, Field, FieldInit, File, Function, Item,
-    Meta, Modifier, Param, Primitive, Statement, SwitchCase, Type, TypeAttribute, UnaryOp,
+    Meta, Modifier, Param, Primitive, RawArm, Statement, SwitchCase, Type, TypeAttribute, UnaryOp,
     UseItem, Variant, VariantPayload, Visibility,
 };
 use lamina_core::lang_doc::parse_language_def;
@@ -863,21 +863,164 @@ public fn render(): void {
     }
 }
 
+// ======================================================================
+// Floor division (`~/`) and the `raw` escape hatch
+// ======================================================================
+
 #[test]
-fn raw_block_in_worked_example_is_a_deferred_error() {
-    // The worked example's `fast_sqrt` uses `raw { … }`; parsing it is a
-    // deliberate deferred error (not a silent drop).
-    let src = r#"public fn fast_sqrt(x: f64): f64 {
+fn floordiv_tilde_slash_parses_at_multiplicative_precedence() {
+    // `~/` is the Dart-style floor-division spelling, mapped to
+    // `BinaryOp::FloorDiv` at the same (multiplicative) tier as `*` `/` `%`.
+    assert_expr(
+        "a ~/ b",
+        Expr::Binary {
+            op: BinaryOp::FloorDiv,
+            lhs: Box::new(Expr::Ref("a".into())),
+            rhs: Box::new(Expr::Ref("b".into())),
+        },
+    );
+    // Multiplicative tier: `a + b ~/ c` groups as `a + (b ~/ c)`.
+    assert_expr(
+        "a + b ~/ c",
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(Expr::Ref("a".into())),
+            rhs: Box::new(Expr::Binary {
+                op: BinaryOp::FloorDiv,
+                lhs: Box::new(Expr::Ref("b".into())),
+                rhs: Box::new(Expr::Ref("c".into())),
+            }),
+        },
+    );
+}
+
+#[test]
+fn raw_single_arm_string_expr_parses() {
+    // `raw <target> "string"` at expression position → a one-arm `Expr::Raw`
+    // (no `else`), the string contents captured verbatim (unescaped).
+    assert_body(
+        "let x = raw rust \"foo.cast::<u32>()\";",
+        vec![Statement::Let {
+            name: "x".into(),
+            ty: None,
+            value: Some(Expr::Raw {
+                arms: vec![RawArm {
+                    target: "rust".into(),
+                    version: None,
+                    code: "foo.cast::<u32>()".into(),
+                }],
+                default: None,
+                meta: Meta::new(),
+            }),
+        }],
+    );
+}
+
+#[test]
+fn raw_single_arm_string_with_version_parses() {
+    // A version constraint is ACCEPTED and stored opaquely (not matched on).
+    assert_body(
+        "let x = raw rust >= 1.70 \"foo.cast::<u32>()\";",
+        vec![Statement::Let {
+            name: "x".into(),
+            ty: None,
+            value: Some(Expr::Raw {
+                arms: vec![RawArm {
+                    target: "rust".into(),
+                    version: Some(">= 1.70".into()),
+                    code: "foo.cast::<u32>()".into(),
+                }],
+                default: None,
+                meta: Meta::new(),
+            }),
+        }],
+    );
+}
+
+#[test]
+fn raw_single_arm_block_item_parses() {
+    // `raw <target> { verbatim-block }` at item position → a one-arm
+    // `Item::Raw`; the brace-balanced body is captured verbatim (edges trimmed).
+    assert_item(
+        "raw rust {\n    macro_rules! id { ($x:expr) => { $x }; }\n}",
+        Item::Raw {
+            arms: vec![RawArm {
+                target: "rust".into(),
+                version: None,
+                code: "macro_rules! id { ($x:expr) => { $x }; }".into(),
+            }],
+            default: None,
+            meta: Meta::new(),
+        },
+    );
+}
+
+#[test]
+fn raw_grouped_multi_arm_with_else_parses() {
+    // The worked example's `fast_sqrt` body: a grouped `raw { … }` with three
+    // target arms and an `else` fallback → the expected multi-arm `Statement::Raw`
+    // AST (structural PartialEq). The brace-balanced arm bodies are verbatim.
+    let src = r#"fn f(): void {
     raw {
         rust   { return x.sqrt(); }
         python { return math.sqrt(x) }
         else   { return x; }
     }
 }"#;
-    let err = parse(src).expect_err("raw is deferred");
-    assert!(
-        matches!(err, lamina_core::ParseError::RawDeferred { .. }),
-        "expected RawDeferred, got {err:?}"
+    assert_item(
+        src,
+        func(
+            "f",
+            vec![Statement::Raw {
+                arms: vec![
+                    RawArm {
+                        target: "rust".into(),
+                        version: None,
+                        code: "return x.sqrt();".into(),
+                    },
+                    RawArm {
+                        target: "python".into(),
+                        version: None,
+                        code: "return math.sqrt(x)".into(),
+                    },
+                ],
+                default: Some("return x;".into()),
+                meta: Meta::new(),
+            }],
+        ),
+    );
+}
+
+#[test]
+fn raw_grouped_arm_with_version_parses() {
+    // A grouped arm may carry a version constraint; it is stored, not matched.
+    let src = r#"fn f(): void {
+    raw {
+        python >= 3.10 { result = (x := compute()) }
+        python < 3.10  { result = compute() }
+    }
+}"#;
+    assert_item(
+        src,
+        func(
+            "f",
+            vec![Statement::Raw {
+                arms: vec![
+                    RawArm {
+                        target: "python".into(),
+                        version: Some(">= 3.10".into()),
+                        code: "result = (x := compute())".into(),
+                    },
+                    RawArm {
+                        target: "python".into(),
+                        version: Some("< 3.10".into()),
+                        code: "result = compute()".into(),
+                    },
+                ],
+                default: None,
+                meta: Meta::new(),
+            }],
+        ),
     );
 }
 
@@ -967,4 +1110,91 @@ fn parse_then_emit_through_fixture_def() {
     let out =
         transpile("public fn answer(n: i32): i32 { return 42; }", &lang).expect("parse then emit");
     assert_eq!(out, "pub fn answer(n: i32) -> i32 {\n    return 42;\n}");
+}
+
+/// A fixture definition whose `target` is `fixture` and whose `### statement`
+/// renders a raw statement verbatim — so a grouped `raw { … }` transpiled
+/// through it emits exactly the `fixture` arm (proving parse → lower → emit).
+const RAW_FIXTURE_DEF: &str = concat!(
+    "# Lamina Language Definition: fixture\n",
+    "\n",
+    "```lang-meta\nlamina-format: 0.0.0\ntarget: fixture\ntarget-version: 1\n```\n",
+    "\n",
+    "## Function\n",
+    "\n",
+    "```template\n",
+    "fn {name}() {{\n",
+    "    {body}\n",
+    "}}\n",
+    "```\n",
+    "\n",
+    "### statement\n",
+    "| When        | Template |\n",
+    "|-------------|----------|\n",
+    "| stmt is raw | \"{value}\" |\n",
+    "| else        | forbid |\n",
+    "\n",
+    "## Capabilities\n",
+    "| Primitive | Action | Target |\n",
+    "|-----------|--------|--------|\n",
+    "| i8 | identity | i8 |\n| i16 | identity | i16 |\n| i32 | identity | i32 |\n",
+    "| i64 | identity | i64 |\n| i128 | identity | i128 |\n| u8 | identity | u8 |\n",
+    "| u16 | identity | u16 |\n| u32 | identity | u32 |\n| u64 | identity | u64 |\n",
+    "| u128 | identity | u128 |\n| isize | identity | isize |\n| usize | identity | usize |\n",
+    "| f16 | identity | f16 |\n| bf16 | identity | bf16 |\n| f32 | identity | f32 |\n",
+    "| f64 | identity | f64 |\n| f128 | identity | f128 |\n| bool | identity | bool |\n",
+    "| void | identity | void |\n| never | identity | never |\n| byte | identity | byte |\n",
+    "| bytes | identity | bytes |\n| char | identity | char |\n| str | identity | str |\n",
+    "| ptr | forbid | |\n| fnptr | forbid | |\n",
+);
+
+#[test]
+fn transpile_grouped_raw_emits_the_target_arm() {
+    // The def's target is `fixture`; a grouped raw with a `fixture` arm plus
+    // other arms must lower to the `fixture` arm and emit it verbatim.
+    let lang = parse_language_def(RAW_FIXTURE_DEF).expect("raw fixture def parses");
+    let src = r#"fn f(): void {
+    raw {
+        rust    { let r = x.sqrt(); }
+        fixture { FIXTURE_LINE; }
+        else    { fallback(); }
+    }
+}"#;
+    let out = transpile(src, &lang).expect("parse then lower then emit");
+    assert_eq!(out, "fn f() {\n    FIXTURE_LINE;\n}");
+}
+
+#[test]
+fn transpile_raw_uses_else_when_no_arm_matches() {
+    // No `fixture` arm, but an `else` fallback → the fallback is emitted.
+    let lang = parse_language_def(RAW_FIXTURE_DEF).expect("raw fixture def parses");
+    let src = r#"fn f(): void {
+    raw {
+        rust   { let r = x.sqrt(); }
+        else   { FALLBACK_LINE; }
+    }
+}"#;
+    let out = transpile(src, &lang).expect("parse then lower then emit");
+    assert_eq!(out, "fn f() {\n    FALLBACK_LINE;\n}");
+}
+
+#[test]
+fn transpile_raw_no_arm_no_else_is_a_lower_error() {
+    // No `fixture` arm and no `else` → a hard lower error (never silently
+    // dropped).
+    let lang = parse_language_def(RAW_FIXTURE_DEF).expect("raw fixture def parses");
+    let src = r#"fn f(): void {
+    raw {
+        rust   { let r = x.sqrt(); }
+        python { r = x }
+    }
+}"#;
+    let err = transpile(src, &lang).expect_err("no matching arm must fail");
+    assert!(
+        matches!(
+            err,
+            lamina_core::TranspileError::Lower(lamina_core::LowerError::NoRawArmForTarget { .. })
+        ),
+        "expected a NoRawArmForTarget lower error, got {err:?}"
+    );
 }

@@ -1400,6 +1400,25 @@ impl<'a> StmtResolver<'a> {
         match &self.scope {
             StmtScope::Case(case) => match name {
                 "value" => emit_expr(&case.value, self.lang, self.index),
+                // The scrutinee's enum **type name** when the enclosing
+                // `switch` dispatches over a payload-bearing enum, else the
+                // EMPTY string. A plain scalar slot (not a fact) exposing the
+                // name the index already resolves for `scrutinee is
+                // payload_enum`: a target renders a qualified native match arm
+                // (`Shape::Circle(r) =>`) from an unqualified source pattern,
+                // while a plain integer switch (or any non-payload-enum
+                // scrutinee) sees `""` and stays byte-identical. The enclosing
+                // Switch is still `self.stmt` in the case element scope, so the
+                // scrutinee is read from there.
+                "enum_name" => {
+                    let name = match self.stmt {
+                        Statement::Switch { scrutinee, .. } => {
+                            self.index.scrutinee_enum_name(scrutinee).unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(Rendered::text(name))
+                }
                 _ => self.unknown_slot(name),
             },
             // A payload-binding element exposes `name` (the local bind name)

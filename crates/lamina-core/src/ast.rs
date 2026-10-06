@@ -2966,6 +2966,15 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
         // variant-payload binding looped through the `binding` item slot.
         SlotScope::SwitchCase => match name {
             "value" => Some(SlotShape::Scalar),
+            // The scrutinee's enum type name when the enclosing `switch`
+            // dispatches over a payload-bearing enum, else the EMPTY string. A
+            // plain scalar slot (NOT a fact): it exposes the name the index
+            // already resolves for `scrutinee is payload_enum`, letting a target
+            // render a qualified native match arm (`Shape::Circle(r) =>`) from an
+            // unqualified source pattern. A plain integer switch (or any
+            // non-payload-enum scrutinee) resolves to `""`, so a case that never
+            // uses it — and every non-enum switch — stays byte-identical.
+            "enum_name" => Some(SlotShape::Scalar),
             // 0-based loop ordinal (see [`RenderContext::index`]).
             "index" => Some(SlotShape::Scalar),
             "body" => Some(SlotShape::Sequence {

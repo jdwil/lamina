@@ -363,6 +363,34 @@ impl<'a> UnitIndex<'a> {
         }
     }
 
+    /// Resolves the **type name** of a payload-bearing-enum scrutinee, backing
+    /// the `enum_name` switch-case scalar slot.
+    ///
+    /// This shares the exact resolution path of
+    /// [`scrutinee_is_payload_enum`](UnitIndex::scrutinee_is_payload_enum): it
+    /// answers `Some(type_name)` **only** when the scrutinee is a bare name
+    /// ([`Expr::Ref`]) whose declared type resolves to a [`Type::Named`] naming
+    /// an [`Item::Enum`] with at least one payload-bearing variant. Every other
+    /// scrutinee — a complex expression, an untyped `let`, an unknown name, a
+    /// payloadless enum, an integer — answers `None`.
+    ///
+    /// It exposes the name the index already knows (the engine stays dumb); a
+    /// language definition uses it to render a qualified native match arm
+    /// (`Shape::Circle(r) =>`) while a plain integer `switch` sees `None` and
+    /// renders byte-identically.
+    pub fn scrutinee_enum_name(&self, scrutinee: &Expr) -> Option<String> {
+        let Expr::Ref(name) = scrutinee else {
+            return None;
+        };
+        let Some(Type::Named(type_name)) = self.value_type(name) else {
+            return None;
+        };
+        match self.items.get(type_name.as_str()) {
+            Some(item) if item.is_payload_bearing_enum() => Some(type_name),
+            _ => None,
+        }
+    }
+
     /// Looks up a caller-supplied argument by `name`, searching frames from the
     /// innermost (top of stack) outward so a deeper passed arg shadows a
     /// shallower one. Returns the already-rendered value if bound, else `None`.

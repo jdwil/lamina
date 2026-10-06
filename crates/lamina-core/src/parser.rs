@@ -260,6 +260,22 @@ impl Parser {
         Visibility::Private
     }
 
+    /// Parses an optional leading **field** visibility keyword
+    /// (`public`/`protected`/`private`, full words). Unlike items — whose
+    /// omitted visibility defaults to [`Visibility::Private`] — a struct/variant
+    /// field whose visibility is omitted keeps the field default
+    /// [`Visibility::Public`], matching the pre-syntax behavior so existing
+    /// field lists render byte-identically.
+    fn parse_optional_field_visibility(&mut self) -> Visibility {
+        if let Some(Token::Ident(word)) = self.peek() {
+            if let Some(vis) = Visibility::from_name(word) {
+                self.pos += 1;
+                return vis;
+            }
+        }
+        Visibility::Public
+    }
+
     /// Parses zero or more on/off modifier keywords preceding `fn`.
     ///
     /// Modifiers are lexed as identifiers (except `const`, which has its own
@@ -406,13 +422,18 @@ impl Parser {
             return Ok(fields);
         }
         loop {
+            // Optional leading field visibility (`public`/`protected`/`private`
+            // as full words). A bare field keeps the field default — `Public` —
+            // so a field list written without any visibility keyword parses
+            // byte-identically to before this syntax existed.
+            let visibility = self.parse_optional_field_visibility();
             let name = self.expect_ident("a field name")?;
             self.expect(&Token::Colon, "`:` between a field name and its type")?;
             let ty = self.parse_type()?;
             fields.push(Field {
                 name,
                 ty,
-                visibility: Visibility::Public,
+                visibility,
                 meta: Meta::new(),
             });
             if !self.eat(&Token::Comma) {
@@ -616,8 +637,34 @@ impl Parser {
     /// A bare identifier is a primitive if it spells one of the frozen kernel
     /// primitive names, otherwise a user-defined [`Type::Named`]. An array type
     /// is `[elem]` (unsized) or `[elem; N]` (sized).
+    ///
+    /// Two **prefix** forms appear in TYPE POSITION ONLY (after a `:` in a
+    /// `let`/field/param, inside a fnptr param/return list, in a typedef target,
+    /// etc.) — never in expression position, so a leading `*` is unambiguously
+    /// "pointer to" rather than the multiplication operator:
+    ///
+    /// - `*T` is a [`Type::Pointer`] to `T`. It composes, so `**i32` is a
+    ///   pointer-to-pointer. (The lexer folds `**` into a single [`Token::StarStar`],
+    ///   so this consumes that token as a pair of `*` prefixes.)
+    /// - `*fn(T1, T2, …): R` is a [`Type::FnPtr`]. The `*` means "pointer to";
+    ///   `fn(params): ret` names the signature (mirroring the `fn name(params):
+    ///   ret` declaration shape, minus the name). A bare `fn(…)` WITHOUT a
+    ///   leading `*` is NOT a standalone type (the kernel has only the fnptr
+    ///   primitive), so `fn` is reachable here only through the `*` arm.
     fn parse_type(&mut self) -> Result<Type, ParseError> {
         match self.peek() {
+            // `*T` — pointer to `T`, type position only (no multiply here).
+            Some(Token::Star) => {
+                self.pos += 1;
+                self.parse_pointer_or_fnptr()
+            }
+            // `**T` — the lexer folds `**` into one token; treat it as two `*`
+            // prefixes so `**i32` is a pointer-to-pointer type.
+            Some(Token::StarStar) => {
+                self.pos += 1;
+                let inner = self.parse_pointer_or_fnptr()?;
+                Ok(Type::Pointer(Box::new(inner)))
+            }
             Some(Token::LBracket) => {
                 self.pos += 1;
                 let elem = self.parse_type()?;
@@ -645,6 +692,49 @@ impl Parser {
             }
             _ => Err(self.error("a type")),
         }
+    }
+
+    /// Parses the type that follows a consumed leading `*` in type position.
+    ///
+    /// If the next token is `fn`, this is the function-pointer form `*fn(T1,
+    /// …): R` and yields a [`Type::FnPtr`]; otherwise the `*` is an ordinary
+    /// pointer prefix and this yields a [`Type::Pointer`] wrapping the inner
+    /// type (which may itself begin with `*`, so pointers compose).
+    fn parse_pointer_or_fnptr(&mut self) -> Result<Type, ParseError> {
+        if self.peek() == Some(&Token::Fn) {
+            self.parse_fnptr_type()
+        } else {
+            let inner = self.parse_type()?;
+            Ok(Type::Pointer(Box::new(inner)))
+        }
+    }
+
+    /// Parses the function-pointer signature after a consumed `*`: `fn(T1, T2,
+    /// …): R`. The parameter list is a (possibly empty) comma-separated list of
+    /// types; the return type follows the ratified `: Type` form (an omitted
+    /// return type defaults to `void`, mirroring a declaration).
+    fn parse_fnptr_type(&mut self) -> Result<Type, ParseError> {
+        self.expect(&Token::Fn, "keyword `fn` in a function-pointer type")?;
+        self.expect(&Token::LParen, "`(` after `fn` in a function-pointer type")?;
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                params.push(self.parse_type()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+                // Allow a trailing comma before `)`.
+                if self.peek() == Some(&Token::RParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RParen, "`)` to close a function-pointer parameter list")?;
+        let ret = self.parse_return_type()?;
+        Ok(Type::FnPtr {
+            params,
+            ret: Box::new(ret),
+        })
     }
 
     // ---- Statements ---------------------------------------------------

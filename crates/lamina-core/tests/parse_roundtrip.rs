@@ -1198,3 +1198,179 @@ fn transpile_raw_no_arm_no_else_is_a_lower_error() {
         "expected a NoRawArmForTarget lower error, got {err:?}"
     );
 }
+
+// ======================================================================
+// Gap 1 — pointer & function-pointer TYPES (type position only)
+// ======================================================================
+//
+// `*T` is a pointer-to-`T` and composes (`**i32`); `*fn(T1, …): R` is a
+// function pointer. Both appear in TYPE POSITION ONLY (here: a `typedef`
+// target and a `let` annotation), so a leading `*` is unambiguously
+// "pointer to", never the multiplication operator. These assert the parsed
+// AST equals the hand-built `Type::Pointer` / `Type::FnPtr` oracle.
+
+/// A `typedef Name = <type>;` oracle, for asserting a parsed type.
+fn typedef(name: &str, target: Type) -> Item {
+    Item::TypeDef {
+        name: name.to_string(),
+        target,
+        meta: Meta::new(),
+    }
+}
+
+#[test]
+fn parses_pointer_type() {
+    // `*i32` -> Type::Pointer(i32).
+    assert_item(
+        "typedef P = *i32;",
+        typedef(
+            "P",
+            Type::Pointer(Box::new(Type::Primitive(Primitive::I32))),
+        ),
+    );
+}
+
+#[test]
+fn parses_pointer_to_pointer_type() {
+    // `**i32` -> Type::Pointer(Type::Pointer(i32)). The lexer folds `**` into a
+    // single token, which `parse_type` unfolds into two pointer prefixes.
+    assert_item(
+        "typedef PP = **i32;",
+        typedef(
+            "PP",
+            Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Primitive(
+                Primitive::I32,
+            ))))),
+        ),
+    );
+}
+
+#[test]
+fn parses_fn_pointer_type() {
+    // `*fn(i32, i32): bool` -> Type::FnPtr { params: [i32, i32], ret: bool }.
+    assert_item(
+        "typedef Cmp = *fn(i32, i32): bool;",
+        typedef(
+            "Cmp",
+            Type::FnPtr {
+                params: vec![
+                    Type::Primitive(Primitive::I32),
+                    Type::Primitive(Primitive::I32),
+                ],
+                ret: Box::new(Type::Primitive(Primitive::Bool)),
+            },
+        ),
+    );
+}
+
+#[test]
+fn parses_zero_param_fn_pointer_type() {
+    // `*fn(): void` -> Type::FnPtr { params: [], ret: void }.
+    assert_item(
+        "typedef Thunk = *fn(): void;",
+        typedef(
+            "Thunk",
+            Type::FnPtr {
+                params: vec![],
+                ret: Box::new(Type::Primitive(Primitive::Void)),
+            },
+        ),
+    );
+}
+
+#[test]
+fn parses_pointer_to_fn_pointer_type() {
+    // `*` composes with the fnptr form: `**fn(i32): bool` is a pointer to a
+    // function pointer (`Pointer(FnPtr{…})`), proving the `*`-prefix and the
+    // `*fn(…)` form compose through the shared `parse_pointer_or_fnptr` seam.
+    assert_item(
+        "typedef PCmp = **fn(i32): bool;",
+        typedef(
+            "PCmp",
+            Type::Pointer(Box::new(Type::FnPtr {
+                params: vec![Type::Primitive(Primitive::I32)],
+                ret: Box::new(Type::Primitive(Primitive::Bool)),
+            })),
+        ),
+    );
+}
+
+#[test]
+fn parses_fn_pointer_let_annotation() {
+    // The fnptr type also parses in a `let` annotation (type position after
+    // `:`): `let cmp: *fn(i32, i32): bool = f;`.
+    assert_body(
+        "let cmp: *fn(i32, i32): bool = f;",
+        vec![Statement::Let {
+            name: "cmp".to_string(),
+            ty: Some(Type::FnPtr {
+                params: vec![
+                    Type::Primitive(Primitive::I32),
+                    Type::Primitive(Primitive::I32),
+                ],
+                ret: Box::new(Type::Primitive(Primitive::Bool)),
+            }),
+            value: Some(Expr::Ref("f".to_string())),
+        }],
+    );
+}
+
+// ======================================================================
+// Gap 4 — struct field visibility (optional leading full-word keyword)
+// ======================================================================
+//
+// A struct field may carry an optional leading visibility keyword, as full
+// words consistent with items: `public x: i32` / `protected y: i32` /
+// `private z: i32`. A field with NO keyword keeps the field default
+// `Visibility::Public`, so a keyword-free field list parses byte-identically
+// to before this syntax existed. (Note the ITEM default is `Private`; the
+// FIELD default is `Public` — see the parser's `parse_optional_field_visibility`.)
+
+/// A `struct` item oracle for the field-visibility tests.
+fn vis_struct(name: &str, fields: Vec<Field>) -> Item {
+    Item::Struct {
+        name: name.to_string(),
+        visibility: Visibility::Public,
+        fields,
+        attributes: vec![],
+        meta: Meta::new(),
+    }
+}
+
+/// An `i32` field with an explicit visibility.
+fn vfield(name: &str, vis: Visibility) -> Field {
+    Field {
+        name: name.to_string(),
+        ty: Type::Primitive(Primitive::I32),
+        visibility: vis,
+        meta: Meta::new(),
+    }
+}
+
+#[test]
+fn bare_field_defaults_to_public() {
+    // No keyword -> the field default (Public), byte-identical to before the
+    // per-field visibility syntax existed.
+    assert_item(
+        "public struct S { x: i32, y: i32 }",
+        vis_struct("S", vec![vfield("x", Visibility::Public), vfield("y", Visibility::Public)]),
+    );
+}
+
+#[test]
+fn parses_per_field_visibility_keywords() {
+    // Each full-word keyword maps to the field's visibility; a bare field keeps
+    // the Public default. Mixed within one struct.
+    assert_item(
+        "public struct S { public a: i32, private b: i32, protected c: i32, d: i32 }",
+        vis_struct(
+            "S",
+            vec![
+                vfield("a", Visibility::Public),
+                vfield("b", Visibility::Private),
+                vfield("c", Visibility::Protected),
+                vfield("d", Visibility::Public),
+            ],
+        ),
+    );
+}

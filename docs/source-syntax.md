@@ -32,6 +32,34 @@ the *written* form will be.
 - `//` line comments (prose; ignored).
 - String literals double-quoted.
 
+### Types (type position only)
+
+A type appears after a `:` in a `let`/field/param, as a `typedef`/`const`
+target, inside a function-pointer parameter/return list, and as an array element.
+The type grammar is:
+
+```
+type := "*" type                         // pointer to a type (composes: **i32)
+      | "*" "fn" "(" (type ("," type)*)? ")" (":" type)?   // function pointer
+      | "[" type (";" INT)? "]"          // array (sized / unsized)
+      | primitive                        // a frozen kernel primitive name
+      | named                            // a user-defined struct/enum/typedef name
+```
+
+- **`*T`** is a **pointer to `T`** (kernel `ptr`). It composes, so `**i32` is a
+  pointer-to-pointer. A leading `*` is **type position only** — it is NOT the
+  multiplication operator (which never appears where a type is expected), so the
+  prefix is unambiguous.
+- **`*fn(T1, T2, …): R`** is a **function pointer** (kernel `fnptr`). The `*`
+  means "pointer to"; `fn(params): ret` names the signature, mirroring the
+  `fn name(params): ret` declaration shape minus the name (an omitted return
+  type is `void`). A bare `fn(…)` **without** a leading `*` is NOT a standalone
+  type — the kernel has only the `fnptr` primitive, and the signature form is
+  reachable only through the `*` prefix. Example:
+  `let cmp: *fn(i32, i32): bool = compare;`
+- Both forms map to the existing `Type::Pointer` / `Type::FnPtr` kernel AST;
+  the rendering per target is supplied by the language definition.
+
 ## Items
 
 ### Functions
@@ -52,11 +80,16 @@ public async fn add(x: i32, y: i32): i32 {
 @displayable
 struct Point {
     x: i32,
-    y: i32,
+    private y: i32,
 }
 ```
 - `struct` (NOT `interface`/`class` — those are OOP, a future layer).
 - Fields `name: Type`, comma-separated.
+- A field may carry an **optional leading visibility** keyword, as full words
+  consistent with items: `public x: i32` / `protected y: i32` / `private z: i32`.
+  A field with no keyword keeps the field default **`public`** (so a
+  keyword-free field list is unchanged from before this syntax existed; note the
+  *item* default is `private`, but the *field* default is `public`).
 
 ### Enums (with payloads — Rust-style)
 ```
@@ -72,13 +105,29 @@ enum Shape {
 const MAX: i32 = 100;
 typedef Celsius = f64;
 
-use http;                     // import a .mdl (module / layer / profile) by name
+use http;                     // import a Lamina .mdl (module / layer / profile) by name
 use ./models::{ User, Role }; // selective from a local source file
 use math as m;                // aliased
+use std::io;                  // a `::`-separated Lamina module path (NO dots)
 ```
-- A single `use` imports any `.mdl` artifact (source module, layer, or profile);
-  the engine resolves what it points at. Kernel source does **not** describe
-  external SDKs (no stubs) — rich SDK binding is a **layer** concern.
+- A single `use` imports any Lamina `.mdl` artifact (source module, layer, or
+  profile) by a **Lamina module path**: one or more identifiers joined by `::`
+  (optionally `./`-prefixed for a local path), with an optional selective
+  `::{ a, b as c }` item list or a module `as alias`. The engine resolves what
+  the path points at.
+- A `use` path is **Lamina-only**: it names a Lamina artifact over a `::`-path.
+  It carries **no dots** (`.` is not a path separator — `use a.b;` is a parse
+  error) and **no target/native-package name**. Kernel source does **not**
+  describe external SDKs (no stubs) — rich SDK binding is a **layer** concern.
+- **Native / external-package imports are OUT of `use` scope and parked.** A
+  Lamina `use` always refers to a Lamina module; a language definition renders
+  that Lamina `::`-path through the target's own module-import form (Rust `use
+  a::b;`, Python `import a::b`, Haskell `import a::b`, Java `import a::b;`, C
+  `#include <a::b>`, …) — it is NOT a native package import. Importing a genuine
+  native/external package (a real `stdio.h`, `java.util.List`, `Data.List`,
+  `numpy`) is a **deferred, dedicated proxy construct** (target-tagged, routed to
+  the target's import region — a profile/layer-arc concern), not reusing `use`
+  and not reusing `raw`. It is intentionally not designed here.
 
 ## Type attributes & metadata (the `@` sigil)
 
@@ -123,6 +172,12 @@ switch (value) {
 - `switch` arms are `case <value> { block }` — braced blocks, **no fall-through**
   (each arm is a self-contained block, matching the kernel's structured switch),
   with an optional `default { block }`.
+- A `case` that binds an enum variant's payload names the variant
+  **UNQUALIFIED** — `case Circle(r) { … }` (positional) / `case Rect { w, h }
+  { … }` (named), never `Shape::Circle`. The source carries no `::` path
+  operator in expression/pattern position; a target that needs a qualifier
+  (e.g. Rust's `Shape::Circle(r) =>`) supplies it from context in the language
+  **definition**, not the source.
 
 ## The tree core (node / attr / text)
 

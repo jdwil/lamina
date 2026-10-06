@@ -220,3 +220,41 @@ ptr fnptr                       -> forbid
 ### Language File Format
 
 A language file is a rigid, markdown-compatible `.mdl` document. Target syntax is expressed as **templates with named slots**, not a fixed set of flags — because flags cannot describe the real variation (`-> !` for never vs. omitted `()` for void vs. `-> i32` for a normal return are three spellings of one return slot). One `decl` template plus slot variants (`ret`, `ret_void`, `ret_never`, `param`, `export_on`, …) covers it; a different target fills the same slots with different spellings (this is exactly how an indentation-based target like Python is supported). Alongside the template sits a small **policy** table (identifier style, statement terminator, empty-body spelling, etc.). When a new construct is added (`if`, `return`), it follows the same pattern: one template plus a tiny policy table, never a new mini-language per construct.
+
+## Source-syntax scope notes (kernel `use`, parked native imports)
+
+**Kernel `use` is Lamina-only.** A `use` imports a **Lamina `.mdl` artifact**
+(source module / layer / profile) by a **Lamina module path**: `::`-separated
+identifiers, **no dots**, **no target/native-package name**. A language
+definition renders that Lamina `::`-path through the target's own module-import
+form (Rust `use a::b;`, Python `import a::b`, Haskell `import a::b`, Java
+`import a::b;`, C `#include <a::b>`, …). It is *not* a native package import, and
+no shipped `<lang>.lang.mdl` transforms the path into one — the defs pass the
+Lamina path through verbatim. (The grammar authority is `docs/source-syntax.md`.)
+
+**Native / external-package imports are PARKED (out of `use` scope).** Importing
+a genuine native/external package (a real `stdio.h`, `java.util.List`,
+`Data.List`, `numpy`) is a **deferred, dedicated proxy construct** — target-
+tagged, routed to the target's import region, a profile/layer-arc concern. It
+does **not** reuse `use` and does **not** reuse `raw`. It is intentionally not
+designed yet.
+
+**Escalation — Rust `switch`-payload case qualifier (source-syntax Gap 3).**
+Case patterns are **unqualified** in source (`case Circle(r)`), and the parser
+correctly produces an unqualified `SwitchCase` + `CaseBindings`. A target that
+needs a qualifier (Rust's native match wants `Shape::Circle(r) =>`) is expected
+to supply it "from context in the definition." However, the shipped
+`rust.lang.mdl` renders a case arm as `{value}( … ) => …`, where `{value}` is the
+case value rendered verbatim through `### expr`; from unqualified source it emits
+`Circle(r) =>`, not `Shape::Circle(r) =>`. There is **no engine mechanism** that
+exposes the scrutinee's enum type name in case scope, so the def cannot
+synthesize the `Shape::` qualifier without either (a) a Rust-def change beyond
+the permitted `use`-rendering reconciliation, or (b) a new engine fact/slot (an
+AST/engine change). Both are out of scope for the gap-closing arc, and producing
+byte-identical qualified output from unqualified source is impossible under the
+stated constraints. The two affected Rust pilot tests
+(`match_binds_tuple_payload`, `match_binds_struct_payload`) are therefore **left
+hand-built-AST** (the AST carries the qualified ref `Shape::Circle`) pending a
+ratified decision on how a target recovers the variant's owning-enum qualifier
+(a dedicated engine fact/slot vs. accepting unqualified Rust output with an
+in-scope `use` of the variants).

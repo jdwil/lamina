@@ -189,9 +189,62 @@ node div(class = "box", id = "main") {
     }
 }
 ```
-- `node name(attr = "value", ...) { children }` — mirrors `fn name(params) { body }`.
+- `node [name] [(attr = "value", ...)] { children }` — mirrors
+  `fn name(params) { body }`; the name and the attribute list are both
+  **optional**, the brace block is required.
 - Attributes use `=` (a value assignment, like `@meta` and `let`).
 - `text "..."` — explicit text leaf (no node-vs-text inference).
+
+### Node & attribute names may be quoted (opaque names)
+
+A `node` name and an `attr` name may each be EITHER a bare identifier OR a
+**double-quoted string literal**. A quoted name is **opaque** — the parser stores
+its string value verbatim and never parses its internal structure — so a name
+that is not a legal identifier (a CSS selector, a hyphenated or symbol-bearing
+key) is expressible:
+```
+node ".box"("font-size" = "14px") { }        // CSS rule + hyphenated property
+node "a.btn:hover"("color" = "red") { }       // compound/pseudo selector
+node div(id = "main") { }                      // identifier form still works (HTML)
+```
+The identifier and quoted forms are interchangeable; both yield the same string
+in the AST name field (there is no second name vocabulary).
+
+### Anonymous nodes (optional name)
+
+A `node` may omit its name entirely: `node { ... }` (optionally with attributes,
+`node("a" = 1) { ... }`) is an **anonymous** node — an empty-string name in the
+AST. This is how a document root or a collection item that has no name of its own
+is written:
+```
+node {                       // anonymous (e.g. a document root / sequence item)
+    node { text "ir" }
+    node { text "transpiler" }
+}
+```
+
+### `@meta(...)` on a node
+
+The `@meta(key = "value", ...)` annotation (used elsewhere on top-level
+`struct`/`enum` items) may also **precede a `node`**, attaching to that node's
+metadata:
+```
+@meta(yaml = "seq")
+node "tags" {
+    node { text "ir" }
+    node { text "transpiler" }
+}
+```
+Only `@meta(...)` is valid on a tree node — a type attribute (`@equatable`,
+`@displayable`, …) on a node is a parse error. The metadata is **opaque**: the
+engine passes it through unchanged and a *language definition* interprets it
+(via the `has_meta(<key>)` / `meta.<key> is <value>` facts). This keeps all
+**domain** semantics out of the kernel grammar — a CSS selector's algebra, a YAML
+block-mapping-vs-sequence distinction, a TOML table-vs-document-root role, and so
+on are a **layer/definition** concern carried through opaque node names and
+opaque metadata, never baked into the tree-core syntax. The three nodes
+(`node`/`attr`/`text`) stay generic and domain-neutral.
+
 
 ## Raw / native-interop (the escape hatch)
 

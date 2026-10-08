@@ -648,6 +648,277 @@ fn top_level_tree_value() {
     );
 }
 
+// ----------------------------------------------------------------------
+// Tree-core source extensions B-1 / B-2 / B-3
+// ----------------------------------------------------------------------
+//
+// B-1: a node/attr name may be a quoted string (an opaque name).
+// B-2: a node name is OPTIONAL (an anonymous, empty-name node).
+// B-3: a `@meta(...)` annotation may precede a `node`, attaching to its Meta.
+//
+// NOTE: `Expr::Node` / `Attr` structural equality IGNORES `meta` (the AST
+// contract — see the module docs), so the B-3 tests assert the parsed `meta`
+// field DIRECTLY rather than through `assert_item`'s `PartialEq`.
+
+/// Parses `src` as a single top-level tree item and returns the root node's
+/// parts, failing if the parse did not yield exactly one `Item::Tree(Node)`.
+fn parse_single_tree_node(src: &str) -> (String, Vec<Attr>, Vec<Expr>, Meta) {
+    let parsed = parse(src).unwrap_or_else(|e| panic!("parse failed for {src:?}: {e}"));
+    let mut items = parsed.items;
+    assert_eq!(items.len(), 1, "expected one item for {src:?}");
+    match items.pop() {
+        Some(Item::Tree(Expr::Node {
+            name,
+            attrs,
+            children,
+            meta,
+        })) => (name, attrs, children, meta),
+        other => panic!("expected a single top-level tree node for {src:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn tree_node_name_may_be_quoted_string() {
+    // B-1: a CSS-selector node name and a hyphenated attribute name are quoted
+    // strings; both are stored opaquely as the string value.
+    assert_item(
+        "node \".box\"(\"font-size\" = \"14px\") { }",
+        Item::Tree(Expr::Node {
+            name: ".box".into(),
+            attrs: vec![Attr {
+                name: "font-size".into(),
+                value: Expr::StringLiteral("14px".into()),
+                meta: Meta::new(),
+            }],
+            children: vec![],
+            meta: Meta::new(),
+        }),
+    );
+    // A compound/descendant selector is likewise an opaque quoted name.
+    assert_item(
+        "node \"a.btn:hover\"(\"color\" = \"red\") { }",
+        Item::Tree(Expr::Node {
+            name: "a.btn:hover".into(),
+            attrs: vec![Attr {
+                name: "color".into(),
+                value: Expr::StringLiteral("red".into()),
+                meta: Meta::new(),
+            }],
+            children: vec![],
+            meta: Meta::new(),
+        }),
+    );
+}
+
+#[test]
+fn tree_node_identifier_name_still_works() {
+    // B-1 is additive: the identifier form (HTML) parses exactly as before.
+    assert_item(
+        "node div(id = \"main\") { }",
+        Item::Tree(Expr::Node {
+            name: "div".into(),
+            attrs: vec![Attr {
+                name: "id".into(),
+                value: Expr::StringLiteral("main".into()),
+                meta: Meta::new(),
+            }],
+            children: vec![],
+            meta: Meta::new(),
+        }),
+    );
+}
+
+#[test]
+fn tree_node_name_is_optional_anonymous() {
+    // B-2: a bare `node { … }` is anonymous — an empty-string name.
+    assert_item(
+        "node { text \"hi\" }",
+        Item::Tree(Expr::Node {
+            name: String::new(),
+            attrs: vec![],
+            children: vec![Expr::Text(Box::new(Expr::StringLiteral("hi".into())))],
+            meta: Meta::new(),
+        }),
+    );
+    // An anonymous node may still carry attributes (the YAML flat-mapping form).
+    assert_item(
+        "node(\"name\" = \"lamina\", \"port\" = 8080) { }",
+        Item::Tree(Expr::Node {
+            name: String::new(),
+            attrs: vec![
+                Attr {
+                    name: "name".into(),
+                    value: Expr::StringLiteral("lamina".into()),
+                    meta: Meta::new(),
+                },
+                Attr {
+                    name: "port".into(),
+                    value: Expr::IntLiteral("8080".into()),
+                    meta: Meta::new(),
+                },
+            ],
+            children: vec![],
+            meta: Meta::new(),
+        }),
+    );
+}
+
+#[test]
+fn tree_nested_anonymous_sequence_shape() {
+    // B-2: nested anonymous nodes model a YAML sequence (each item an
+    // anonymous node wrapping a text scalar).
+    assert_item(
+        "node { node { text \"ir\" } node { text \"transpiler\" } }",
+        Item::Tree(Expr::Node {
+            name: String::new(),
+            attrs: vec![],
+            children: vec![
+                Expr::Node {
+                    name: String::new(),
+                    attrs: vec![],
+                    children: vec![Expr::Text(Box::new(Expr::StringLiteral("ir".into())))],
+                    meta: Meta::new(),
+                },
+                Expr::Node {
+                    name: String::new(),
+                    attrs: vec![],
+                    children: vec![Expr::Text(Box::new(Expr::StringLiteral(
+                        "transpiler".into(),
+                    )))],
+                    meta: Meta::new(),
+                },
+            ],
+            meta: Meta::new(),
+        }),
+    );
+}
+
+#[test]
+fn tree_meta_annotates_a_node() {
+    // B-3: a `@meta(...)` before a `node` attaches to the node's Meta (opaque —
+    // the def interprets it). Assert the Meta DIRECTLY (PartialEq ignores it).
+    let (name, _attrs, children, meta) = parse_single_tree_node(
+        "@meta(yaml = \"seq\")\nnode \"tags\" { node { text \"ir\" } node { text \"transpiler\" } }",
+    );
+    assert_eq!(name, "tags");
+    assert_eq!(meta.get("yaml"), Some("seq"), "node carries yaml=seq");
+    assert_eq!(children.len(), 2, "two sequence items");
+}
+
+#[test]
+fn tree_meta_only_accepts_meta_on_a_node() {
+    // B-3: only `@meta(...)` is valid on a tree node — a type attribute is a
+    // clear parse error (not silently accepted or dropped).
+    assert!(
+        parse("@equatable\nnode div { }").is_err(),
+        "a type attribute on a tree node must be rejected"
+    );
+    assert!(
+        parse("node x { @displayable\nnode y { } }").is_err(),
+        "a type attribute on a nested tree node must be rejected"
+    );
+}
+
+#[test]
+fn tree_meta_nested_node_carries_metadata() {
+    // B-3 at nesting depth: a `@meta(...)` before a child node attaches to that
+    // child's Meta.
+    let (_name, _attrs, children, _meta) = parse_single_tree_node(
+        "node {\n    @meta(toml = \"table\")\n    node \"server\"(\"host\" = \"localhost\") { }\n}",
+    );
+    assert_eq!(children.len(), 1);
+    match &children[0] {
+        Expr::Node { name, meta, .. } => {
+            assert_eq!(name, "server");
+            assert_eq!(meta.get("toml"), Some("table"));
+        }
+        other => panic!("expected a nested node, got {other:?}"),
+    }
+}
+
+#[test]
+fn tree_worked_yaml_example_round_trips() {
+    // The full worked YAML example from the spec: an anonymous document-root
+    // mapping with scalar attributes, a nested named mapping, and a
+    // `@meta(yaml=seq)`-tagged sequence of anonymous text items.
+    let src = r#"
+        node("name" = "lamina", "version" = "1") {
+            node "server"("host" = "localhost", "port" = "5432") { }
+            @meta(yaml = "seq")
+            node "tags" {
+                node { text "ir" }
+                node { text "transpiler" }
+            }
+        }
+    "#;
+    let (name, attrs, children, meta) = parse_single_tree_node(src);
+
+    // Root: anonymous mapping with two scalar attributes.
+    assert_eq!(name, "", "document root is anonymous");
+    assert!(meta.is_empty(), "root carries no metadata");
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].name, "name");
+    assert_eq!(attrs[0].value, Expr::StringLiteral("lamina".into()));
+    assert_eq!(attrs[1].name, "version");
+    assert_eq!(attrs[1].value, Expr::StringLiteral("1".into()));
+    assert_eq!(children.len(), 2);
+
+    // First child: named `server` mapping with two scalar attributes.
+    match &children[0] {
+        Expr::Node {
+            name,
+            attrs,
+            children,
+            meta,
+        } => {
+            assert_eq!(name, "server");
+            assert!(meta.is_empty());
+            assert!(children.is_empty());
+            assert_eq!(attrs.len(), 2);
+            assert_eq!(attrs[0].name, "host");
+            assert_eq!(attrs[0].value, Expr::StringLiteral("localhost".into()));
+            assert_eq!(attrs[1].name, "port");
+            assert_eq!(attrs[1].value, Expr::StringLiteral("5432".into()));
+        }
+        other => panic!("expected the `server` mapping node, got {other:?}"),
+    }
+
+    // Second child: `@meta(yaml=seq)` `tags` sequence of two anonymous text
+    // items.
+    match &children[1] {
+        Expr::Node {
+            name,
+            attrs,
+            children,
+            meta,
+        } => {
+            assert_eq!(name, "tags");
+            assert_eq!(meta.get("yaml"), Some("seq"), "the tags node is a sequence");
+            assert!(attrs.is_empty());
+            assert_eq!(children.len(), 2);
+            for (child, expected) in children.iter().zip(["ir", "transpiler"]) {
+                match child {
+                    Expr::Node {
+                        name,
+                        attrs,
+                        children,
+                        ..
+                    } => {
+                        assert_eq!(name, "", "a sequence item is an anonymous node");
+                        assert!(attrs.is_empty());
+                        assert_eq!(
+                            children,
+                            &vec![Expr::Text(Box::new(Expr::StringLiteral(expected.into())))]
+                        );
+                    }
+                    other => panic!("expected an anonymous sequence item, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected the `tags` sequence node, got {other:?}"),
+    }
+}
+
 // ======================================================================
 // Whole-kernel representative program (minus raw)
 // ======================================================================

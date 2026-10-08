@@ -187,8 +187,21 @@ impl Parser {
             Some(Token::TypeDef) => self.parse_typedef(),
             Some(Token::Use) => self.parse_use(),
             Some(Token::Node) | Some(Token::Text) => {
-                // A top-level tree value (a declarative-only document root).
-                let expr = self.parse_expr()?;
+                // A top-level tree value (a declarative-only document root). A
+                // preceding `@meta(...)` attaches to the root node (B-3); a type
+                // attribute is not valid on a tree node.
+                if !attributes.is_empty() {
+                    return Err(ParseError::Expected {
+                        expected: "only `@meta(...)` on a tree node (a type \
+                                   attribute like `@equatable` is not valid here)"
+                            .to_string(),
+                        found: "a type attribute".to_string(),
+                    });
+                }
+                let expr = match self.peek() {
+                    Some(Token::Node) => self.parse_node(meta)?,
+                    _ => self.parse_text()?,
+                };
                 Ok(Item::Tree(expr))
             }
             Some(Token::RawConstruct { .. }) => {
@@ -1258,7 +1271,7 @@ impl Parser {
                 Ok(Expr::NullLiteral)
             }
             Some(Token::LBracket) => self.parse_array_literal(),
-            Some(Token::Node) => self.parse_node(),
+            Some(Token::Node) => self.parse_node(Meta::new()),
             Some(Token::Text) => self.parse_text(),
             Some(Token::RawConstruct { .. }) => {
                 let (arms, default) = self.take_raw_construct()?;
@@ -1345,17 +1358,53 @@ impl Parser {
         })
     }
 
-    /// `node := "node" IDENT ("(" attr ("," attr)* ")")? ("{" child* "}")?`
-    /// where `attr := IDENT "=" expr` and a child is a nested expression.
-    fn parse_node(&mut self) -> Result<Expr, ParseError> {
+    /// Reads a **tree name** — a `node` name or an `attr` name — which may be
+    /// EITHER a bare identifier OR a double-quoted string literal. Either form
+    /// yields the same `String`; the name is **opaque** (its internal structure
+    /// is never parsed), so a CSS selector (`".box"`, `"a.btn:hover"`) or a
+    /// hyphenated key (`"font-size"`) is expressible as a quoted name while the
+    /// identifier form (`div`, `id`) still works unchanged.
+    fn expect_tree_name(&mut self, what: &str) -> Result<String, ParseError> {
+        match self.peek() {
+            Some(Token::Ident(name)) => {
+                let name = name.clone();
+                self.pos += 1;
+                Ok(name)
+            }
+            Some(Token::Str(name)) => {
+                let name = name.clone();
+                self.pos += 1;
+                Ok(name)
+            }
+            _ => Err(self.error(what)),
+        }
+    }
+
+    /// `node := meta? "node" name? ("(" attr ("," attr)* ")")? "{" child* "}"`
+    /// where `name := IDENT | STRING` (opaque — see [`Self::expect_tree_name`]),
+    /// `attr := name "=" expr`, and a child is a nested expression.
+    ///
+    /// The `name` is **optional**: `node { … }` is an **anonymous** node (an
+    /// empty-string name in the AST), used for a document root or a sequence
+    /// item. The leading `meta` is an already-parsed [`Meta`] (from a `@meta(…)`
+    /// annotation preceding the `node`); callers that parse no annotation pass
+    /// an empty [`Meta::new`].
+    fn parse_node(&mut self, meta: Meta) -> Result<Expr, ParseError> {
         self.expect(&Token::Node, "keyword `node`")?;
-        let name = self.expect_ident("a node name")?;
+        // The name is optional (B-2): a bare `node { … }` is anonymous. A name,
+        // when present, is an identifier or a quoted string (B-1).
+        let name = match self.peek() {
+            Some(Token::Ident(_)) | Some(Token::Str(_)) => {
+                self.expect_tree_name("a node name")?
+            }
+            _ => String::new(),
+        };
         let mut attrs = Vec::new();
         if self.peek() == Some(&Token::LParen) {
             self.pos += 1;
             if self.peek() != Some(&Token::RParen) {
                 loop {
-                    let attr_name = self.expect_ident("an attribute name")?;
+                    let attr_name = self.expect_tree_name("an attribute name")?;
                     self.expect(&Token::Eq, "`=` in a node attribute")?;
                     let value = self.parse_binary(0, true)?;
                     attrs.push(Attr {
@@ -1388,7 +1437,7 @@ impl Parser {
             name,
             attrs,
             children,
-            meta: Meta::new(),
+            meta,
         })
     }
 
@@ -1397,9 +1446,36 @@ impl Parser {
     /// whitespace-separated in source).
     fn parse_child(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
-            Some(Token::Node) => self.parse_node(),
+            Some(Token::At) => self.parse_meta_node(),
+            Some(Token::Node) => self.parse_node(Meta::new()),
             Some(Token::Text) => self.parse_text(),
             _ => self.parse_binary(0, true),
+        }
+    }
+
+    /// Parses a `@meta(key = "value", …)` annotation that precedes a `node`
+    /// (B-3), attaching the parsed [`Meta`] to that node. The metadata is
+    /// **opaque** — the engine passes it through and a language definition
+    /// interprets it (`has_meta`/`meta.<key>`), so a def can distinguish e.g. a
+    /// YAML sequence from a map, or a TOML table-array, WITHOUT any domain role
+    /// in the grammar.
+    ///
+    /// Only `@meta(…)` is accepted here: a type attribute (`@equatable`, …) is
+    /// not valid on a tree node and is rejected with a clear error. A `@meta`
+    /// not followed by a `node` is likewise an error.
+    fn parse_meta_node(&mut self) -> Result<Expr, ParseError> {
+        let (attributes, meta) = self.parse_annotations()?;
+        if !attributes.is_empty() {
+            return Err(ParseError::Expected {
+                expected: "only `@meta(...)` on a tree node (a type attribute \
+                           like `@equatable` is not valid here)"
+                    .to_string(),
+                found: "a type attribute".to_string(),
+            });
+        }
+        match self.peek() {
+            Some(Token::Node) => self.parse_node(meta),
+            _ => Err(self.error("a `node` after a `@meta(...)` annotation")),
         }
     }
 

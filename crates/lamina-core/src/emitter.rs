@@ -3405,7 +3405,14 @@ impl<'a> SlotResolver for TypeResolver<'a> {
 mod tests {
     use super::*;
     use crate::lang_doc::parse_language_def;
-    use crate::parser::parse;
+
+    /// Wraps bare Lamina `src` in a ```` ```lamina ```` fenced block and parses
+    /// it through the real markdown front-end, so these emitter unit tests can
+    /// keep passing bare-source snippets unchanged.
+    fn parse(src: &str) -> Result<crate::ast::File, crate::error::ParseError> {
+        let doc = format!("```lamina\n{src}\n```\n");
+        crate::parser::parse(&doc)
+    }
 
     const RUST_DEF: &str = concat!(
         "# Lamina Language Definition: rust\n",

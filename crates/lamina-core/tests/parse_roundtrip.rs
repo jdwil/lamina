@@ -18,9 +18,24 @@ use lamina_core::ast::{
     Meta, Modifier, Param, Primitive, RawArm, Statement, SwitchCase, Type, TypeAttribute, UnaryOp,
     UseItem, Variant, VariantPayload, Visibility,
 };
+use lamina_core::lang::LanguageDef;
 use lamina_core::lang_doc::parse_language_def;
-use lamina_core::parser::parse;
-use lamina_core::transpile;
+
+/// Wraps bare Lamina `src` in a ```` ```lamina ```` fenced block (the markdown
+/// source-document form [`lamina_core::parser::parse`] now expects) and parses
+/// it. Shadows the real `parse` so every snippet in this file stays bare while
+/// still exercising the markdown front-end.
+fn parse(src: &str) -> Result<File, lamina_core::ParseError> {
+    let doc = format!("```lamina\n{src}\n```\n");
+    lamina_core::parser::parse(&doc)
+}
+
+/// Wraps bare Lamina `src` in a ```` ```lamina ```` fenced block and transpiles
+/// it, shadowing [`lamina_core::transpile`] for the same reason as [`parse`].
+fn transpile(src: &str, lang: &LanguageDef) -> Result<String, lamina_core::TranspileError> {
+    let doc = format!("```lamina\n{src}\n```\n");
+    lamina_core::transpile(&doc, lang)
+}
 
 /// Convenience: a private `void` function wrapping `body`, so a per-construct
 /// snippet can live inside a function the way real source does.

@@ -8,7 +8,16 @@
 //! entirely by the (external) language definition.
 
 use lamina_core::lang_doc::parse_language_def;
-use lamina_core::transpile;
+use lamina_core::lang::LanguageDef;
+
+/// Wraps bare Lamina `src` in a ```` ```lamina ```` fenced block (the markdown
+/// source document form `parse` now expects) and transpiles it. Shadows
+/// [`lamina_core::transpile`] so these tests keep passing bare snippets
+/// unchanged while exercising the real markdown front-end.
+fn transpile(src: &str, lang: &LanguageDef) -> Result<String, lamina_core::TranspileError> {
+    let doc = format!("```lamina\n{src}\n```\n");
+    lamina_core::transpile(&doc, lang)
+}
 
 const SOURCE: &str = "fn answer() -> i32 { return 42; }";
 

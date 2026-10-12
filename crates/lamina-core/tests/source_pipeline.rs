@@ -195,10 +195,12 @@ const FIXTURE_DEF: &str = concat!(
 );
 
 /// Parse → lower → emit `src` through the fixture def, panicking with context
-/// on any pipeline error.
+/// on any pipeline error. `src` is bare Lamina, wrapped here in a ```` ```lamina
+/// ```` fenced block to form the markdown source document `parse` now expects.
 fn t(src: &str) -> String {
     let lang = parse_language_def(FIXTURE_DEF).expect("fixture def parses");
-    transpile(src, &lang).unwrap_or_else(|e| panic!("transpile failed for {src:?}: {e}"))
+    let doc = format!("```lamina\n{src}\n```\n");
+    transpile(&doc, &lang).unwrap_or_else(|e| panic!("transpile failed for {src:?}: {e}"))
 }
 
 // ---- functions ------------------------------------------------------------

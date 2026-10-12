@@ -6,6 +6,56 @@ this spec; it produces the existing kernel AST (see `crates/lamina-core/src/ast.
 Until the parser exists, programs are hand-built ASTs — this spec defines what
 the *written* form will be.
 
+## A source `.mdl` is a markdown document (code lives in ```` ```lamina ```` blocks)
+
+Every Lamina `.mdl` artifact — source, language definition, layer, profile — is
+a **markdown document** sharing one document structure. A **source** `.mdl` is
+therefore a markdown document whose Lamina code lives in one or more
+```` ```lamina ```` **fenced blocks**, interleaved with headings and prose that
+document it. This mirrors how a language definition carries its code in
+```` ```template ```` / ```` ```lang-* ```` blocks, and it is the structural
+scaffold the future *raise* direction needs (English, diagrams, and examples as
+sibling sections under each item's heading).
+
+- **The parser is a markdown front-end.** `parse` extracts every ```` ```lamina
+  ```` block, concatenates their bodies **in document order** into a single
+  compilation unit, then lexes and parses that concatenation with the ordinary
+  lexer and grammar (below). Because the blocks join into one unit, **references
+  may cross block boundaries** — a `struct` declared in one block is usable by a
+  `fn` in a later block.
+- **Granularity is hybrid.** A trivial file is one ```` ```lamina ```` block; a
+  documented, raise-rich file is many blocks, each under its own `##` heading
+  with prose. Both are valid.
+- **Prose, headings, and other-language fenced blocks are ignored** by the
+  parser — they are documentation (and future *raise* material). A ```` ```rust
+  ```` or ```` ```text ```` block between two ```` ```lamina ```` blocks is not
+  Lamina code and is skipped.
+- **An empty document is an empty program.** A document with **no** ```` ```lamina
+  ```` block parses to an empty unit (a `File` with no items), not an error — an
+  undocumented or not-yet-written source document is simply empty.
+- **Line numbers are preserved.** Extraction replaces every non-`lamina` line
+  with a blank line, so parser diagnostics report the real line (and column) in
+  the original document.
+
+A minimal source document therefore looks like:
+
+````markdown
+# My module
+
+A sentence describing what this module does.
+
+```lamina
+public fn add(x: i32, y: i32): i32 {
+    return x + y;
+}
+```
+````
+
+and a hybrid, documentation-rich one splits the program across several
+```` ```lamina ```` blocks under `##` headings (see
+`lamina-defs/examples/basic/calculator.mdl` for a worked example). The remainder
+of this document specifies the **grammar inside** a ```` ```lamina ```` block.
+
 ## Guiding principles
 
 - **Starting point: conventional C/Rust-family, legible** — pleasant for humans

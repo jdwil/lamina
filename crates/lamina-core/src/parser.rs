@@ -1,6 +1,34 @@
 //! A recursive-descent parser for the full ratified Lamina concrete source
 //! syntax (`docs/source-syntax.md`), producing the kernel [`crate::ast`].
 //!
+//! # Document shape (a source `.mdl` is a markdown document)
+//!
+//! Every Lamina `.mdl` artifact — source, language definition, layer, profile —
+//! is a markdown document sharing one structure. A **source** `.mdl` is a
+//! markdown document whose Lamina code lives in one or more ```` ```lamina ````
+//! fenced blocks (under headings, interleaved with prose), mirroring how a
+//! language definition carries its code in ```` ```template ```` / ```` ```lang-*
+//! ```` blocks.
+//!
+//! [`parse`] is therefore a thin markdown **front-end** over the lexer and the
+//! recursive-descent grammar: it extracts every ```` ```lamina ```` fenced block
+//! (see `extract_lamina_blocks`), concatenates their bodies in **document
+//! order** into a single compilation unit, then lexes and parses that
+//! concatenation with the unchanged lexer and grammar. Because the blocks join
+//! into one unit, references may cross block boundaries (a `struct` declared in
+//! one block is usable by a `fn` in a later block). Prose, headings, and
+//! fenced blocks of any **other** language are documentation (and future *raise*
+//! material) and are ignored.
+//!
+//! The concatenation **preserves original line numbers**: each non-`lamina` line
+//! (prose, heading, fence delimiter, other-language fence content) is replaced by
+//! a blank line, so a block's inner lines keep the 1-based line (and column)
+//! positions they occupy in the source document and parser diagnostics point at
+//! the real location. A document containing **no** ```` ```lamina ```` block
+//! extracts to the empty string, which parses to an **empty [`File`]** (no items)
+//! — the same result as empty source; this is intentional (an undocumented or
+//! not-yet-written source document is simply empty, not an error).
+//!
 //! # Shape
 //!
 //! The parser is one function per grammar production, mirroring the spec:
@@ -60,20 +88,93 @@ use crate::ast::{
 use crate::error::ParseError;
 use crate::lexer::{lex, SpannedToken, Token};
 
-/// Parses Lamina source into a [`File`] AST.
+/// The opening fence of a Lamina source code block inside a `.mdl` markdown
+/// document. A line whose trimmed content equals this opens a block; the next
+/// line whose trimmed content is a bare triple-backtick closes it.
+const LAMINA_FENCE: &str = "```lamina";
+
+/// The closing fence (and the generic fence delimiter) — a bare triple-backtick.
+const FENCE_CLOSE: &str = "```";
+
+/// Extracts the Lamina code from a source `.mdl` markdown document.
 ///
-/// This is the engine's entry point for the concrete source syntax; it lexes
-/// `src` and runs the recursive-descent grammar.
+/// Scans `src` line by line, collecting the inner lines of every
+/// ```` ```lamina ```` fenced block in **document order**. A line whose trimmed
+/// content equals ```` ```lamina ```` opens a block; collection runs verbatim
+/// (at column 0, as authored) until the next line whose trimmed content is a
+/// bare ```` ``` ````. Prose, headings, and fenced blocks of any other language
+/// are **not** collected (they are documentation / future *raise* material).
+///
+/// Line numbers are **preserved**: every line that is not inside a `lamina`
+/// block — including the fence delimiter lines themselves — is emitted as an
+/// empty line, so each collected line keeps the 1-based line position it holds
+/// in the original document. Columns are already faithful because block bodies
+/// are authored at column 0 and copied verbatim.
+///
+/// A document with no ```` ```lamina ```` block yields a string of blank lines
+/// (semantically empty), which the lexer tokenizes to nothing and the grammar
+/// parses to an empty [`File`].
+///
+/// An unterminated ```` ```lamina ```` block (opened but never closed before end
+/// of document) collects every remaining line as block content; this is lenient
+/// by design — the subsequent lex/parse surfaces any resulting syntax error with
+/// a faithful position, and the common authoring mistake still produces a
+/// legible diagnostic rather than a bespoke extractor error.
+fn extract_lamina_blocks(src: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    let mut first = true;
+    for line in src.lines() {
+        // Preserve the inter-line newline between emitted lines (not before the
+        // first and not after the last), so line N of the output corresponds to
+        // line N of the input.
+        if first {
+            first = false;
+        } else {
+            out.push('\n');
+        }
+        let trimmed = line.trim();
+        if in_block {
+            if trimmed == FENCE_CLOSE {
+                // Close the block; the fence line itself contributes a blank line.
+                in_block = false;
+            } else {
+                // A verbatim content line — kept exactly as authored.
+                out.push_str(line);
+            }
+        } else if trimmed == LAMINA_FENCE {
+            // Open a block; the fence line itself contributes a blank line.
+            in_block = true;
+        }
+        // Any other line outside a block contributes a blank line (prose,
+        // heading, other-language fence), preserving line numbers.
+    }
+    out
+}
+
+/// Parses a Lamina source `.mdl` **markdown document** into a [`File`] AST.
+///
+/// This is the engine's entry point for the concrete source syntax. A source
+/// `.mdl` is a markdown document whose Lamina code lives in ```` ```lamina ````
+/// fenced blocks; `parse` first extracts and
+/// concatenates those blocks (in document order, line numbers preserved), then
+/// lexes the concatenation and runs the recursive-descent grammar. Prose,
+/// headings, and other-language fenced blocks are ignored.
+///
+/// A document with no ```` ```lamina ```` block parses to an **empty [`File`]**
+/// (no items) — the same result as empty source.
 ///
 /// # Errors
 ///
-/// Returns a [`ParseError`] if the source does not conform to the ratified
-/// grammar (`docs/source-syntax.md`), with the offending source position where
-/// available. The `raw` escape hatch is fully parsed into a multi-arm raw node
-/// (its verbatim arm bodies are captured by the lexer); target resolution
-/// happens later, in [`lower`](crate::lower).
+/// Returns a [`ParseError`] if the extracted Lamina code does not conform to the
+/// ratified grammar (`docs/source-syntax.md`), with the offending source
+/// position where available (positions map back to the original document's lines
+/// and columns, since extraction preserves them). The `raw` escape hatch is
+/// fully parsed into a multi-arm raw node (its verbatim arm bodies are captured
+/// by the lexer); target resolution happens later, in [`lower`](crate::lower).
 pub fn parse(src: &str) -> Result<File, ParseError> {
-    let tokens = lex(src)?;
+    let code = extract_lamina_blocks(src);
+    let tokens = lex(&code)?;
     let mut parser = Parser { tokens, pos: 0 };
     parser.parse_file()
 }
@@ -1644,6 +1745,15 @@ fn binding_power(op: BinaryOp) -> (u8, u8, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wraps bare Lamina `src` in a ```` ```lamina ```` fenced block and parses
+    /// it, so these unit tests can keep asserting against bare-source snippets
+    /// while exercising the real markdown front-end ([`super::parse`]). Shadows
+    /// the imported [`super::parse`] within this test module only.
+    fn parse(src: &str) -> Result<File, ParseError> {
+        let doc = format!("```lamina\n{src}\n```\n");
+        super::parse(&doc)
+    }
 
     /// Extracts the `Function` from an item expected to be a function.
     fn as_function(item: &Item) -> &Function {

@@ -1028,6 +1028,10 @@ impl Parser {
         if self.eat(&Token::Eq) {
             let value = self.parse_expr()?;
             self.make_assign(expr, value)
+        } else if let Some(op) = self.peek().and_then(compound_assign_op) {
+            self.pos += 1;
+            let rhs = self.parse_expr()?;
+            self.make_compound_assign(expr, op, rhs)
         } else {
             Ok(Statement::Expr(expr))
         }
@@ -1183,10 +1187,47 @@ impl Parser {
             let value = self.parse_expr()?;
             self.expect(&Token::Semicolon, "`;` to end an assignment")?;
             self.make_assign(expr, value)
+        } else if let Some(op) = self.peek().and_then(compound_assign_op) {
+            self.pos += 1;
+            let rhs = self.parse_expr()?;
+            self.expect(&Token::Semicolon, "`;` to end an assignment")?;
+            self.make_compound_assign(expr, op, rhs)
         } else {
             self.expect(&Token::Semicolon, "`;` to end an expression statement")?;
             Ok(Statement::Expr(expr))
         }
+    }
+
+    /// Builds the plain [`Statement::Assign`] that a compound-assignment
+    /// (`x += y`) desugars to: `x = x <op> y`. This is **pure sugar** — the
+    /// produced AST is byte-identical to hand-writing `x = x + y`, so a language
+    /// definition's existing compound-assign idiom recognition
+    /// (`value is binary && value.op is add && target eq value.lhs`) matches it
+    /// with no definition change, and a target without compound assignment falls
+    /// through to the plain `target = value` form unaffected.
+    fn make_compound_assign(
+        &self,
+        target: Expr,
+        op: BinaryOp,
+        rhs: Expr,
+    ) -> Result<Statement, ParseError> {
+        if !is_lvalue(&target) {
+            let (line, column) = self.current_pos();
+            return Err(ParseError::InvalidAssignTarget {
+                detail: format!(
+                    "the left-hand side ({}) is not a place that can be assigned to",
+                    target.kind().as_str()
+                ),
+                line,
+                column,
+            });
+        }
+        let value = Expr::Binary {
+            op,
+            lhs: Box::new(target.clone()),
+            rhs: Box::new(rhs),
+        };
+        Ok(Statement::Assign { target, value })
     }
 
     /// Builds an [`Statement::Assign`], validating the target is an lvalue.
@@ -1689,6 +1730,24 @@ impl Parser {
         }
         false
     }
+}
+
+/// Maps a compound-assignment token (`+=`, `-=`, `*=`, `/=`, `%=`) to the
+/// [`BinaryOp`] it desugars to, or `None` for any other token.
+///
+/// A compound assignment is **pure syntactic sugar**: `x <op>= y` parses to the
+/// identical AST as `x = x <op> y`, so no AST node, emitter path, or language
+/// definition is affected. The covered operators are exactly those the kernel's
+/// compound-assign idiom recognizes (`add`/`sub`/`mul`/`div`/`rem`).
+fn compound_assign_op(token: &Token) -> Option<BinaryOp> {
+    Some(match token {
+        Token::PlusEq => BinaryOp::Add,
+        Token::MinusEq => BinaryOp::Sub,
+        Token::StarEq => BinaryOp::Mul,
+        Token::SlashEq => BinaryOp::Div,
+        Token::PercentEq => BinaryOp::Rem,
+        _ => return None,
+    })
 }
 
 /// Maps a token to its [`BinaryOp`], or `None` if it is not a binary operator.

@@ -198,6 +198,18 @@ use std::io;                  // a `::`-separated Lamina module path (NO dots)
   `>>>` (ushr).
 - **Struct literal:** Rust-style named fields — `Point { x: 1, y: 2 }`.
 - **Bindings:** `let x = expr;` or typed `let x: i32 = expr;`.
+- **Compound assignment (pure sugar):** `x += y`, `x -= y`, `x *= y`, `x /= y`,
+  `x %= y` are **pure syntactic sugar** for `x = x + y`, `x = x - y`, etc. They
+  parse to the *identical* AST as the expanded form — a plain `Assign` whose
+  value is a binary with `target == lhs` (the shape a language definition
+  recognizes as the compound-assignment idiom via
+  `value is binary && value.op is add && target eq value.lhs`). There is **no**
+  new AST node, so a target that spells it `+=` emits the idiom while a target
+  without compound assignment falls through to the plain `x = x + y` form — both
+  from one source spelling. A compound assignment is accepted both as a
+  **statement** (`x += 1;`) and as a counted-`for` **step clause**
+  (`for (let i = 0; i < n; i += 1) { ... }`). The covered operators are exactly
+  the five the kernel's compound-assign idiom supports: `+= -= *= /= %=`.
 
 ## Statements / control flow
 

@@ -173,6 +173,16 @@ pub enum Token {
     // ---- Operators ----
     /// `=`
     Eq,
+    /// `+=` (compound add-assign — pure sugar for `x = x + y`).
+    PlusEq,
+    /// `-=` (compound sub-assign — pure sugar for `x = x - y`).
+    MinusEq,
+    /// `*=` (compound mul-assign — pure sugar for `x = x * y`).
+    StarEq,
+    /// `/=` (compound div-assign — pure sugar for `x = x / y`).
+    SlashEq,
+    /// `%=` (compound rem-assign — pure sugar for `x = x % y`).
+    PercentEq,
     /// `==`
     EqEq,
     /// `!=`
@@ -271,6 +281,11 @@ impl Token {
             Token::Arrow => "`->`".to_string(),
             Token::FatArrow => "`=>`".to_string(),
             Token::Eq => "`=`".to_string(),
+            Token::PlusEq => "`+=`".to_string(),
+            Token::MinusEq => "`-=`".to_string(),
+            Token::StarEq => "`*=`".to_string(),
+            Token::SlashEq => "`/=`".to_string(),
+            Token::PercentEq => "`%=`".to_string(),
             Token::EqEq => "`==`".to_string(),
             Token::NotEq => "`!=`".to_string(),
             Token::Lt => "`<`".to_string(),
@@ -818,7 +833,15 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
                 }
             }
             '^' => punct(&mut cursor, &mut tokens, Token::Caret),
-            '%' => punct(&mut cursor, &mut tokens, Token::Percent),
+            '%' => {
+                cursor.bump();
+                if cursor.peek() == Some('=') {
+                    cursor.bump();
+                    push(&mut tokens, Token::PercentEq, span);
+                } else {
+                    push(&mut tokens, Token::Percent, span);
+                }
+            }
             '.' => punct(&mut cursor, &mut tokens, Token::Dot),
             ':' => {
                 cursor.bump();
@@ -852,12 +875,23 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
                     push(&mut tokens, Token::Bang, span);
                 }
             }
-            '+' => punct(&mut cursor, &mut tokens, Token::Plus),
+            '+' => {
+                cursor.bump();
+                if cursor.peek() == Some('=') {
+                    cursor.bump();
+                    push(&mut tokens, Token::PlusEq, span);
+                } else {
+                    push(&mut tokens, Token::Plus, span);
+                }
+            }
             '-' => {
                 cursor.bump();
                 if cursor.peek() == Some('>') {
                     cursor.bump();
                     push(&mut tokens, Token::Arrow, span);
+                } else if cursor.peek() == Some('=') {
+                    cursor.bump();
+                    push(&mut tokens, Token::MinusEq, span);
                 } else {
                     push(&mut tokens, Token::Minus, span);
                 }
@@ -867,14 +901,23 @@ pub fn lex(src: &str) -> Result<Vec<SpannedToken>, ParseError> {
                 if cursor.peek() == Some('*') {
                     cursor.bump();
                     push(&mut tokens, Token::StarStar, span);
+                } else if cursor.peek() == Some('=') {
+                    cursor.bump();
+                    push(&mut tokens, Token::StarEq, span);
                 } else {
                     push(&mut tokens, Token::Star, span);
                 }
             }
             '/' => {
-                // `//` was handled above as a comment; a lone `/` is division.
+                // `//` was handled above as a comment; a lone `/` is division,
+                // and `/=` is compound div-assign.
                 cursor.bump();
-                push(&mut tokens, Token::Slash, span);
+                if cursor.peek() == Some('=') {
+                    cursor.bump();
+                    push(&mut tokens, Token::SlashEq, span);
+                } else {
+                    push(&mut tokens, Token::Slash, span);
+                }
             }
             '&' => {
                 cursor.bump();

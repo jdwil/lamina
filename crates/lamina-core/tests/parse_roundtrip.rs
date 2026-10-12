@@ -363,6 +363,51 @@ fn assignment_statement() {
 }
 
 #[test]
+fn compound_assign_desugars_to_plain_assign() {
+    // `i += 1` is PURE SUGAR for `i = i + 1`: it must parse to the IDENTICAL
+    // AST (a plain `Assign` whose value is a binary with target == lhs), so the
+    // definitions' compound-assign idiom recognition keeps working unchanged.
+    let plus = parse("fn f(): void { i += 1; }").expect("`+=` must parse");
+    let plain = parse("fn f(): void { i = i + 1; }").expect("`=` must parse");
+    assert_eq!(plus, plain, "`i += 1` must parse identically to `i = i + 1`");
+}
+
+#[test]
+fn compound_assign_all_operators() {
+    // Each of `+= -= *= /= %=` desugars to `x = x <op> y` with the matching op.
+    for (src, op) in [
+        ("+=", BinaryOp::Add),
+        ("-=", BinaryOp::Sub),
+        ("*=", BinaryOp::Mul),
+        ("/=", BinaryOp::Div),
+        ("%=", BinaryOp::Rem),
+    ] {
+        assert_body(
+            &format!("x {src} y;"),
+            vec![Statement::Assign {
+                target: Expr::Ref("x".into()),
+                value: Expr::Binary {
+                    op,
+                    lhs: Box::new(Expr::Ref("x".into())),
+                    rhs: Box::new(Expr::Ref("y".into())),
+                },
+            }],
+        );
+    }
+}
+
+#[test]
+fn compound_assign_as_for_step() {
+    // `for (let i = 0; i < n; i += 1)` must parse its step to the SAME `Assign`
+    // as the `i = i + 1` step form (see `for_counted_loop`).
+    let sugar = parse("fn f(): void { for (let i = 0; i < n; i += 1) { continue; } }")
+        .expect("`+=` for-step must parse");
+    let plain = parse("fn f(): void { for (let i = 0; i < n; i = i + 1) { continue; } }")
+        .expect("`=` for-step must parse");
+    assert_eq!(sugar, plain, "`i += 1` for-step must equal `i = i + 1` for-step");
+}
+
+#[test]
 fn expr_statement_call() {
     assert_body(
         "f();",

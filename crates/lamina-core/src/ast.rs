@@ -1361,6 +1361,15 @@ pub enum Statement {
         /// The initializer expression, or `None` when the local is declared
         /// unassigned.
         value: Option<Expr>,
+        /// Whether the binding is **mutable** (reassignable). This is the
+        /// explicit source annotation `let mut` — it is NEVER inferred from
+        /// reassignment. Defaults to `false` (immutable), so a binding built
+        /// without specifying it renders byte-identically to one built before
+        /// mutability existed. A target whose immutable binding form forbids
+        /// reassignment (Rust `let`, Kotlin `val`, Swift `let`) branches its
+        /// `### statement`/`### stmt` `let` row on the engine's `mut` fact to
+        /// emit the mutable form (`let mut`, `var`) when this is `true`.
+        mutable: bool,
     },
     /// A `return;` or `return <expr>;` statement. The value is optional: a bare
     /// `return;` is valid, and a `void` function returns nothing.
@@ -1477,13 +1486,15 @@ impl PartialEq for Statement {
                     name: an,
                     ty: at,
                     value: av,
+                    mutable: am,
                 },
                 Statement::Let {
                     name: bn,
                     ty: bt,
                     value: bv,
+                    mutable: bm,
                 },
-            ) => an == bn && at == bt && av == bv,
+            ) => an == bn && at == bt && av == bv && am == bm,
             (Statement::Return(a), Statement::Return(b)) => a == b,
             (
                 Statement::If {
@@ -2929,6 +2940,13 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "target" => Some(SlotShape::Scalar),
             "cond" => Some(SlotShape::Scalar),
             "iterable" => Some(SlotShape::Scalar),
+            // A `foreach` iterable's resolved element type and (sized-array)
+            // textual length — engine-provided scalar slots for a target (C)
+            // that desugars `foreach` into a counted index loop. Both resolve
+            // only for an array iterable; `foreach_len` is additionally guarded
+            // by the `has_foreach_len` fact (sized arrays only).
+            "foreach_elem_type" => Some(SlotShape::Scalar),
+            "foreach_len" => Some(SlotShape::Scalar),
             "scrutinee" => Some(SlotShape::Scalar),
             "else" => Some(SlotShape::Scalar),
             "init" => Some(SlotShape::Scalar),
@@ -3431,7 +3449,8 @@ mod tests {
             Statement::Let {
                 name: "x".into(),
                 ty: None,
-                value: None
+                value: None,
+                mutable: false
             }
             .kind(),
             StatementKind::Let

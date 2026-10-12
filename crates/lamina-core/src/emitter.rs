@@ -1128,9 +1128,12 @@ fn statement_context(
         ..Default::default()
     };
     match stmt {
-        Statement::Let { ty, value, .. } => {
+        Statement::Let {
+            ty, value, mutable, ..
+        } => {
             ctx.has_type = ty.is_some();
             ctx.has_value = value.is_some();
+            ctx.mutable = *mutable;
         }
         Statement::Return(value) => ctx.has_value = value.is_some(),
         Statement::If { else_block, .. } => ctx.has_else = else_block.is_some(),
@@ -1156,6 +1159,15 @@ fn statement_context(
             // a payloadless enum, an unresolvable expression) leaves this false,
             // so an ordinary `switch` renders byte-identically to before.
             ctx.scrutinee_is_payload_enum = index.scrutinee_is_payload_enum(scrutinee);
+        }
+        // A `foreach` exposes whether its iterable resolves to a sized array,
+        // so a lambda-/iterator-less target (C) that desugars `foreach` to a
+        // counted index loop can guard its `<idx> < {foreach_len}` header. The
+        // kernel's only sized collection is the fixed array; every other
+        // iterable leaves this false and the C desugar forbids it, while every
+        // native-`foreach` target ignores the fact and renders byte-identically.
+        Statement::ForEach { iterable, .. } => {
+            ctx.has_foreach_len = index.foreach_len(iterable).is_some();
         }
         // An `assign` exposes its `value` sub-part for one-level structural
         // predicates (Part 2): `value is <kind>`, `value.op is <op>` (when the
@@ -1469,6 +1481,26 @@ impl<'a> StmtResolver<'a> {
             (Statement::For { cond: Some(c), .. }, "cond") => emit_expr(c, self.lang, self.index),
             (Statement::ForEach { iterable, .. }, "iterable") => {
                 emit_expr(iterable, self.lang, self.index)
+            }
+            // The `foreach` iterable's resolved element type, for a target (C)
+            // that desugars `foreach` into a counted index loop and must declare
+            // the element binding (`<elem_type> <binding> = <iterable>[<idx>];`).
+            // Resolvable only for a sized/unsized array iterable named by a bare
+            // typed binding; an unresolvable iterable surfaces a clean missing-
+            // slot error rather than wrong output.
+            (Statement::ForEach { iterable, .. }, "foreach_elem_type") => {
+                match self.index.foreach_elem_type(iterable) {
+                    Some(elem) => resolve_type(&elem, self.lang, self.index),
+                    None => self.unknown_slot("foreach_elem_type"),
+                }
+            }
+            // The `foreach` iterable's textual length, guarded by the
+            // `has_foreach_len` fact. Resolvable only for a sized array iterable.
+            (Statement::ForEach { iterable, .. }, "foreach_len") => {
+                match self.index.foreach_len(iterable) {
+                    Some(len) => Ok(Rendered::text(len)),
+                    None => self.unknown_slot("foreach_len"),
+                }
             }
             (Statement::Switch { scrutinee, .. }, "scrutinee") => {
                 emit_expr(scrutinee, self.lang, self.index)
@@ -4396,12 +4428,14 @@ mod tests {
             name: "x".into(),
             ty: None,
             value: Some(Expr::IntLiteral("1".into())),
+            mutable: false,
         }]);
         assert!(with.contains("let x = 1;"), "got: {with}");
         let without = emit_fn_body(vec![Statement::Let {
             name: "x".into(),
             ty: None,
             value: None,
+            mutable: false,
         }]);
         assert!(without.contains("let x;"), "got: {without}");
     }

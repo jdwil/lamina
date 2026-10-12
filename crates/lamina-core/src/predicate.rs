@@ -167,6 +167,15 @@ pub struct RenderContext {
     pub has_value: bool,
     /// `has_type` — a `let` statement carries an explicit type annotation.
     pub has_type: bool,
+    /// `mut` — a `let` statement is **mutable** (`let mut x = …`). True iff the
+    /// [`Statement::Let`](crate::ast::Statement::Let) being rendered has
+    /// `mutable: true`; `false` for an immutable `let` and for any non-`let`
+    /// node. Lets a target whose immutable binding form forbids reassignment
+    /// (Rust `let`, Kotlin `val`, Swift `let`) branch its `### statement` /
+    /// `### stmt` `let` row (`stmt is let && mut`) to the mutable spelling
+    /// (`let mut`, `var`). Default `false` keeps an immutable `let`
+    /// byte-identical to before mutability existed.
+    pub mutable: bool,
     /// `has_else` — an `if` statement carries an `else` branch.
     pub has_else: bool,
     /// `has_init` — a counted `for` loop carries an initializer.
@@ -196,6 +205,14 @@ pub struct RenderContext {
     /// sized form `[T; N]` rather than the unsized/slice form `[T]`). Set when
     /// rendering a [`Type::Array`](crate::ast::Type::Array) with `len: Some(_)`.
     pub has_len: bool,
+    /// `has_foreach_len` — the `foreach` statement being rendered iterates a
+    /// resolvable **sized array** iterable, so its textual length is available
+    /// via the `{foreach_len}` slot. `false` for an unsized array, a non-array
+    /// iterable, or an unresolvable one (the kernel's only sized collection is
+    /// the fixed array), so a target that desugars `foreach` to a counted index
+    /// loop (C) guards its `<idx> < {foreach_len}` header on this fact. Default
+    /// `false` keeps every non-C `foreach` byte-identical.
+    pub has_foreach_len: bool,
     /// `has_items` — a `use` import carries a selective item list
     /// (`use path::{a, b}`). Set on the `## Use` entry template when the import
     /// has one or more [`UseItem`](crate::ast::UseItem)s.
@@ -598,6 +615,9 @@ impl RenderContext {
             // Optional statement sub-part flags.
             ("has_value", None) => self.has_value,
             ("has_type", None) => self.has_type,
+            // A `let` is mutable (`let mut x = …`). Closed boolean fact in the
+            // let render scope; `false` for an immutable `let` and any non-let.
+            ("mut", None) => self.mutable,
             ("has_else", None) => self.has_else,
             ("has_init", None) => self.has_init,
             ("has_cond", None) => self.has_cond,
@@ -609,6 +629,7 @@ impl RenderContext {
             // discriminant-dispatch header). Closed single-value enum query.
             ("scrutinee", Some("payload_enum")) => self.scrutinee_is_payload_enum,
             ("has_len", None) => self.has_len,
+            ("has_foreach_len", None) => self.has_foreach_len,
             ("has_items", None) => self.has_items,
             ("has_alias", None) => self.has_alias,
             ("has_payload", None) => self.has_payload,
@@ -857,6 +878,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("last", None)
             | ("has_value", None)
             | ("has_type", None)
+            | ("mut", None)
             | ("has_else", None)
             | ("has_init", None)
             | ("has_cond", None)
@@ -864,6 +886,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
             | ("has_default", None)
             | ("scrutinee", Some("payload_enum"))
             | ("has_len", None)
+            | ("has_foreach_len", None)
             | ("has_items", None)
             | ("has_alias", None)
             | ("has_payload", None)

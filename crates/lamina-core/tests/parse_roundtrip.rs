@@ -272,6 +272,7 @@ fn let_typed_and_inferred() {
             name: "x".into(),
             ty: Some(Type::Primitive(Primitive::I32)),
             value: Some(Expr::IntLiteral("1".into())),
+            mutable: false,
         }],
     );
     assert_body(
@@ -280,6 +281,40 @@ fn let_typed_and_inferred() {
             name: "y".into(),
             ty: None,
             value: Some(Expr::IntLiteral("2".into())),
+            mutable: false,
+        }],
+    );
+}
+
+/// `let mut <name> …` parses to a mutable binding, and a bare `let` stays
+/// immutable — mutability is the explicit `mut` annotation, never inferred.
+#[test]
+fn let_mut_sets_mutable_flag() {
+    assert_body(
+        "let mut x = 0;",
+        vec![Statement::Let {
+            name: "x".into(),
+            ty: None,
+            value: Some(Expr::IntLiteral("0".into())),
+            mutable: true,
+        }],
+    );
+    assert_body(
+        "let mut acc: f64 = 0.0;",
+        vec![Statement::Let {
+            name: "acc".into(),
+            ty: Some(Type::Primitive(Primitive::F64)),
+            value: Some(Expr::FloatLiteral("0.0".into())),
+            mutable: true,
+        }],
+    );
+    assert_body(
+        "let x = 0;",
+        vec![Statement::Let {
+            name: "x".into(),
+            ty: None,
+            value: Some(Expr::IntLiteral("0".into())),
+            mutable: false,
         }],
     );
 }
@@ -316,6 +351,7 @@ fn for_counted_loop() {
                 name: "i".into(),
                 ty: None,
                 value: Some(Expr::IntLiteral("0".into())),
+                mutable: false,
             })),
             cond: Some(Expr::Binary {
                 op: BinaryOp::Lt,
@@ -1320,6 +1356,7 @@ fn raw_single_arm_string_expr_parses() {
                 default: None,
                 meta: Meta::new(),
             }),
+            mutable: false,
         }],
     );
 }
@@ -1341,6 +1378,7 @@ fn raw_single_arm_string_with_version_parses() {
                 default: None,
                 meta: Meta::new(),
             }),
+            mutable: false,
         }],
     );
 }
@@ -1719,6 +1757,7 @@ fn parses_fn_pointer_let_annotation() {
                 ret: Box::new(Type::Primitive(Primitive::Bool)),
             }),
             value: Some(Expr::Ref("f".to_string())),
+            mutable: false,
         }],
     );
 }

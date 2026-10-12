@@ -914,9 +914,12 @@ impl Parser {
         }
     }
 
-    /// `let := "let" IDENT (":" type)? ("=" expr)? ";"`
+    /// `let := "let" "mut"? IDENT (":" type)? ("=" expr)? ";"`
     fn parse_let(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Let, "keyword `let`")?;
+        // An explicit `mut` after `let` makes the binding mutable; its absence
+        // leaves it immutable. Mutability is NEVER inferred from reassignment.
+        let mutable = self.eat(&Token::Mut);
         let name = self.expect_ident("a binding name after `let`")?;
         let ty = if self.eat(&Token::Colon) {
             Some(self.parse_type()?)
@@ -929,7 +932,12 @@ impl Parser {
             None
         };
         self.expect(&Token::Semicolon, "`;` to end a `let`")?;
-        Ok(Statement::Let { name, ty, value })
+        Ok(Statement::Let {
+            name,
+            ty,
+            value,
+            mutable,
+        })
     }
 
     /// `return := "return" expr? ";"`

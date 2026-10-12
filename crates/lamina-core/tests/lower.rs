@@ -160,6 +160,7 @@ fn non_raw_ast_passes_through_unchanged() {
             name: "x".to_string(),
             ty: Some(Type::Primitive(Primitive::I32)),
             value: Some(Expr::IntLiteral("1".to_string())),
+            mutable: false,
         },
         Statement::Return(Some(Expr::Ref("x".to_string()))),
     ]);

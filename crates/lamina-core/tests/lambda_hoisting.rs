@@ -198,6 +198,7 @@ fn single_expression_lambda_renders_inline() {
             name: "g".to_string(),
             ty: None,
             value: Some(lambda),
+            mutable: false,
         }])],
     };
     let out = emit(&file, &def()).expect("emit");
@@ -219,6 +220,7 @@ fn multi_statement_lambda_hoists_to_named_fn() {
                 name: "y".to_string(),
                 ty: None,
                 value: Some(add(r("x"), int("1"))),
+                mutable: false,
             },
             Statement::Return(Some(r("y"))),
         ],
@@ -229,6 +231,7 @@ fn multi_statement_lambda_hoists_to_named_fn() {
             name: "g".to_string(),
             ty: None,
             value: Some(lambda),
+            mutable: false,
         }])],
     };
     let out = emit(&file, &def()).expect("emit");
@@ -263,6 +266,7 @@ fn two_distinct_lambdas_get_distinct_hoisted_names() {
                 name: var.to_string(),
                 ty: None,
                 value: Some(add(r("x"), int("1"))),
+                mutable: false,
             },
             Statement::Return(Some(r(var))),
         ],
@@ -274,11 +278,13 @@ fn two_distinct_lambdas_get_distinct_hoisted_names() {
                 name: "g".to_string(),
                 ty: None,
                 value: Some(mk("y")),
+                mutable: false,
             },
             Statement::Let {
                 name: "h".to_string(),
                 ty: None,
                 value: Some(mk("z")),
+                mutable: false,
             },
         ])],
     };

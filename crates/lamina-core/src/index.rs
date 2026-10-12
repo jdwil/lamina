@@ -391,6 +391,51 @@ impl<'a> UnitIndex<'a> {
         }
     }
 
+    /// Resolves the **element type** of a `foreach` iterable, backing the
+    /// `foreach_elem_type` scalar slot used by a lambda-/iterator-less target
+    /// (C) to desugar `foreach` into a counted index loop
+    /// (`<elem_type> <binding> = <iterable>[<idx>];`).
+    ///
+    /// Resolution is conservative and purely local — the engine never guesses.
+    /// It answers `Some(elem)` **only** when the iterable is a bare name
+    /// ([`Expr::Ref`]) whose declared type (a function parameter, a
+    /// type-annotated `let`, or a top-level `const`) resolves to a
+    /// [`Type::Array`] — the kernel's only collection. Any other iterable (a
+    /// complex expression, an untyped binding, a non-array type) answers `None`,
+    /// so a target that needs the element type and does not get one surfaces a
+    /// clean missing-slot error rather than wrong output.
+    pub fn foreach_elem_type(&self, iterable: &Expr) -> Option<Type> {
+        let Expr::Ref(name) = iterable else {
+            return None;
+        };
+        match self.value_type(name) {
+            Some(Type::Array { elem, .. }) => Some(*elem),
+            _ => None,
+        }
+    }
+
+    /// Resolves the textual **length** of a `foreach` iterable, backing the
+    /// `foreach_len` scalar slot and the `has_foreach_len` fact used by the C
+    /// counted-index desugar (`<idx> < <len>`).
+    ///
+    /// Like [`foreach_elem_type`](UnitIndex::foreach_elem_type), it is
+    /// conservative and local: it answers `Some(len)` **only** when the iterable
+    /// is a bare name whose declared type resolves to a **sized**
+    /// [`Type::Array`] (`len: Some(_)`). An unsized array (`[T]`), a non-array
+    /// type, or an unresolvable iterable answers `None` — the length of a
+    /// non-array / unsized collection is genuinely unknowable to the kernel
+    /// (the only collection the kernel has is the fixed array), so a target
+    /// must guard its use with the `has_foreach_len` fact.
+    pub fn foreach_len(&self, iterable: &Expr) -> Option<String> {
+        let Expr::Ref(name) = iterable else {
+            return None;
+        };
+        match self.value_type(name) {
+            Some(Type::Array { len, .. }) => len,
+            _ => None,
+        }
+    }
+
     /// Looks up a caller-supplied argument by `name`, searching frames from the
     /// innermost (top of stack) outward so a deeper passed arg shadows a
     /// shallower one. Returns the already-rendered value if bound, else `None`.
@@ -1084,11 +1129,13 @@ mod tests {
                     name: "typed".into(),
                     ty: Some(Type::Named("Shape".into())),
                     value: None,
+                    mutable: false,
                 },
                 Statement::Let {
                     name: "untyped".into(),
                     ty: None,
                     value: Some(Expr::IntLiteral("1".into())),
+                    mutable: false,
                 },
             ],
             meta: Meta::new(),
@@ -1100,5 +1147,76 @@ mod tests {
             !frame.iter().any(|(n, _)| n == "untyped"),
             "untyped let omitted"
         );
+    }
+
+    #[test]
+    fn foreach_elem_type_and_len_resolve_from_array_param() {
+        // fn f(xs: [i32; 3]) { foreach x in xs { } }  — a sized array param.
+        let function = Function {
+            name: "f".into(),
+            visibility: Visibility::Private,
+            modifiers: vec![],
+            params: vec![Param {
+                name: "xs".into(),
+                ty: Type::Array {
+                    elem: Box::new(Type::Primitive(Primitive::I32)),
+                    len: Some("3".into()),
+                },
+                meta: Meta::new(),
+            }],
+            return_type: Type::Primitive(Primitive::Void),
+            body: vec![],
+            meta: Meta::new(),
+        };
+        let file = File {
+            items: vec![Item::Function(function.clone())],
+        };
+        let index = UnitIndex::build(&file);
+        index.push_value_types(function_value_types(&function));
+        let iterable = Expr::Ref("xs".into());
+        // Element type resolves to the array's element.
+        assert_eq!(
+            index.foreach_elem_type(&iterable),
+            Some(Type::Primitive(Primitive::I32))
+        );
+        // The sized length resolves to its textual form.
+        assert_eq!(index.foreach_len(&iterable), Some("3".to_string()));
+        // An unresolvable iterable (a complex expression) yields None for both.
+        let complex = Expr::IntLiteral("0".into());
+        assert_eq!(index.foreach_elem_type(&complex), None);
+        assert_eq!(index.foreach_len(&complex), None);
+    }
+
+    #[test]
+    fn foreach_len_is_none_for_unsized_array() {
+        let function = Function {
+            name: "f".into(),
+            visibility: Visibility::Private,
+            modifiers: vec![],
+            params: vec![Param {
+                name: "xs".into(),
+                ty: Type::Array {
+                    elem: Box::new(Type::Primitive(Primitive::I32)),
+                    len: None,
+                },
+                meta: Meta::new(),
+            }],
+            return_type: Type::Primitive(Primitive::Void),
+            body: vec![],
+            meta: Meta::new(),
+        };
+        let file = File {
+            items: vec![Item::Function(function.clone())],
+        };
+        let index = UnitIndex::build(&file);
+        index.push_value_types(function_value_types(&function));
+        let iterable = Expr::Ref("xs".into());
+        // Element type still resolves (an unsized array still has an element).
+        assert_eq!(
+            index.foreach_elem_type(&iterable),
+            Some(Type::Primitive(Primitive::I32))
+        );
+        // But the length is unknowable for an unsized array.
+        assert_eq!(index.foreach_len(&iterable), None);
     }
 }

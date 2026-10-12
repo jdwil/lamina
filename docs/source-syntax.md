@@ -198,6 +198,17 @@ use std::io;                  // a `::`-separated Lamina module path (NO dots)
   `>>>` (ushr).
 - **Struct literal:** Rust-style named fields — `Point { x: 1, y: 2 }`.
 - **Bindings:** `let x = expr;` or typed `let x: i32 = expr;`.
+- **Mutable bindings:** `let mut x = expr;` marks the binding **mutable**
+  (reassignable). The `mut` keyword is written immediately after `let`, before
+  the name, and composes with a type annotation (`let mut acc: f64 = 0.0;`).
+  Mutability is **explicit only** — it is NEVER inferred from whether the binding
+  is later reassigned. A bare `let` (no `mut`) is immutable and parses
+  byte-identically to before this syntax existed. The distinction matters only
+  for targets whose immutable binding form forbids reassignment (Rust `let` vs
+  `let mut`, Kotlin `val` vs `var`, Swift `let` vs `var`); targets whose bindings
+  are mutable by nature (C, Python, Ruby, JavaScript, TypeScript, Go, Java) spell
+  both forms identically. A language definition selects the mutable spelling by
+  branching its `let` row on `stmt is let && mut`.
 - **Compound assignment (pure sugar):** `x += y`, `x -= y`, `x *= y`, `x /= y`,
   `x %= y` are **pure syntactic sugar** for `x = x + y`, `x = x - y`, etc. They
   parse to the *identical* AST as the expanded form — a plain `Assign` whose

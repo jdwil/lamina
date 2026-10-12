@@ -178,6 +178,20 @@ switch (value) {
   operator in expression/pattern position; a target that needs a qualifier
   (e.g. Rust's `Shape::Circle(r) =>`) supplies it from context in the language
   **definition**, not the source.
+- **A `{` after a variant name is a named payload binding only when its contents
+  are binding-shaped; otherwise it is the arm body.** Because the grammar is
+  `case <pattern> { body }`, a unit variant whose arm body is a brace block
+  (`case Clear { return 0; }`) and a struct-payload binding
+  (`case Rect { w, h }`) both put a `{` right after the variant name. The parser
+  disambiguates by a bounded lookahead *inside* the brace: it is a **named
+  binding** iff the first inner token is an identifier **and** the token after it
+  is `,`, `:`, or `}` — i.e. one of `{ ident ,`, `{ ident :`, or `{ ident }`
+  (a field list, a `field: local` rename, or a single field). Any other shape —
+  an empty `{ }`, a statement keyword (`return`/`let`/`if`/…), or an identifier
+  followed by `(`/`.`/`=`/anything else — makes the `{` the **arm body**, so a
+  unit-variant arm parses correctly. A real struct binding is therefore **two
+  brace groups**: `case Rect { w, h } { return w; }` — the binding `{ w, h }`
+  then the separate body block `{ return w; }`.
 
 ## The tree core (node / attr / text)
 

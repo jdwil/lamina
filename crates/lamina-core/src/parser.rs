@@ -1006,7 +1006,19 @@ impl Parser {
                 return Ok((Expr::Ref(name), CaseBindings::Positional(names)));
             }
             // Named binding: `Variant { a, b, … }` (shorthand field = local).
-            if self.peek_at(1) == Some(&Token::LBrace) {
+            //
+            // A `{` after the variant name is AMBIGUOUS with the arm body
+            // block (`case Clear { return 0; }`), since the grammar is
+            // `case <pattern> { body }` — the pattern, then a separately-parsed
+            // body block. Disambiguate with a bounded lookahead INSIDE the
+            // brace: the `{` opens a named binding IFF the first inner token is
+            // an `Ident` AND the token after it is one of `,` `:` `}` — i.e.
+            // the shapes `{ ident ,` (a field, more follow), `{ ident :` (a
+            // `field: local` rename), or `{ ident }` (a single field). Anything
+            // else — an empty `{ }`, a statement keyword (`return`/`let`/`if`/…),
+            // or an `Ident` followed by `(`/`.`/`=`/etc. — is the arm BODY, so
+            // leave the brace unconsumed for the caller and report no binding.
+            if self.peek_at(1) == Some(&Token::LBrace) && self.lbrace_opens_named_binding() {
                 self.pos += 2; // ident `{`
                 let mut binds = Vec::new();
                 if self.peek() != Some(&Token::RBrace) {
@@ -1039,6 +1051,25 @@ impl Parser {
         // expression (struct literals are not valid case values).
         let value = self.parse_expr_no_struct()?;
         Ok((value, CaseBindings::None))
+    }
+
+    /// Decides whether a `{` immediately following a case variant name opens a
+    /// NAMED payload binding (`case Rect { w, h }`) rather than the arm body
+    /// block (`case Clear { return 0; }`).
+    ///
+    /// The cursor is positioned on the variant `Ident`, so the `{` is at
+    /// `peek_at(1)`, its first inner token at `peek_at(2)`, and the token after
+    /// that at `peek_at(3)`. It is a named binding IFF the first inner token is
+    /// an [`Ident`](Token::Ident) and the token after it is `,`, `:`, or `}`
+    /// (the three binding-shaped prefixes `{ ident ,` / `{ ident :` /
+    /// `{ ident }`). Every other shape — an empty `{ }`, a statement keyword, or
+    /// an identifier followed by `(`/`.`/`=`/anything else — is the arm body.
+    fn lbrace_opens_named_binding(&self) -> bool {
+        matches!(self.peek_at(2), Some(Token::Ident(_)))
+            && matches!(
+                self.peek_at(3),
+                Some(Token::Comma) | Some(Token::Colon) | Some(Token::RBrace)
+            )
     }
 
     /// Parses an expression statement or an assignment statement.

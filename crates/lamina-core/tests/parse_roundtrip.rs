@@ -410,6 +410,83 @@ fn switch_named_payload_binding() {
     );
 }
 
+#[test]
+fn switch_unit_variant_arm_body_is_not_a_binding() {
+    // `case Clear { return 0; }` — the `{` is the ARM BODY of a UNIT variant,
+    // NOT a named payload binding (its first inner token is the `return`
+    // keyword, which is not binding-shaped). The old parser misparsed this as
+    // a named binding and errored on `return`.
+    assert_body(
+        "switch (op) { case Clear { return 0; } }",
+        vec![Statement::Switch {
+            scrutinee: Expr::Ref("op".into()),
+            cases: vec![SwitchCase::with_bindings(
+                Expr::Ref("Clear".into()),
+                vec![Statement::Return(Some(Expr::IntLiteral("0".into())))],
+                CaseBindings::None,
+            )],
+            default: None,
+        }],
+    );
+}
+
+#[test]
+fn switch_struct_binding_then_body_two_brace_groups() {
+    // `case Rect { w, h } { return w; }` — a REAL named binding `{ w, h }`
+    // (binding-shaped: `{ ident ,`) followed by the SEPARATE arm body block
+    // `{ return w; }`. Both brace groups must parse.
+    assert_body(
+        "switch (s) { case Rect { w, h } { return w; } }",
+        vec![Statement::Switch {
+            scrutinee: Expr::Ref("s".into()),
+            cases: vec![SwitchCase::with_bindings(
+                Expr::Ref("Rect".into()),
+                vec![Statement::Return(Some(Expr::Ref("w".into())))],
+                CaseBindings::Named(vec![
+                    CaseFieldBind::shorthand("w"),
+                    CaseFieldBind::shorthand("h"),
+                ]),
+            )],
+            default: None,
+        }],
+    );
+}
+
+#[test]
+fn switch_positional_binding_still_works_after_fix() {
+    // `case Circle(r) { return r; }` — the positional `(…)` form is untouched
+    // by the brace-lookahead fix; the body still parses separately.
+    assert_body(
+        "switch (s) { case Circle(r) { return r; } }",
+        vec![Statement::Switch {
+            scrutinee: Expr::Ref("s".into()),
+            cases: vec![SwitchCase::with_bindings(
+                Expr::Ref("Circle".into()),
+                vec![Statement::Return(Some(Expr::Ref("r".into())))],
+                CaseBindings::Positional(vec!["r".into()]),
+            )],
+            default: None,
+        }],
+    );
+}
+
+#[test]
+fn switch_unit_variant_empty_body() {
+    // `case Clear { }` — an empty arm body (no inner tokens), NOT a binding.
+    assert_body(
+        "switch (op) { case Clear { } }",
+        vec![Statement::Switch {
+            scrutinee: Expr::Ref("op".into()),
+            cases: vec![SwitchCase::with_bindings(
+                Expr::Ref("Clear".into()),
+                vec![],
+                CaseBindings::None,
+            )],
+            default: None,
+        }],
+    );
+}
+
 // ======================================================================
 // Expressions
 // ======================================================================

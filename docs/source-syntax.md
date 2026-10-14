@@ -198,17 +198,24 @@ use std::io;                  // a `::`-separated Lamina module path (NO dots)
   `>>>` (ushr).
 - **Struct literal:** Rust-style named fields — `Point { x: 1, y: 2 }`.
 - **Bindings:** `let x = expr;` or typed `let x: i32 = expr;`.
-- **Mutable bindings:** `let mut x = expr;` marks the binding **mutable**
-  (reassignable). The `mut` keyword is written immediately after `let`, before
-  the name, and composes with a type annotation (`let mut acc: f64 = 0.0;`).
-  Mutability is **explicit only** — it is NEVER inferred from whether the binding
-  is later reassigned. A bare `let` (no `mut`) is immutable and parses
-  byte-identically to before this syntax existed. The distinction matters only
-  for targets whose immutable binding form forbids reassignment (Rust `let` vs
-  `let mut`, Kotlin `val` vs `var`, Swift `let` vs `var`); targets whose bindings
-  are mutable by nature (C, Python, Ruby, JavaScript, TypeScript, Go, Java) spell
-  both forms identically. A language definition selects the mutable spelling by
-  branching its `let` row on `stmt is let && mut`.
+- **Mutability is INFERRED — there is no `mut` keyword.** A binding is just
+  `let x = expr;` (or typed `let x: i32 = expr;`). Whether a binding is
+  **mutable** (reassignable) is **not** written in the source: the engine infers
+  it from the program itself — a binding is mutable **iff its name is
+  reassigned somewhere in its scope** (a bare reassignment `x = …`, a compound
+  `x += …`, or a field/index assignment `x.f = …` / `x[i] = …`, all of which
+  require `x` be mutable in the targets that distinguish mutability). The scope
+  includes nested blocks, so a binding reassigned only inside a `foreach`/`if`/
+  `while`/`for`/`switch` arm still infers mutable. A binding that is never
+  reassigned infers **immutable**. The fact of mutation is already in the AST
+  (the reassignment is right there), so restating it as a `mut` keyword would be
+  redundant ceremony; inference is correct-by-construction (no "unused mut" or
+  "forgot mut" skew). The distinction only matters for targets whose immutable
+  binding form forbids reassignment (Rust `let` vs `let mut`, Kotlin `val` vs
+  `var`, Swift `let` vs `var`); targets whose bindings are mutable by nature
+  (C, Python, Ruby, JavaScript, TypeScript, Go, Java) spell both forms
+  identically. A language definition selects the mutable spelling by branching
+  its `let` row on the engine-inferred fact `stmt is let && mut`.
 - **Compound assignment (pure sugar):** `x += y`, `x -= y`, `x *= y`, `x /= y`,
   `x %= y` are **pure syntactic sugar** for `x = x + y`, `x = x - y`, etc. They
   parse to the *identical* AST as the expanded form — a plain `Assign` whose

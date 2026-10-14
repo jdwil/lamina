@@ -167,14 +167,20 @@ pub struct RenderContext {
     pub has_value: bool,
     /// `has_type` — a `let` statement carries an explicit type annotation.
     pub has_type: bool,
-    /// `mut` — a `let` statement is **mutable** (`let mut x = …`). True iff the
-    /// [`Statement::Let`](crate::ast::Statement::Let) being rendered has
-    /// `mutable: true`; `false` for an immutable `let` and for any non-`let`
-    /// node. Lets a target whose immutable binding form forbids reassignment
-    /// (Rust `let`, Kotlin `val`, Swift `let`) branch its `### statement` /
-    /// `### stmt` `let` row (`stmt is let && mut`) to the mutable spelling
-    /// (`let mut`, `var`). Default `false` keeps an immutable `let`
-    /// byte-identical to before mutability existed.
+    /// `mut` — a `let` statement binds a **mutable** (reassignable) binding.
+    /// There is no `mut` keyword in the source; this fact is **inferred by the
+    /// engine**: it is `true` iff the [`Statement::Let`](crate::ast::Statement::Let)
+    /// being rendered binds a name that is **reassigned somewhere in its scope**
+    /// (a bare reassignment `x = …`, a compound `x = x + 1`, or a field/index
+    /// assignment `x.f = …` / `x[i] = …` — all of which require `x` be mutable
+    /// in Rust/Kotlin), computed from the per-function mutable-binding set the
+    /// emitter maintains (see [`crate::index::UnitIndex::is_mutable_binding`]).
+    /// It is `false` for a never-reassigned `let` and for any non-`let` node.
+    /// Lets a target whose immutable binding form forbids reassignment (Rust
+    /// `let`, Kotlin `val`, Swift `let`) branch its `### statement` / `### stmt`
+    /// `let` row (`stmt is let && mut`) to the mutable spelling (`let mut`,
+    /// `var`). Default `false` keeps a never-reassigned `let` byte-identical to
+    /// a binding built before mutability existed.
     pub mutable: bool,
     /// `has_else` — an `if` statement carries an `else` branch.
     pub has_else: bool,
@@ -615,8 +621,10 @@ impl RenderContext {
             // Optional statement sub-part flags.
             ("has_value", None) => self.has_value,
             ("has_type", None) => self.has_type,
-            // A `let` is mutable (`let mut x = …`). Closed boolean fact in the
-            // let render scope; `false` for an immutable `let` and any non-let.
+            // A `let` binds a mutable (reassignable) binding — INFERRED by the
+            // engine from whether the name is reassigned in scope, not from any
+            // source keyword. Closed boolean fact in the let render scope;
+            // `false` for a never-reassigned `let` and any non-let.
             ("mut", None) => self.mutable,
             ("has_else", None) => self.has_else,
             ("has_init", None) => self.has_init,

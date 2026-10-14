@@ -1353,6 +1353,14 @@ pub enum Statement {
     /// A local binding (`let name: ty = value;`). Both `ty` and `value` are
     /// optional: `value` is absent for declared-but-unassigned locals (needed
     /// for the C hoisting case), and `ty` is absent for inferred targets.
+    ///
+    /// There is no explicit mutability field: a binding's mutability is
+    /// **inferred by the engine** (a binding is mutable iff it is reassigned
+    /// somewhere in its scope). A target whose immutable binding form forbids
+    /// reassignment (Rust `let`, Kotlin `val`, Swift `let`) branches its
+    /// `### statement`/`### stmt` `let` row on the engine's `mut` fact to emit
+    /// the mutable form (`let mut`, `var`); see [`crate::index`] for how the
+    /// fact is populated.
     Let {
         /// The bound identifier.
         name: String,
@@ -1361,15 +1369,6 @@ pub enum Statement {
         /// The initializer expression, or `None` when the local is declared
         /// unassigned.
         value: Option<Expr>,
-        /// Whether the binding is **mutable** (reassignable). This is the
-        /// explicit source annotation `let mut` — it is NEVER inferred from
-        /// reassignment. Defaults to `false` (immutable), so a binding built
-        /// without specifying it renders byte-identically to one built before
-        /// mutability existed. A target whose immutable binding form forbids
-        /// reassignment (Rust `let`, Kotlin `val`, Swift `let`) branches its
-        /// `### statement`/`### stmt` `let` row on the engine's `mut` fact to
-        /// emit the mutable form (`let mut`, `var`) when this is `true`.
-        mutable: bool,
     },
     /// A `return;` or `return <expr>;` statement. The value is optional: a bare
     /// `return;` is valid, and a `void` function returns nothing.
@@ -1486,15 +1485,13 @@ impl PartialEq for Statement {
                     name: an,
                     ty: at,
                     value: av,
-                    mutable: am,
                 },
                 Statement::Let {
                     name: bn,
                     ty: bt,
                     value: bv,
-                    mutable: bm,
                 },
-            ) => an == bn && at == bt && av == bv && am == bm,
+            ) => an == bn && at == bt && av == bv,
             (Statement::Return(a), Statement::Return(b)) => a == b,
             (
                 Statement::If {
@@ -3450,7 +3447,6 @@ mod tests {
                 name: "x".into(),
                 ty: None,
                 value: None,
-                mutable: false
             }
             .kind(),
             StatementKind::Let

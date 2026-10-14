@@ -229,7 +229,14 @@ fn emit_function(
     // so an unused frame is harmless and the behavior stays byte-identical for
     // every switch whose scrutinee does not resolve to a payload-bearing enum.
     index.push_value_types(crate::index::function_value_types(function));
+    // Push this function's inferred mutable-binding set (the names reassigned
+    // anywhere in its body, including nested blocks) so each `let` can answer
+    // the closed `mut` fact by membership. Mutability is INFERRED here — the
+    // source has no `mut` keyword — and the frame is popped before returning so
+    // sibling functions never see it.
+    index.push_mutable_names(crate::index::function_mutable_names(function));
     let result = lang.function.entry.render(&mut resolver);
+    index.pop_mutable_names();
     index.pop_value_types();
     result
 }
@@ -1128,12 +1135,14 @@ fn statement_context(
         ..Default::default()
     };
     match stmt {
-        Statement::Let {
-            ty, value, mutable, ..
-        } => {
+        Statement::Let { name, ty, value } => {
             ctx.has_type = ty.is_some();
             ctx.has_value = value.is_some();
-            ctx.mutable = *mutable;
+            // Mutability is INFERRED, not annotated: the binding is mutable iff
+            // its name is reassigned somewhere in its scope (the per-function
+            // mutable-binding frame the emitter pushed). A never-reassigned
+            // binding stays immutable (byte-identical to a pre-`mut` `let`).
+            ctx.mutable = index.is_mutable_binding(name);
         }
         Statement::Return(value) => ctx.has_value = value.is_some(),
         Statement::If { else_block, .. } => ctx.has_else = else_block.is_some(),
@@ -4428,14 +4437,12 @@ mod tests {
             name: "x".into(),
             ty: None,
             value: Some(Expr::IntLiteral("1".into())),
-            mutable: false,
         }]);
         assert!(with.contains("let x = 1;"), "got: {with}");
         let without = emit_fn_body(vec![Statement::Let {
             name: "x".into(),
             ty: None,
             value: None,
-            mutable: false,
         }]);
         assert!(without.contains("let x;"), "got: {without}");
     }

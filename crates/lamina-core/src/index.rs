@@ -24,7 +24,7 @@
 //!   `field_type(<struct>, <field>)`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ast::{Expr, File, Item, Statement, Type};
 
@@ -99,6 +99,19 @@ pub struct RenderState {
     /// caller treats as "not a payload enum" (the safe default). Innermost
     /// frame wins, so a shadowing inner binding is honored.
     value_types: Vec<Vec<(String, Type)>>,
+    /// A stack of lexical **mutable-binding** frames: each frame is the set of
+    /// binding names that are reassigned somewhere in the function body being
+    /// rendered (including nested blocks). The emitter pushes one frame per
+    /// function body before rendering and pops it after, so a `let` statement
+    /// can answer the closed `mut` fact by membership — a binding is mutable
+    /// iff its name appears as the ROOT of some assignment target in scope.
+    ///
+    /// This is how mutability is **inferred** rather than annotated: the source
+    /// has no `mut` keyword, so the engine derives the same fact the defs
+    /// already consume (`stmt is let && mut`) from the reassignments that are
+    /// right there in the AST. A name never reassigned is absent from the set,
+    /// so its `let` infers immutable (byte-identical to a pre-`mut` `let`).
+    mutable_names: Vec<HashSet<String>>,
 }
 
 /// A read-only index of one compilation unit ([`File`]): a map of top-level
@@ -308,6 +321,35 @@ impl<'a> UnitIndex<'a> {
     /// empty (which never happens under balanced push/pop from the emitter).
     pub fn pop_value_types(&self) {
         self.state.borrow_mut().value_types.pop();
+    }
+
+    /// Pushes a lexical **mutable-binding** frame — the set of binding names
+    /// reassigned somewhere in the body being rendered (including nested
+    /// blocks). The emitter pushes one frame per function body (computed by
+    /// `function_mutable_names`) before rendering and pops it after, so a
+    /// `let` statement can answer the closed `mut` fact by membership.
+    pub fn push_mutable_names(&self, frame: HashSet<String>) {
+        self.state.borrow_mut().mutable_names.push(frame);
+    }
+
+    /// Pops the most recently pushed mutable-binding frame. A no-op if the stack
+    /// is empty (which never happens under balanced push/pop from the emitter).
+    pub fn pop_mutable_names(&self) {
+        self.state.borrow_mut().mutable_names.pop();
+    }
+
+    /// Whether the binding `name` is **inferred mutable** in the current scope:
+    /// true iff `name` is the ROOT of some assignment target in the innermost
+    /// pushed mutable-binding frame. Backs the closed `mut` fact (`stmt is let
+    /// && mut`) the Rust/Kotlin defs consume. A name never reassigned (and any
+    /// name when no frame is pushed) answers `false` — the immutable default,
+    /// byte-identical to a pre-`mut` `let`.
+    pub fn is_mutable_binding(&self, name: &str) -> bool {
+        self.state
+            .borrow()
+            .mutable_names
+            .last()
+            .is_some_and(|frame| frame.contains(name))
     }
 
     /// Resolves a value `name` to its declared [`Type`], searching the lexical
@@ -593,6 +635,115 @@ fn collect_typed_lets_in_stmt(stmt: &Statement, frame: &mut Vec<(String, Type)>)
         | Statement::Break
         | Statement::Continue
         | Statement::Raw { .. } => {}
+    }
+}
+
+/// Computes the set of binding names a function reassigns anywhere in its body
+/// (including nested `if`/`while`/`for`/`foreach`/`switch`/block scopes). A name
+/// is in the set iff it is the ROOT of some assignment target — a bare
+/// reassignment (`x = …`), a compound assignment (`x = x + 1`, which parses to a
+/// plain `Assign`), OR a field/index assignment (`x.f = …` / `x[i] = …`). All
+/// three require the binding `x` be mutable in the targets that distinguish
+/// mutability (Rust `let mut`, confirmed by `rustc`: `let p = …; p.x = 1;` is a
+/// compile error without `mut`), so the root-of-target rule is the correct,
+/// closed definition of inferred mutability.
+///
+/// A function's parameters are not `let` bindings, so they never appear as the
+/// subject of the `mut` fact; recording a reassigned parameter name here is
+/// harmless (no `let` of that name exists to query it).
+pub(crate) fn function_mutable_names(function: &crate::ast::Function) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    for stmt in &function.body {
+        collect_mutable_names_in_stmt(stmt, &mut names);
+    }
+    names
+}
+
+/// Recursively records the root name of every assignment target reachable from
+/// `stmt` (descending into every nested statement block) into `names`.
+fn collect_mutable_names_in_stmt(stmt: &Statement, names: &mut HashSet<String>) {
+    match stmt {
+        Statement::Assign { target, .. } => {
+            if let Some(root) = assign_target_root(target) {
+                names.insert(root.to_string());
+            }
+        }
+        Statement::Block(body) => {
+            for s in body {
+                collect_mutable_names_in_stmt(s, names);
+            }
+        }
+        Statement::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            for s in then_block {
+                collect_mutable_names_in_stmt(s, names);
+            }
+            if let Some(e) = else_block {
+                collect_mutable_names_in_stmt(e, names);
+            }
+        }
+        Statement::While { body, .. } => {
+            for s in body {
+                collect_mutable_names_in_stmt(s, names);
+            }
+        }
+        Statement::For {
+            init, step, body, ..
+        } => {
+            if let Some(i) = init {
+                collect_mutable_names_in_stmt(i, names);
+            }
+            if let Some(s) = step {
+                collect_mutable_names_in_stmt(s, names);
+            }
+            for s in body {
+                collect_mutable_names_in_stmt(s, names);
+            }
+        }
+        Statement::ForEach { body, .. } => {
+            for s in body {
+                collect_mutable_names_in_stmt(s, names);
+            }
+        }
+        Statement::Switch {
+            cases, default, ..
+        } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_mutable_names_in_stmt(s, names);
+                }
+            }
+            if let Some(d) = default {
+                for s in d {
+                    collect_mutable_names_in_stmt(s, names);
+                }
+            }
+        }
+        // Statements that bind nothing new and carry no nested statement blocks
+        // to descend into contribute no reassignments.
+        Statement::Let { .. }
+        | Statement::Return(_)
+        | Statement::Expr(_)
+        | Statement::Break
+        | Statement::Continue
+        | Statement::Raw { .. } => {}
+    }
+}
+
+/// Resolves the ROOT binding name of an assignment lvalue `target`, peeling
+/// field (`x.f`) and index (`x[i]`) accesses down to the base name. Returns
+/// `Some(name)` for a `Ref`/`Field`/`Index` chain rooted at a bare name, and
+/// `None` for any other lvalue shape (which the emitter restricts out at
+/// construction). This is a purely local, bounded walk — no scripting surface.
+fn assign_target_root(target: &Expr) -> Option<&str> {
+    match target {
+        Expr::Ref(name) => Some(name.as_str()),
+        Expr::Field { obj, .. } => assign_target_root(obj),
+        Expr::Index { obj, .. } => assign_target_root(obj),
+        _ => None,
     }
 }
 
@@ -1129,13 +1280,11 @@ mod tests {
                     name: "typed".into(),
                     ty: Some(Type::Named("Shape".into())),
                     value: None,
-                    mutable: false,
                 },
                 Statement::Let {
                     name: "untyped".into(),
                     ty: None,
                     value: Some(Expr::IntLiteral("1".into())),
-                    mutable: false,
                 },
             ],
             meta: Meta::new(),

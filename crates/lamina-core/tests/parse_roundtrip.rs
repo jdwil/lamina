@@ -272,7 +272,6 @@ fn let_typed_and_inferred() {
             name: "x".into(),
             ty: Some(Type::Primitive(Primitive::I32)),
             value: Some(Expr::IntLiteral("1".into())),
-            mutable: false,
         }],
     );
     assert_body(
@@ -281,41 +280,37 @@ fn let_typed_and_inferred() {
             name: "y".into(),
             ty: None,
             value: Some(Expr::IntLiteral("2".into())),
-            mutable: false,
         }],
     );
 }
 
-/// `let mut <name> …` parses to a mutable binding, and a bare `let` stays
-/// immutable — mutability is the explicit `mut` annotation, never inferred.
+/// There is no `mut` keyword: a `let` is just `let <name> [: ty] [= value]`,
+/// and `let mut …` is now a parse error (the keyword was removed; mutability is
+/// inferred by the engine from reassignment, not annotated in the source).
 #[test]
-fn let_mut_sets_mutable_flag() {
-    assert_body(
-        "let mut x = 0;",
-        vec![Statement::Let {
-            name: "x".into(),
-            ty: None,
-            value: Some(Expr::IntLiteral("0".into())),
-            mutable: true,
-        }],
-    );
-    assert_body(
-        "let mut acc: f64 = 0.0;",
-        vec![Statement::Let {
-            name: "acc".into(),
-            ty: Some(Type::Primitive(Primitive::F64)),
-            value: Some(Expr::FloatLiteral("0.0".into())),
-            mutable: true,
-        }],
-    );
+fn let_has_no_mut_keyword() {
+    // A bare `let` parses, with no mutability field on the AST node.
     assert_body(
         "let x = 0;",
         vec![Statement::Let {
             name: "x".into(),
             ty: None,
             value: Some(Expr::IntLiteral("0".into())),
-            mutable: false,
         }],
+    );
+    assert_body(
+        "let acc: f64 = 0.0;",
+        vec![Statement::Let {
+            name: "acc".into(),
+            ty: Some(Type::Primitive(Primitive::F64)),
+            value: Some(Expr::FloatLiteral("0.0".into())),
+        }],
+    );
+    // `mut` is no longer a keyword, so `let mut x = 0;` parses `mut` as the
+    // binding name, then hits `x` where it expects `=`/`:`/`;` — a parse error.
+    assert!(
+        parse("fn f(): void { let mut x = 0; }").is_err(),
+        "`let mut` must no longer parse now that the `mut` keyword is removed"
     );
 }
 
@@ -351,7 +346,6 @@ fn for_counted_loop() {
                 name: "i".into(),
                 ty: None,
                 value: Some(Expr::IntLiteral("0".into())),
-                mutable: false,
             })),
             cond: Some(Expr::Binary {
                 op: BinaryOp::Lt,
@@ -1356,7 +1350,6 @@ fn raw_single_arm_string_expr_parses() {
                 default: None,
                 meta: Meta::new(),
             }),
-            mutable: false,
         }],
     );
 }
@@ -1378,7 +1371,6 @@ fn raw_single_arm_string_with_version_parses() {
                 default: None,
                 meta: Meta::new(),
             }),
-            mutable: false,
         }],
     );
 }
@@ -1757,7 +1749,6 @@ fn parses_fn_pointer_let_annotation() {
                 ret: Box::new(Type::Primitive(Primitive::Bool)),
             }),
             value: Some(Expr::Ref("f".to_string())),
-            mutable: false,
         }],
     );
 }

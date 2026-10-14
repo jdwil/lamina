@@ -74,10 +74,6 @@ pub enum Token {
     // ---- Statement / control-flow keywords ----
     /// The `let` keyword.
     Let,
-    /// The `mut` keyword (modifies a `let`: `let mut x = …`). Only meaningful
-    /// immediately after `let`; elsewhere a bare `mut` lexes as this token and
-    /// the parser rejects it in context.
-    Mut,
     /// The `return` keyword.
     Return,
     /// The `if` keyword.
@@ -247,7 +243,6 @@ impl Token {
             Token::Use => "keyword `use`".to_string(),
             Token::As => "keyword `as`".to_string(),
             Token::Let => "keyword `let`".to_string(),
-            Token::Mut => "keyword `mut`".to_string(),
             Token::Return => "keyword `return`".to_string(),
             Token::If => "keyword `if`".to_string(),
             Token::Else => "keyword `else`".to_string(),
@@ -341,7 +336,6 @@ fn keyword(word: &str) -> Option<Token> {
         "use" => Token::Use,
         "as" => Token::As,
         "let" => Token::Let,
-        "mut" => Token::Mut,
         "return" => Token::Return,
         "if" => Token::If,
         "else" => Token::Else,

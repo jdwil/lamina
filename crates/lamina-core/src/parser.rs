@@ -914,12 +914,14 @@ impl Parser {
         }
     }
 
-    /// `let := "let" "mut"? IDENT (":" type)? ("=" expr)? ";"`
+    /// `let := "let" IDENT (":" type)? ("=" expr)? ";"`
+    ///
+    /// There is no mutability keyword: a `let` is just a binding. Whether the
+    /// binding is mutable is **inferred by the engine** (a binding is mutable
+    /// iff it is reassigned somewhere in its scope); see
+    /// [`crate::index`] for the reassignment analysis.
     fn parse_let(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Let, "keyword `let`")?;
-        // An explicit `mut` after `let` makes the binding mutable; its absence
-        // leaves it immutable. Mutability is NEVER inferred from reassignment.
-        let mutable = self.eat(&Token::Mut);
         let name = self.expect_ident("a binding name after `let`")?;
         let ty = if self.eat(&Token::Colon) {
             Some(self.parse_type()?)
@@ -932,12 +934,7 @@ impl Parser {
             None
         };
         self.expect(&Token::Semicolon, "`;` to end a `let`")?;
-        Ok(Statement::Let {
-            name,
-            ty,
-            value,
-            mutable,
-        })
+        Ok(Statement::Let { name, ty, value })
     }
 
     /// `return := "return" expr? ";"`

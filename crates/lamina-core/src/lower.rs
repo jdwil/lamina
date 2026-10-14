@@ -161,16 +161,10 @@ fn lower_block(body: &[Statement], target: &str) -> Result<Vec<Statement>, Lower
 fn lower_stmt(stmt: &Statement, target: &str) -> Result<Statement, LowerError> {
     match stmt {
         Statement::Block(body) => Ok(Statement::Block(lower_block(body, target)?)),
-        Statement::Let {
-            name,
-            ty,
-            value,
-            mutable,
-        } => Ok(Statement::Let {
+        Statement::Let { name, ty, value } => Ok(Statement::Let {
             name: name.clone(),
             ty: ty.clone(),
             value: lower_opt_expr(value, target)?,
-            mutable: *mutable,
         }),
         Statement::Return(value) => Ok(Statement::Return(lower_opt_expr(value, target)?)),
         Statement::If {

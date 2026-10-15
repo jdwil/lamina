@@ -188,6 +188,48 @@ fn emit_item(item: &Item, lang: &LanguageDef, index: &UnitIndex) -> Result<Rende
         // dispatch — it has no entry template of its own; a pure markup/config
         // file is just its root tree expression.
         Item::Tree(expr) => emit_expr(expr, lang, index),
+        // A native library import is DEDUPLICATED: the first occurrence of a
+        // given resolved import renders (routed by the def's `## Import`
+        // section to its `imports` region); a second occurrence of the SAME
+        // import renders nothing, so the import region never repeats a
+        // directive. Dedup happens here (before the generic section dispatch)
+        // keyed on the resolved arm's structured content.
+        Item::Import { .. } => {
+            if let Some(arm) = import_resolved_arm(item) {
+                let items_key = arm
+                    .items
+                    .iter()
+                    .map(|i| match &i.alias {
+                        Some(a) => format!("{}={a}", i.name),
+                        None => i.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let key = format!(
+                    "{}|{}|{}",
+                    arm.module,
+                    items_key,
+                    arm.alias.as_deref().unwrap_or("")
+                );
+                if !index.mark_import_first_seen(&key) {
+                    return Ok(Rendered::empty());
+                }
+            }
+            let kind = item.kind();
+            let def = lang.item_def(kind).ok_or_else(|| EmitError::UnknownItem {
+                target: lang.name.clone(),
+                item: kind.as_str().to_string(),
+            })?;
+            let mut resolver = ItemResolver {
+                item,
+                def,
+                lang,
+                index,
+                ctx: item_context(item),
+                scope: ItemScope::Node,
+            };
+            def.entry.render(&mut resolver)
+        }
         _ => {
             let kind = item.kind();
             let def = lang.item_def(kind).ok_or_else(|| EmitError::UnknownItem {
@@ -256,6 +298,11 @@ fn context_for(function: &Function) -> RenderContext {
     };
     RenderContext {
         export: function.visibility == Visibility::Public,
+        // The conventional program entry point is a function named `main`;
+        // this backs the closed `fn is entry` fact so a def renders the
+        // target's native single-file entry (Rust `fn main()`, Go `func main`,
+        // Java `static void main`, Python's `__main__` guard, …).
+        is_entry: function.name == "main",
         is_async: function.has_modifier(Modifier::Async),
         is_const: function.has_modifier(Modifier::Const),
         is_unsafe: function.has_modifier(Modifier::Unsafe),
@@ -295,6 +342,7 @@ fn pred_item_kind(kind: ItemKind) -> PredItemKind {
         ItemKind::Use => PredItemKind::Use,
         ItemKind::Tree => PredItemKind::Tree,
         ItemKind::Raw => PredItemKind::Raw,
+        ItemKind::Import => PredItemKind::Import,
     }
 }
 
@@ -339,6 +387,15 @@ fn item_context(item: &Item) -> RenderContext {
         ctx.has_items = !items.is_empty();
         ctx.has_alias = alias.is_some();
     }
+    // A native library `import` surfaces the SAME shape facts (`has_items` /
+    // `has_alias`) from its single resolved arm, so a def renders the native
+    // import spelling by branching exactly like its `## Use` section. (After
+    // `lower`, an `Import` always has exactly one arm; the arm the resolver
+    // reads is that one — see `import_resolved_arm`.)
+    if let Some(arm) = import_resolved_arm(item) {
+        ctx.has_items = !arm.items.is_empty();
+        ctx.has_alias = arm.alias.is_some();
+    }
     // An `enum` surfaces whether any variant carries a payload so a target
     // lacking native tagged-union enums (e.g. TypeScript) can branch the whole
     // declaration to a discriminated-union form; a payloadless enum leaves this
@@ -372,6 +429,22 @@ fn item_visibility(item: &Item) -> Option<Visibility> {
         Item::TypeDef { .. } | Item::Use { .. } => None,
         Item::Tree(_) => None,
         Item::Raw { .. } => None,
+        Item::Import { .. } => None,
+    }
+}
+
+/// The single resolved [`ImportArm`] of an [`Item::Import`], or `None` for any
+/// other item.
+///
+/// After [`lower`](crate::lower) an import always carries exactly one arm (the
+/// one selected for the build target); the emitter reads that arm's structured
+/// pieces. If (defensively) no arm is present, the `else` fallback is used.
+fn import_resolved_arm(item: &Item) -> Option<&crate::ast::ImportArm> {
+    match item {
+        Item::Import { arms, default, .. } => {
+            arms.first().or(default.as_deref())
+        }
+        _ => None,
     }
 }
 
@@ -518,6 +591,19 @@ impl<'a> ItemResolver<'a> {
             (Item::Raw { arms, default, .. }, "value") => {
                 Ok(Rendered::text(resolved_raw_code(arms, default)?))
             }
+            // A native library import's structured pieces (from its single
+            // resolved arm): `module` (the target-native module path) and the
+            // optional `alias`. The `items` sequence is handled in `sequence`.
+            (Item::Import { .. }, "module") => Ok(Rendered::text(
+                import_resolved_arm(self.item)
+                    .map(|a| a.module.clone())
+                    .unwrap_or_default(),
+            )),
+            (Item::Import { .. }, "alias") => Ok(Rendered::text(
+                import_resolved_arm(self.item)
+                    .and_then(|a| a.alias.clone())
+                    .unwrap_or_default(),
+            )),
             _ => self.unknown_slot(name),
         }
     }
@@ -533,6 +619,15 @@ impl<'a> ItemResolver<'a> {
                 self.render_attributes(attributes, item_slot)
             }
             (Item::Use { items, .. }, "items") => self.render_use_items(items, item_slot),
+            // A native library import's selective items reuse the shared
+            // `use_item` item slot, rendered from the single resolved arm.
+            (Item::Import { .. }, "items") => {
+                let empty: Vec<crate::ast::UseItem> = Vec::new();
+                let items = import_resolved_arm(self.item)
+                    .map(|a| a.items.as_slice())
+                    .unwrap_or(empty.as_slice());
+                self.render_use_items(items, item_slot)
+            }
             _ => self.render_variant_payload(name, item_slot),
         }
     }

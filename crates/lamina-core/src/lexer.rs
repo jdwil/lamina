@@ -68,6 +68,9 @@ pub enum Token {
     Const,
     /// The `use` keyword.
     Use,
+    /// The `import` keyword (native library import; see
+    /// [`Item::Import`](crate::ast::Item::Import)).
+    Import,
     /// The `as` keyword (import / use alias).
     As,
 
@@ -241,6 +244,7 @@ impl Token {
             Token::TypeDef => "keyword `typedef`".to_string(),
             Token::Const => "keyword `const`".to_string(),
             Token::Use => "keyword `use`".to_string(),
+            Token::Import => "keyword `import`".to_string(),
             Token::As => "keyword `as`".to_string(),
             Token::Let => "keyword `let`".to_string(),
             Token::Return => "keyword `return`".to_string(),
@@ -334,6 +338,7 @@ fn keyword(word: &str) -> Option<Token> {
         "typedef" => Token::TypeDef,
         "const" => Token::Const,
         "use" => Token::Use,
+        "import" => Token::Import,
         "as" => Token::As,
         "let" => Token::Let,
         "return" => Token::Return,

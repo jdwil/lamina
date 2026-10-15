@@ -24,7 +24,7 @@
 //! [`LowerError::NoRawArmForTarget`] — raw code is never silently dropped.
 
 use crate::ast::{
-    Attr, Expr, FieldInit, File, Function, Item, Meta, RawArm, Statement, SwitchCase,
+    Attr, Expr, FieldInit, File, Function, ImportArm, Item, Meta, RawArm, Statement, SwitchCase,
 };
 use crate::error::LowerError;
 
@@ -73,6 +73,45 @@ fn resolve_raw(
         target: target.to_string(),
         declared,
     })
+}
+
+/// Resolves a native library import (`arms` + optional `default`) to the single
+/// structured [`ImportArm`] selected for `target`.
+///
+/// Selection is target-only, mirroring [`resolve_raw`]: the first arm whose
+/// `target` equals `target` wins; otherwise the `else` fallback is used;
+/// otherwise this is a hard [`LowerError::NoRawArmForTarget`] (an import is
+/// never silently dropped). The returned arm's `target` is cleared so a
+/// resolved import compares equal regardless of which build target produced it.
+fn resolve_import(
+    arms: &[ImportArm],
+    default: &Option<Box<ImportArm>>,
+    target: &str,
+) -> Result<ImportArm, LowerError> {
+    let selected = arms
+        .iter()
+        .find(|a| a.target == target)
+        .or(default.as_deref());
+    match selected {
+        Some(arm) => Ok(ImportArm {
+            target: String::new(),
+            version: None,
+            module: arm.module.clone(),
+            items: arm.items.clone(),
+            alias: arm.alias.clone(),
+        }),
+        None => {
+            let declared = arms
+                .iter()
+                .map(|a| a.target.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(LowerError::NoRawArmForTarget {
+                target: target.to_string(),
+                declared,
+            })
+        }
+    }
 }
 
 /// Builds a resolved single-arm raw node from already-selected verbatim `code`,
@@ -125,6 +164,23 @@ fn lower_item(item: &Item, target: &str) -> Result<Item, LowerError> {
                 arms,
                 default,
                 meta,
+            })
+        }
+        // A native library import resolves exactly like a raw node: pick the
+        // arm whose `target` matches the build target (or the `else` fallback);
+        // no match + no fallback is a hard error. The resolved node carries the
+        // single selected (structured) arm so the emitter reads its
+        // `module`/`items`/`alias` directly.
+        Item::Import {
+            arms,
+            default,
+            meta,
+        } => {
+            let resolved = resolve_import(arms, default, target)?;
+            Ok(Item::Import {
+                arms: vec![resolved],
+                default: None,
+                meta: meta.clone(),
             })
         }
         // Structs, enums, typedefs, and uses carry no nested expressions or

@@ -47,6 +47,13 @@ pub struct RenderState {
     /// A `BTreeMap` keeps iteration deterministic; the definition's declared
     /// `layout` drives the actual assembly order.
     regions: BTreeMap<String, String>,
+    /// The set of native library imports (by a canonical key of their resolved
+    /// structured content) already emitted in this unit, so a second
+    /// occurrence of the SAME import renders nothing — the import region is
+    /// DEDUPLICATED. Keyed by the resolved arm's `module` + `items` + `alias`,
+    /// so two source `Import`s that resolve to the same target module collapse
+    /// to one.
+    seen_imports: std::collections::BTreeSet<String>,
     /// Memoized fresh-name allocations keyed by `(lambda_identity, prefix,
     /// key)`. The SAME key returns the SAME identifier no matter which pass or
     /// region requests it — this is what lets a hoisted definition (emitted in
@@ -285,6 +292,15 @@ impl<'a> UnitIndex<'a> {
         let result = f();
         self.state.borrow_mut().current_lambda = previous;
         result
+    }
+
+    /// Records that a native import keyed by `key` is being emitted, returning
+    /// `true` if it is the FIRST occurrence (so it should render) and `false`
+    /// if the SAME import was already emitted (so it should be suppressed).
+    /// This is what deduplicates the import region: two source `Import`s whose
+    /// resolved target content is identical collapse to one emitted directive.
+    pub fn mark_import_first_seen(&self, key: &str) -> bool {
+        self.state.borrow_mut().seen_imports.insert(key.to_string())
     }
 
     /// Consumes and returns the accumulated region buffers (draining the map),
@@ -532,6 +548,8 @@ fn item_name(item: &Item) -> Option<&str> {
         // A raw / verbatim item is an opaque code string — it binds no name the
         // index can key on.
         Item::Raw { .. } => None,
+        // A native library import binds no name the index can key on.
+        Item::Import { .. } => None,
     }
 }
 

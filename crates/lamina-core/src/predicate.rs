@@ -95,6 +95,16 @@ pub struct Fact {
 pub struct RenderContext {
     /// `export` — the node is publicly visible.
     pub export: bool,
+    /// `fn is entry` — the function being rendered is the program's **entry
+    /// point** (by convention, a function named `main`). A closed boolean-enum
+    /// dispatch fact: a definition branches its `## Function` section on
+    /// `fn is entry` to render the target's native single-file entry (Rust
+    /// `fn main()`, Go `func main()` + `package main`, Java
+    /// `static void main(String[])`, Python's `if __name__ == "__main__":`
+    /// guard, …) rather than string-matching the function name itself. `false`
+    /// for every non-entry function (and any non-function node), so a program
+    /// with no `main` renders byte-identically to before this fact existed.
+    pub is_entry: bool,
     /// Modifier flags (answer boolean facts of the same name).
     pub is_async: bool,
     /// `const`.
@@ -539,6 +549,8 @@ pub enum ItemKind {
     Tree,
     /// A raw / verbatim top-level item (`item is raw`).
     Raw,
+    /// A native library import (`item is import`).
+    Import,
 }
 
 impl ItemKind {
@@ -553,6 +565,7 @@ impl ItemKind {
             ItemKind::Use => "use",
             ItemKind::Tree => "tree",
             ItemKind::Raw => "raw",
+            ItemKind::Import => "import",
         }
     }
 }
@@ -609,6 +622,10 @@ impl RenderContext {
         match (fact.key.as_str(), fact.value.as_deref()) {
             // Boolean flags.
             ("export", None) => self.export,
+            // Entry-point dispatch: `fn is entry` — the function being rendered
+            // is the program's conventional entry point (a `main`). Closed
+            // single-value enum query mirroring `ret is <kind>`.
+            ("fn", Some("entry")) => self.is_entry,
             ("async", None) => self.is_async,
             ("const", None) => self.is_const,
             ("unsafe", None) => self.is_unsafe,
@@ -831,7 +848,7 @@ fn stmt_kind_is_known(kind: &str) -> bool {
 fn item_kind_is_known(kind: &str) -> bool {
     matches!(
         kind,
-        "function" | "struct" | "enum" | "typedef" | "const" | "use" | "tree" | "raw"
+        "function" | "struct" | "enum" | "typedef" | "const" | "use" | "tree" | "raw" | "import"
     )
 }
 
@@ -875,6 +892,7 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     let known = matches!(
         (fact.key.as_str(), fact.value.as_deref()),
         ("export", None)
+            | ("fn", Some("entry"))
             | ("async", None)
             | ("const", None)
             | ("unsafe", None)

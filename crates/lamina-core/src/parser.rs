@@ -82,8 +82,8 @@
 
 use crate::ast::{
     is_lvalue, Attr, BinaryOp, CaseBindings, CaseFieldBind, Expr, Field, FieldInit, File, Function,
-    Item, Meta, Modifier, Param, Primitive, RawArm, Statement, SwitchCase, Type, TypeAttribute,
-    UnaryOp, UseItem, Variant, VariantPayload, Visibility,
+    ImportArm, Item, Meta, Modifier, Param, Primitive, RawArm, Statement, SwitchCase, Type,
+    TypeAttribute, UnaryOp, UseItem, Variant, VariantPayload, Visibility,
 };
 use crate::error::ParseError;
 use crate::lexer::{lex, SpannedToken, Token};
@@ -287,6 +287,7 @@ impl Parser {
             Some(Token::Const) => self.parse_const(visibility),
             Some(Token::TypeDef) => self.parse_typedef(),
             Some(Token::Use) => self.parse_use(),
+            Some(Token::Import) => self.parse_import(),
             Some(Token::Node) | Some(Token::Text) => {
                 // A top-level tree value (a declarative-only document root). A
                 // preceding `@meta(...)` attaches to the root node (B-3); a type
@@ -716,6 +717,129 @@ impl Parser {
             alias,
             meta: Meta::new(),
         })
+    }
+
+    /// Parses a native library import directive:
+    ///
+    /// ```text
+    /// import {
+    ///     c          { "stdio.h" }
+    ///     python     { "sys" }
+    ///     python     { from "os" import path }      // from-import form
+    ///     rust       { "std::io::Write" }
+    ///     javascript { from "fs" import readFileSync }
+    ///     go         { "bufio" }
+    ///     else       { "fallback" }                 // optional fallback
+    /// }
+    /// ```
+    ///
+    /// Each arm is `<target> { <module-spec> }` (or `else { <module-spec> }`
+    /// for the optional fallback). A module-spec is one of:
+    /// - `"module"` — a bare module import (optionally `"module" as alias`);
+    /// - `from "module" import a, b [as c]` — a selective import.
+    ///
+    /// The module is a quoted string (target-native text); the item/alias
+    /// grammar mirrors `use`. Resolution to the current build target happens in
+    /// [`lower`](crate::lower).
+    fn parse_import(&mut self) -> Result<Item, ParseError> {
+        self.expect(&Token::Import, "keyword `import`")?;
+        self.expect(&Token::LBrace, "`{` to open an `import` block")?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        while self.peek() != Some(&Token::RBrace) {
+            // An arm head is either `else` (the fallback) or a target name.
+            let is_else = self.peek() == Some(&Token::Else);
+            let target = if is_else {
+                self.pos += 1; // `else`
+                String::new()
+            } else {
+                self.expect_ident("an import arm target name (or `else`)")?
+            };
+            self.expect(&Token::LBrace, "`{` to open an import arm body")?;
+            let (module, items, alias) = self.parse_import_spec()?;
+            self.expect(&Token::RBrace, "`}` to close an import arm body")?;
+            let arm = ImportArm {
+                target,
+                version: None,
+                module,
+                items,
+                alias,
+            };
+            if is_else {
+                if default.is_some() {
+                    return Err(self.error("at most one `else` arm in an `import` block"));
+                }
+                default = Some(Box::new(arm));
+            } else {
+                arms.push(arm);
+            }
+        }
+        self.expect(&Token::RBrace, "`}` to close the `import` block")?;
+        if arms.is_empty() && default.is_none() {
+            return Err(self.error("at least one arm in an `import` block"));
+        }
+        Ok(Item::Import {
+            arms,
+            default,
+            meta: Meta::new(),
+        })
+    }
+
+    /// Parses one import arm's module-spec: either a bare `"module" [as alias]`
+    /// or a selective `from "module" import a, b [as c]`. Returns the module
+    /// path, the selective items (empty for a bare import), and the optional
+    /// module alias.
+    #[allow(clippy::type_complexity)]
+    fn parse_import_spec(&mut self) -> Result<(String, Vec<UseItem>, Option<String>), ParseError> {
+        // A `from "module" import a, b` selective form. `from` is a plain
+        // identifier (not a keyword), `import` is the keyword.
+        if matches!(self.peek(), Some(Token::Ident(w)) if w == "from") {
+            self.pos += 1; // `from`
+            let module = self.expect_str("a quoted module path after `from`")?;
+            self.expect(&Token::Import, "keyword `import` in a `from … import …` arm")?;
+            let mut items = Vec::new();
+            loop {
+                let name = self.expect_ident("an imported item name")?;
+                let item_alias = if self.eat(&Token::As) {
+                    Some(self.expect_ident("an alias after `as`")?)
+                } else {
+                    None
+                };
+                items.push(UseItem {
+                    name,
+                    alias: item_alias,
+                    meta: Meta::new(),
+                });
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+                if self.peek() == Some(&Token::RBrace) {
+                    break;
+                }
+            }
+            return Ok((module, items, None));
+        }
+        // A bare `"module" [as alias]` form.
+        let module = self.expect_str("a quoted module path in an import arm")?;
+        let alias = if self.eat(&Token::As) {
+            Some(self.expect_ident("an alias after `as`")?)
+        } else {
+            None
+        };
+        Ok((module, Vec::new(), alias))
+    }
+
+    /// Consumes and returns the contents of a string literal, or a positioned
+    /// error.
+    fn expect_str(&mut self, what: &str) -> Result<String, ParseError> {
+        match self.peek() {
+            Some(Token::Str(s)) => {
+                let s = s.clone();
+                self.pos += 1;
+                Ok(s)
+            }
+            _ => Err(self.error(what)),
+        }
     }
 
     /// Parses a `use` path: a `::`-separated run of identifiers, with an

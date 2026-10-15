@@ -129,6 +129,49 @@ pub struct RawArm {
     pub code: String,
 }
 
+/// One **target-tagged arm** of a native [`Item::Import`] directive.
+///
+/// Unlike a [`RawArm`] (whose body is opaque verbatim target code), an import
+/// arm is **structured** — it mirrors the shape of [`Item::Use`]: a `module`
+/// path, an optional selective `items` list, and an optional module `alias`.
+/// The arm therefore covers `import x` (bare module), `from x import a, b`
+/// (selective), and `use x::{a, b} as c` (selective + alias) uniformly, while
+/// the DEFINITION renders the native per-target spelling around these pieces
+/// (branching on the `has_items` / `has_alias` facts exactly as `## Use` does).
+///
+/// The AST keeps **all** target arms; resolution to the current build target
+/// happens in the [`lower`](crate::lower) pass (match the arm whose `target`
+/// equals the build target; no match + no default = hard error), exactly like
+/// the raw multi-arm pattern. A library import has PLACEMENT semantics `raw`
+/// lacks (it is declared anywhere in source but routed to the file's import
+/// region), so it is a dedicated node rather than a raw escape.
+///
+/// Structural equality is derived: two arms are equal iff their `target`,
+/// `version`, `module`, `items`, and `alias` all match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportArm {
+    /// The target language this arm applies to (e.g. `"python"`, `"rust"`).
+    ///
+    /// [`lower`](crate::lower) selects an arm by comparing this verbatim to the
+    /// language definition's `target` name (target-only match today).
+    pub target: String,
+    /// An **opaque** version constraint (e.g. `">=3.10"`), parsed but NOT
+    /// matched on yet — version-range resolution is deferred to the later
+    /// dependency/version arc, consistent with the opaque-version-token
+    /// decision. `None` when the arm head carries no constraint.
+    pub version: Option<String>,
+    /// The imported module path, verbatim target-native text (a quoted string
+    /// in source, since it is the target's own module spelling — `"stdio.h"`,
+    /// `"std::io::Write"`, `"sys"`).
+    pub module: String,
+    /// The selectively-imported items (`from "os" import path`); empty for a
+    /// bare module import.
+    pub items: Vec<UseItem>,
+    /// A module alias (`import "numpy" as np`); `None` for a bare or selective
+    /// import.
+    pub alias: Option<String>,
+}
+
 /// A parsed Lamina source unit (the contents of one `lamina` code block).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
@@ -276,6 +319,32 @@ pub enum Item {
         /// item is raiseable like any other node.
         meta: Meta,
     },
+    /// A **native library import** (`import { c { "stdio.h" } python { "sys" }
+    /// … }`): a target-tagged, structured import directive routed to the file's
+    /// import region.
+    ///
+    /// Unlike [`Item::Use`] (a Lamina-module import rendered inline where it
+    /// appears), an `Import` names a **target-native** library and has
+    /// PLACEMENT semantics: each target routes it to its own import region
+    /// (top-of-file for C/Python/Rust/JS/TS, an `import (...)` block for Go,
+    /// after `package` for Java), DEDUPLICATED. It is therefore a dedicated
+    /// node, target-keyed like [`Item::Raw`], resolved by
+    /// [`lower`](crate::lower) to the single arm matching the build target (no
+    /// match + no `else` = hard error). After lowering, the one resolved arm's
+    /// structured pieces (`module` / `items` / `alias`) render through the
+    /// target's `## Import` section (routed to the def's `imports` region) with
+    /// the native per-target spelling. Structural equality compares `arms` +
+    /// `default` and ignores `meta`.
+    Import {
+        /// The target-tagged structured arms, in source order.
+        /// [`lower`](crate::lower) collapses this to the one selected arm.
+        arms: Vec<ImportArm>,
+        /// The `else { … }` fallback arm, used when no `arms` target matches;
+        /// `None` when the source had no `else`.
+        default: Option<Box<ImportArm>>,
+        /// Engine-transparent metadata (see [`Meta`]); default empty.
+        meta: Meta,
+    },
 }
 
 impl Item {
@@ -291,6 +360,7 @@ impl Item {
             Item::Use { .. } => ItemKind::Use,
             Item::Tree(_) => ItemKind::Tree,
             Item::Raw { .. } => ItemKind::Raw,
+            Item::Import { .. } => ItemKind::Import,
         }
     }
 
@@ -308,6 +378,7 @@ impl Item {
             // A tree item's metadata is the tree expression's own metadata.
             Item::Tree(expr) => expr.meta(),
             Item::Raw { meta, .. } => meta,
+            Item::Import { meta, .. } => meta,
         }
     }
 
@@ -343,6 +414,28 @@ impl Item {
                 target: String::new(),
                 version: None,
                 code: code.into(),
+            }],
+            default: None,
+            meta: Meta::new(),
+        }
+    }
+
+    /// Builds a **resolved single-arm** bare-module import from a `module`
+    /// path.
+    ///
+    /// This is the convenient way to hand-build an already-target-resolved
+    /// import node (its `target` is irrelevant to the emitter, which reads the
+    /// one arm's structured pieces): `arms = [one]` with empty `items`/`alias`,
+    /// `default = None`, empty metadata. For a selective or aliased import,
+    /// construct the [`ImportArm`] directly.
+    pub fn import(module: impl Into<String>) -> Item {
+        Item::Import {
+            arms: vec![ImportArm {
+                target: String::new(),
+                version: None,
+                module: module.into(),
+                items: Vec::new(),
+                alias: None,
             }],
             default: None,
             meta: Meta::new(),
@@ -439,6 +532,21 @@ impl PartialEq for Item {
                     ..
                 },
                 Item::Raw {
+                    arms: ba,
+                    default: bd,
+                    ..
+                },
+            ) => aa == ba && ad == bd,
+            // An import item's structural identity is its target arms and
+            // `else` fallback; metadata is ignored (consistent with every
+            // other node).
+            (
+                Item::Import {
+                    arms: aa,
+                    default: ad,
+                    ..
+                },
+                Item::Import {
                     arms: ba,
                     default: bd,
                     ..
@@ -611,6 +719,8 @@ pub enum ItemKind {
     Tree,
     /// A raw / verbatim top-level item (the layer escape hatch).
     Raw,
+    /// A native library import (routed to the def's import region).
+    Import,
 }
 
 impl ItemKind {
@@ -627,6 +737,7 @@ impl ItemKind {
             ItemKind::Use => "use",
             ItemKind::Tree => "tree",
             ItemKind::Raw => "raw",
+            ItemKind::Import => "import",
         }
     }
 
@@ -643,6 +754,7 @@ impl ItemKind {
             ItemKind::Use => "Use",
             ItemKind::Tree => "Tree",
             ItemKind::Raw => "Raw",
+            ItemKind::Import => "Import",
         }
     }
 
@@ -657,13 +769,14 @@ impl ItemKind {
             ItemKind::Use => SlotScope::Use,
             ItemKind::Tree => SlotScope::Node,
             ItemKind::Raw => SlotScope::Raw,
+            ItemKind::Import => SlotScope::Import,
         }
     }
 
     /// Every item kind, in canonical order. Keeps the closed `item` vocabulary
     /// in one place, shared by the predicate registry and the language-def
     /// parser (which parses one `## <Item>` section per kind).
-    pub fn all() -> [ItemKind; 8] {
+    pub fn all() -> [ItemKind; 9] {
         [
             ItemKind::Function,
             ItemKind::Struct,
@@ -673,6 +786,7 @@ impl ItemKind {
             ItemKind::Use,
             ItemKind::Tree,
             ItemKind::Raw,
+            ItemKind::Import,
         ]
     }
 }
@@ -2849,6 +2963,15 @@ pub enum SlotScope {
     /// [`SlotScope::Statement`] `value` slot, so no separate scope is needed for
     /// them.)
     Raw,
+    /// Resolving slots of a native library [`Item::Import`] directive (after
+    /// [`lower`](crate::lower) resolves it to one target arm). Exposes `module`
+    /// (scalar leaf — the target-native module path), the optional `alias`
+    /// (scalar leaf, guarded by the `has_alias` fact), and the `items`
+    /// sequence (looping the shared `use_item` item slot in
+    /// [`SlotScope::UseItem`], guarded by the `has_items` fact) — the same
+    /// structured surface as [`SlotScope::Use`], so a def renders the native
+    /// import spelling by branching exactly like its `## Use` section.
+    Import,
     /// Resolving slots of a [`Expr::Lambda`]: its `params` (a Sequence looping
     /// the shared `param` item slot, resolved in [`SlotScope::Param`]), its
     /// optional `ret_type` (a scalar, guarded by the `has_ret_type` fact), and
@@ -3264,6 +3387,23 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "value" => Some(SlotShape::Scalar),
             _ => None,
         },
+        // A native library import (resolved to one target arm): `module` is a
+        // scalar leaf (the target-native module path). A module alias
+        // (`import "numpy" as np`) exposes `alias` (scalar leaf, guarded by the
+        // `has_alias` fact); a selective import exposes `items` (a sequence
+        // looping the shared `use_item` item slot, guarded by the `has_items`
+        // fact) — the same structured surface as a `use`, so a def renders the
+        // native import spelling by branching exactly like its `## Use`
+        // section.
+        SlotScope::Import => match name {
+            "module" => Some(SlotShape::Scalar),
+            "alias" => Some(SlotShape::Scalar),
+            "items" => Some(SlotShape::Sequence {
+                item_slot: "use_item".to_string(),
+                item_scope: SlotScope::UseItem,
+            }),
+            _ => None,
+        },
         // A lambda: `params` loops the shared `param` item slot (reusing
         // [`SlotScope::Param`], so a lambda parameter renders through the same
         // `name`/`type` sub-slots as a function parameter); `ret_type` is a
@@ -3654,7 +3794,7 @@ mod tests {
 
     #[test]
     fn item_kind_set_is_closed_and_spellings_match_headings() {
-        assert_eq!(ItemKind::all().len(), 8);
+        assert_eq!(ItemKind::all().len(), 9);
         // Each `item is <kind>` spelling and its `## <Heading>` are consistent.
         for kind in ItemKind::all() {
             assert!(!kind.as_str().is_empty());
@@ -3665,6 +3805,8 @@ mod tests {
         assert_eq!(ItemKind::TypeDef.as_str(), "typedef");
         assert_eq!(ItemKind::Raw.heading(), "Raw");
         assert_eq!(ItemKind::Raw.as_str(), "raw");
+        assert_eq!(ItemKind::Import.heading(), "Import");
+        assert_eq!(ItemKind::Import.as_str(), "import");
     }
 
     #[test]

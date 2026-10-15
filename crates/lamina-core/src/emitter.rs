@@ -1515,7 +1515,7 @@ impl<'a> StmtResolver<'a> {
         }
         match &self.scope {
             StmtScope::Case(case) => match name {
-                "value" => emit_expr(&case.value, self.lang, self.index),
+                "value" => emit_pattern_expr(&case.value, self.lang, self.index),
                 // The scrutinee's enum **type name** when the enclosing
                 // `switch` dispatches over a payload-bearing enum, else the
                 // EMPTY string. A plain scalar slot (not a fact) exposing the
@@ -1867,6 +1867,32 @@ impl<'a> SlotResolver for StmtResolver<'a> {
 /// A `null` literal is gated by the `ptr` primitive: on a target that forbids
 /// `ptr`, `null` is forbidden too (`null` follows `ptr`).
 fn emit_expr(expr: &Expr, lang: &LanguageDef, index: &UnitIndex) -> Result<Rendered, EmitError> {
+    emit_expr_impl(expr, lang, index, false)
+}
+
+/// Renders a `switch` case's **pattern** value (the case label). Identical to
+/// [`emit_expr`] except it suppresses variant-construction recognition: a bare
+/// variant `Ref` in a case label is the label (`case Rect`, `is Op.Add`), not a
+/// constructed value, so it must render as the plain variant name the matching
+/// defs already expect — never as the target's construction form.
+fn emit_pattern_expr(
+    expr: &Expr,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+) -> Result<Rendered, EmitError> {
+    emit_expr_impl(expr, lang, index, true)
+}
+
+/// Shared implementation of [`emit_expr`] / [`emit_pattern_expr`]: renders
+/// `expr` through the `### expr` dispatch, with `in_pattern` selecting whether a
+/// bare variant name is recognized as a construction (value position) or left as
+/// a plain label (pattern position).
+fn emit_expr_impl(
+    expr: &Expr,
+    lang: &LanguageDef,
+    index: &UnitIndex,
+    in_pattern: bool,
+) -> Result<Rendered, EmitError> {
     // `null` follows `ptr`: if the target forbids the `ptr` primitive, a `null`
     // literal is not expressible either.
     if matches!(expr, Expr::NullLiteral) {
@@ -1881,6 +1907,7 @@ fn emit_expr(expr: &Expr, lang: &LanguageDef, index: &UnitIndex) -> Result<Rende
         index,
         scope: ExprScope::Node,
         ord: 0,
+        in_pattern,
     };
     resolver.render_named_slot("expr")
 }
@@ -2237,6 +2264,17 @@ struct ExprResolver<'a> {
     /// the element position when rendering one element of an `args` / `fields`
     /// / `attrs` / `children` / `elems` collection.
     ord: usize,
+    /// Whether this expression is being rendered in a **pattern** position (a
+    /// `switch` case's `value`), where it must NOT be recognized as a variant
+    /// *construction*: a bare variant `Ref` there is the case LABEL (`case Rect`,
+    /// `is Op.Add`), not a constructed value. Set only on the case-pattern
+    /// render path; every value position leaves it `false` so a genuine
+    /// construction (including a construction nested as a case value's
+    /// sub-expression, which cannot occur for a bare-name pattern) is still
+    /// recognized. The flag does NOT propagate into sub-renders — a construction
+    /// is a leaf w.r.t. the pattern, and `variant_construction_info` only ever
+    /// consults it at the node itself.
+    in_pattern: bool,
 }
 
 impl<'a> ExprResolver<'a> {
@@ -2267,6 +2305,17 @@ impl<'a> ExprResolver<'a> {
             expr: Some(pred_expr_kind(self.expr.kind())),
             meta: self.node_meta().clone(),
             helper_facts: self.compute_helper_facts(),
+            // Construction-side signal: this expression constructs an enum
+            // variant (`expr is variant_construction`). Resolved from the
+            // per-unit index; an ambiguous name surfaces as an error eagerly in
+            // `render_named_slot` (so `ctx` stays infallible — it treats the
+            // error case as `false`, which that eager check never lets reach a
+            // template anyway).
+            is_variant_construction: self
+                .variant_construction_info()
+                .ok()
+                .flatten()
+                .is_some(),
             // A lambda exposes whether it carries an explicit return type so the
             // `### expr` `lambda` row can render the annotation conditionally.
             has_ret_type: matches!(
@@ -2335,6 +2384,53 @@ impl<'a> ExprResolver<'a> {
         facts
     }
 
+    /// Resolves whether the current (Node-scope) expression constructs an enum
+    /// variant, and if so which enum owns it. This is the engine side of the
+    /// context-aware `expr is variant_construction` fact and its `{enum_name}`
+    /// scalar slot.
+    ///
+    /// It recognizes the three construction shapes against the per-unit index:
+    ///
+    /// - a **tuple**-variant construction — an [`Expr::Call`] whose callee is a
+    ///   bare [`Expr::Ref`] naming a variant;
+    /// - a **struct**-variant construction — an [`Expr::StructLit`] whose type
+    ///   name is a variant;
+    /// - a **unit**-variant construction — a bare [`Expr::Ref`] naming a
+    ///   variant.
+    ///
+    /// Resolution is only meaningful at the expression node itself
+    /// ([`ExprScope::Node`]); every other scope answers `Ok(None)`. An
+    /// ambiguous name (a variant of multiple enums, or both a variant and a
+    /// function) is a loud [`EmitError::AmbiguousVariantConstruction`], never a
+    /// guess.
+    fn variant_construction_info(
+        &self,
+    ) -> Result<Option<(String, crate::ast::VariantKind)>, EmitError> {
+        if !matches!(self.scope, ExprScope::Node) {
+            return Ok(None);
+        }
+        // A pattern-position expression (a `switch` case label) is never a
+        // construction — a bare variant `Ref` there is the case label, not a
+        // constructed value.
+        if self.in_pattern {
+            return Ok(None);
+        }
+        let name = match self.expr {
+            // A tuple-variant construction is a call on a bare variant name.
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Ref(name) => name.as_str(),
+                _ => return Ok(None),
+            },
+            // A struct-variant construction is a struct-literal whose type name
+            // is the variant.
+            Expr::StructLit { type_name, .. } => type_name.as_str(),
+            // A unit-variant construction is a bare reference to the variant.
+            Expr::Ref(name) => name.as_str(),
+            _ => return Ok(None),
+        };
+        self.index.variant_construction(name)
+    }
+
     /// The locally-nameable resolved type of `expr` for `type_of`: a struct
     /// literal's aggregate type name, or a reference to a top-level const/struct
     /// whose type the index can name. Returns `None` when the type is not
@@ -2353,6 +2449,10 @@ impl<'a> ExprResolver<'a> {
     /// Renders a named slot definition (the `expr` table, or a helper slot)
     /// against the current expression context.
     fn render_named_slot(&mut self, name: &str) -> Result<Rendered, EmitError> {
+        // Surface an ambiguous variant construction loudly before any rendering
+        // (the ratified stance is error, not a guess). `ctx` treats the error
+        // case as `false`, so this is the only place the ambiguity is reported.
+        self.variant_construction_info()?;
         let slot =
             self.lang
                 .function
@@ -2402,12 +2502,13 @@ impl<'a> ExprResolver<'a> {
     /// compound (unary/binary) operand so the tree's grouping is preserved.
     fn render_child(&self, child: &Expr) -> Result<Rendered, EmitError> {
         let mut resolver = ExprResolver {
-            expr: child,
-            lang: self.lang,
-            index: self.index,
-            scope: ExprScope::Node,
-            ord: 0,
-        };
+                    expr: child,
+                    lang: self.lang,
+                    index: self.index,
+                    scope: ExprScope::Node,
+                    ord: 0,
+                    in_pattern: false,
+                };
         let inner = resolver.render_named_slot("expr")?;
         if is_compound(child) {
             let mut wrapped = Rendered::text("(");
@@ -2510,7 +2611,16 @@ impl<'a> ExprResolver<'a> {
                 _ => self.unknown_slot(name),
             },
             (ExprScope::Node, "callee") => match self.expr {
-                Expr::Call { callee, .. } => self.render_child(callee),
+                // For a recognized variant construction, the callee IS the
+                // variant name: render it as the bare identifier text, not as a
+                // re-dispatched sub-expression. Re-dispatching would recognize
+                // the bare variant Ref as a *unit*-variant construction and
+                // double-qualify it (`Op::Op::Add`); the def wants the plain
+                // variant spelling to compose with `{enum_name}`.
+                Expr::Call { callee, .. } => match (self.variant_construction_info()?, callee.as_ref()) {
+                    (Some(_), Expr::Ref(variant)) => Ok(Rendered::text(variant.clone())),
+                    _ => self.render_child(callee),
+                },
                 _ => self.unknown_slot(name),
             },
             // A cast's value sub-expression and its target type.
@@ -2529,6 +2639,23 @@ impl<'a> ExprResolver<'a> {
                 Expr::StructLit { type_name, .. } => Ok(Rendered::text(type_name.clone())),
                 _ => self.unknown_slot(name),
             },
+            // The owning enum's name when this expression constructs an enum
+            // variant (`expr is variant_construction`), else the EMPTY string —
+            // the construction-side mirror of the `switch`-case `enum_name`
+            // slot. A def renders a qualified construction form
+            // (`{enum_name}::{callee}(..)`, `new {callee}(..)`, a tagged-union
+            // literal) from the enum name the index resolves; an ordinary
+            // (non-variant) call/struct-lit/reference sees `""`. An ambiguous
+            // name is already surfaced as an error in `render_named_slot`, so a
+            // reachable `{enum_name}` here only ever sees a unique resolution or
+            // the empty default.
+            (ExprScope::Node, "enum_name") => {
+                let enum_name = self
+                    .variant_construction_info()?
+                    .map(|(enum_name, _)| enum_name)
+                    .unwrap_or_default();
+                Ok(Rendered::text(enum_name))
+            }
             // Names / literal contents.
             (ExprScope::Node, "field") => match self.expr {
                 Expr::Field { field, .. } => Ok(Rendered::text(field.clone())),
@@ -2576,12 +2703,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, elem) in args.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::Arg(elem),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::Arg(elem),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function
@@ -2644,12 +2772,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, init) in fields.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::Field(init),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::Field(init),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function
@@ -2712,12 +2841,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, attr) in attrs.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::Attr(attr),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::Attr(attr),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function
@@ -2781,12 +2911,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, child) in children.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::Child(child),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::Child(child),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function
@@ -2850,12 +2981,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, elem) in elems.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::ArrayElem(elem),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::ArrayElem(elem),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function
@@ -2920,12 +3052,13 @@ impl<'a> ExprResolver<'a> {
         let mut out = Rendered::empty();
         for (i, param) in params.iter().enumerate() {
             let mut elem_resolver = ExprResolver {
-                expr: self.expr,
-                lang: self.lang,
-                index: self.index,
-                scope: ExprScope::LambdaParam(param),
-                ord: i,
-            };
+                            expr: self.expr,
+                            lang: self.lang,
+                            index: self.index,
+                            scope: ExprScope::LambdaParam(param),
+                            ord: i,
+                            in_pattern: false,
+                        };
             let slot = self
                 .lang
                 .function

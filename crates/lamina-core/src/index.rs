@@ -449,6 +449,83 @@ impl<'a> UnitIndex<'a> {
         }
     }
 
+    /// Resolves a bare construction name to the **enum it constructs a variant
+    /// of**, backing the context-aware `expr is variant_construction` fact and
+    /// its `enum_name` render-scope slot.
+    ///
+    /// This is the construction-side mirror of
+    /// [`scrutinee_enum_name`](UnitIndex::scrutinee_enum_name): where the
+    /// matching side resolves a `switch` scrutinee to its payload-enum type,
+    /// this resolves a *construction* identifier (a tuple-variant `Call`
+    /// callee, a struct-variant `StructLit` type name, or a unit-variant bare
+    /// `Ref`) to the enum that owns a variant of that name. A language
+    /// definition uses the returned enum name + the variant kind to render the
+    /// target's construction form (Rust `Op::Add(..)`, Java `new Add(..)`, a C
+    /// tagged-union literal, …) so a constructed value matches the same
+    /// encoding the def emits for the enum declaration and `switch` matching.
+    ///
+    /// Resolution is **unique or error** — the engine never guesses:
+    ///
+    /// - `Ok(Some((enum_name, kind)))` when `name` is a variant of **exactly
+    ///   one** in-scope enum (and not also a function). `kind` is the variant's
+    ///   [`VariantKind`](crate::ast::VariantKind) so a def may branch
+    ///   tuple-vs-struct-vs-unit.
+    /// - `Ok(None)` when `name` is not a variant of any in-scope enum — an
+    ///   ordinary call / struct-literal / reference, rendered byte-identically
+    ///   to before this fact existed.
+    /// - `Err(EmitError::AmbiguousVariantConstruction)` when `name` is a
+    ///   variant of **more than one** enum, or is both a variant and a
+    ///   top-level function. The ratified stance is error, not a guess.
+    ///
+    /// Note the asymmetry with [`scrutinee_enum_name`](UnitIndex::scrutinee_enum_name):
+    /// variant construction resolves by the **variant name alone** (every enum
+    /// in the unit is in scope at a construction site), independent of any
+    /// payload-bearing-ness — a unit-variant construction (`Clear`) resolves
+    /// too, so a target that needs a qualified nullary form (`Op::Clear`) can
+    /// render it.
+    pub fn variant_construction(
+        &self,
+        name: &str,
+    ) -> Result<Option<(String, crate::ast::VariantKind)>, crate::error::EmitError> {
+        // Collect every (enum_name, variant_kind) pairing whose enum declares a
+        // variant called `name`. More than one hit is ambiguous.
+        let mut hits: Vec<(&str, crate::ast::VariantKind)> = Vec::new();
+        for (item_name, item) in &self.items {
+            if let Item::Enum { variants, .. } = item {
+                if let Some(variant) = variants.iter().find(|v| v.name == name) {
+                    hits.push((item_name, variant.payload.kind()));
+                }
+            }
+        }
+        match hits.as_slice() {
+            // Not a variant of any enum — an ordinary construction/reference.
+            [] => Ok(None),
+            // A unique variant. It is still ambiguous if the SAME name is also a
+            // top-level function (a bare `Ref`/`Call` could mean either), so the
+            // engine refuses to guess.
+            [(enum_name, kind)] => {
+                if matches!(self.items.get(name), Some(Item::Function(_))) {
+                    return Err(crate::error::EmitError::AmbiguousVariantConstruction {
+                        name: name.to_string(),
+                        reason: format!(
+                            "both a variant of enum {enum_name:?} and a top-level function"
+                        ),
+                    });
+                }
+                Ok(Some(((*enum_name).to_string(), *kind)))
+            }
+            // A variant of two or more enums — ambiguous.
+            many => {
+                let mut names: Vec<&str> = many.iter().map(|(n, _)| *n).collect();
+                names.sort_unstable();
+                Err(crate::error::EmitError::AmbiguousVariantConstruction {
+                    name: name.to_string(),
+                    reason: format!("a variant of multiple enums [{}]", names.join(", ")),
+                })
+            }
+        }
+    }
+
     /// Resolves the **element type** of a `foreach` iterable, backing the
     /// `foreach_elem_type` scalar slot used by a lambda-/iterator-less target
     /// (C) to desugar `foreach` into a counted index loop

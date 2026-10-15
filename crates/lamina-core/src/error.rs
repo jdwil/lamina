@@ -467,6 +467,32 @@ pub enum EmitError {
         /// Whether the un-lowered raw node still carried an `else` fallback.
         has_default: bool,
     },
+
+    /// A construction expression (an [`Expr::Call`](crate::ast::Expr::Call) /
+    /// [`Expr::StructLit`](crate::ast::Expr::StructLit) /
+    /// [`Expr::Ref`](crate::ast::Expr::Ref)) names an identifier that is an
+    /// **ambiguous** enum-variant construction: `name` is a variant of more
+    /// than one in-scope enum, or is both an enum variant AND a top-level
+    /// function.
+    ///
+    /// The engine recognizes a context-aware variant construction (no keyword)
+    /// by resolving a bare callee/type/ref name to a *unique* in-scope enum
+    /// variant. When the name is not unique, the engine **refuses to guess**
+    /// (the ratified stance) and surfaces this error rather than silently
+    /// picking one meaning: a constructed value must round-trip through a
+    /// `switch`, so an ambiguous construction is a program error the author
+    /// must disambiguate.
+    #[error(
+        "ambiguous variant construction {name:?}: it is {reason} — the engine \
+         will not guess which construction is meant"
+    )]
+    AmbiguousVariantConstruction {
+        /// The ambiguous callee/type/ref name.
+        name: String,
+        /// A human-readable description of why the name is ambiguous (a variant
+        /// of multiple enums, or both a variant and a function).
+        reason: String,
+    },
 }
 
 /// An error produced while **lowering** a parsed AST for a concrete target

@@ -3175,6 +3175,10 @@ pub fn slot_binding(name: &str, scope: SlotScope) -> Option<SlotShape> {
             "obj" => Some(SlotShape::Scalar),
             "index" => Some(SlotShape::Scalar),
             "callee" => Some(SlotShape::Scalar),
+            // The owning enum's name when the expression constructs an enum
+            // variant (`expr is variant_construction`), else the empty string.
+            // The construction-side mirror of the switch-case `enum_name` slot.
+            "enum_name" => Some(SlotShape::Scalar),
             "ty" => Some(SlotShape::Scalar),
             "type_name" => Some(SlotShape::Scalar),
             // A tree node's own name (scalar leaf). `value` (already bound

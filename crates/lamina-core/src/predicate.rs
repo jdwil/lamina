@@ -217,6 +217,28 @@ pub struct RenderContext {
     /// type cannot be resolved leaves this `false`. Default `false` keeps an
     /// ordinary integer `switch` byte-identical to before this fact existed.
     pub scrutinee_is_payload_enum: bool,
+    /// Answers `expr is variant_construction` — whether the expression being
+    /// rendered **constructs an enum variant** (context-aware, no keyword): a
+    /// tuple-variant construction (an [`Expr::Call`](crate::ast::Expr::Call)
+    /// whose callee is a bare variant name), a struct-variant construction (an
+    /// [`Expr::StructLit`](crate::ast::Expr::StructLit) whose type name is a
+    /// variant), or a unit-variant construction (a bare
+    /// [`Expr::Ref`](crate::ast::Expr::Ref) naming a variant).
+    ///
+    /// This is the construction-side mirror of
+    /// [`scrutinee_is_payload_enum`](RenderContext::scrutinee_is_payload_enum):
+    /// a target that encodes a variant specially (Rust `Op::Add(..)`, Java
+    /// `new Add(..)`, a C tagged-union literal, a TS tagged object) branches its
+    /// `### expr` table to that construction form on this fact, *before* the
+    /// generic `expr is call`, so a constructed value matches the same encoding
+    /// the def emits for the enum declaration and `switch` matching. The owning
+    /// enum's name is exposed as the `{enum_name}` scalar slot in the same
+    /// render scope. The engine computes it from the per-unit index (a bare
+    /// construction name resolving to a *unique* in-scope enum variant); an
+    /// ambiguous name is a loud [`EmitError`](crate::error::EmitError), never a
+    /// guess. Default `false` keeps every ordinary call/struct-lit/reference
+    /// byte-identical to before this fact existed.
+    pub is_variant_construction: bool,
     /// `has_len` — an array type carries an explicit length (rendering the
     /// sized form `[T; N]` rather than the unsized/slice form `[T]`). Set when
     /// rendering a [`Type::Array`](crate::ast::Type::Array) with `len: Some(_)`.
@@ -672,6 +694,14 @@ impl RenderContext {
             ("vis", Some("private")) => self.vis == Some(VisKind::Private),
             ("caller", Some("async")) => self.caller == Some(CallerKind::Async),
             ("caller", Some("sync")) => self.caller == Some(CallerKind::Sync),
+            // Construction-side signal: `expr is variant_construction` — the
+            // expression being rendered constructs an enum variant (a
+            // tuple-variant call, a struct-variant struct-literal, or a
+            // unit-variant bare reference). Closed single-value enum query
+            // mirroring `scrutinee is payload_enum`; handled here (before the
+            // generic `expr is <kind>` ExprKind arm) because it is a contextual
+            // signal, NOT an `ExprKind` spelling.
+            ("expr", Some("variant_construction")) => self.is_variant_construction,
             // Expression dispatch: `expr is <kind>`. The value must be a known
             // kind spelling and match the expression currently being rendered.
             ("expr", Some(kind)) => {
@@ -933,6 +963,13 @@ fn validate_fact(fact: &Fact) -> Result<(), PredicateError> {
     // `expr is <kind>` is validated against the closed kind vocabulary.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("expr", Some(k)) if expr_kind_is_known(k));
+    // `expr is variant_construction` — the closed construction-side signal
+    // (not an `ExprKind` spelling, so validated explicitly).
+    let known = known
+        || matches!(
+            (fact.key.as_str(), fact.value.as_deref()),
+            ("expr", Some("variant_construction"))
+        );
     // `stmt is <kind>` is validated against the closed statement vocabulary.
     let known = known
         || matches!((fact.key.as_str(), fact.value.as_deref()), ("stmt", Some(k)) if stmt_kind_is_known(k));

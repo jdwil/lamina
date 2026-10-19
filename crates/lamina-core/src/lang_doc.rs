@@ -974,6 +974,8 @@ fn is_special_slot(name: &str) -> bool {
         || (name.starts_with("escape(") && name.ends_with(')'))
         || (name.starts_with("field_type(") && name.ends_with(')'))
         || (name.starts_with("fresh_name(") && name.ends_with(')'))
+        || (name.starts_with("require_import(") && name.ends_with(')'))
+        || (name.starts_with("require_once(") && name.ends_with(')'))
 }
 
 /// The slot names referenced by a slot definition's template(s).

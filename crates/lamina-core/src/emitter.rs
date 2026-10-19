@@ -109,14 +109,50 @@ fn emit_multipass(
     // Assemble: concatenate the region buffers in the declared layout order.
     // A layout entry naming a region that received no emission contributes the
     // empty string (created-on-first-emission means it is simply absent).
+    //
+    // The conventional `imports` region additionally gets a final **line-wise**
+    // deduplication: native import directives have set semantics (a duplicate
+    // line is pure noise), and two independent contributors — the author's
+    // `Item::Import` (deduped structurally) and a def realization's
+    // `{require_import(...)}` (deduped by its own text) — can still land the
+    // SAME rendered directive because they dedup in separate key spaces. The
+    // line-wise pass collapses any such coincidental duplicate, preserving
+    // first-occurrence order, so an import a realization declares AND the author
+    // also declares appears exactly once. This is dumb and order-preserving; it
+    // only ever removes exact-duplicate lines and only in the imports region.
     let regions = index.take_regions();
     let mut out = String::new();
     for region in &lang.passes.layout {
         if let Some(text) = regions.get(region) {
-            out.push_str(text);
+            if region == IMPORTS_REGION {
+                out.push_str(&dedup_lines(text));
+            } else {
+                out.push_str(text);
+            }
         }
     }
     Ok(out)
+}
+
+/// Collapses exact-duplicate lines in `text`, preserving the first occurrence's
+/// position and the original trailing-newline shape. Used only on the
+/// conventional `imports` region, where import directives have set semantics.
+fn dedup_lines(text: &str) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        // Blank separators are preserved verbatim (never deduped), so a def that
+        // intentionally spaces its import groups keeps that spacing.
+        if line.is_empty() || seen.insert(line) {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    out
 }
 
 /// The conventional default output region: inline/unrouted emission lands here,
@@ -124,6 +160,15 @@ fn emit_multipass(
 /// engine treats it as an ordinary region name; the only convention is that
 /// unrouted output is directed to it.
 pub(crate) const BODY_REGION: &str = "body";
+
+/// The conventional output region for native library imports. The
+/// `{require_import(<directive>)}` render helper routes a def-realization's
+/// declared dependency here (deduplicated), alongside the author's
+/// `Item::Import` output. Every shipped imperative definition names its import
+/// region `imports` and positions it first in `layout`, so a realization-declared
+/// import lands at the top of the file exactly like an authored one. The engine
+/// attaches no meaning to the name beyond this helper's routing target.
+pub(crate) const IMPORTS_REGION: &str = "imports";
 
 /// Selects the outcome and optional target region a [`SlotDef`] yields for the
 /// current pass.
@@ -922,6 +967,14 @@ impl<'a> SlotResolver for ItemResolver<'a> {
             Some(SpecialSlot::FreshName { prefix, key }) => {
                 return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
             }
+            Some(SpecialSlot::RequireImport(directive)) => {
+                self.index.require_import(directive);
+                return Ok(Rendered::empty());
+            }
+            Some(SpecialSlot::RequireOnce { region, text }) => {
+                self.index.require_once(region, text);
+                return Ok(Rendered::empty());
+            }
             _ => {}
         }
         let (base, projection) = parse_slot_projection(name);
@@ -1111,6 +1164,14 @@ impl<'a> SlotResolver for FunctionResolver<'a> {
             // `(prefix, key)`), so it resolves identically in every scope.
             Some(SpecialSlot::FreshName { prefix, key }) => {
                 return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            Some(SpecialSlot::RequireImport(directive)) => {
+                self.index.require_import(directive);
+                return Ok(Rendered::empty());
+            }
+            Some(SpecialSlot::RequireOnce { region, text }) => {
+                self.index.require_once(region, text);
+                return Ok(Rendered::empty());
             }
             _ => {}
         }
@@ -1818,6 +1879,14 @@ impl<'a> SlotResolver for StmtResolver<'a> {
             Some(SpecialSlot::FreshName { prefix, key }) => {
                 return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
             }
+            Some(SpecialSlot::RequireImport(directive)) => {
+                self.index.require_import(directive);
+                return Ok(Rendered::empty());
+            }
+            Some(SpecialSlot::RequireOnce { region, text }) => {
+                self.index.require_once(region, text);
+                return Ok(Rendered::empty());
+            }
             _ => {}
         }
         let (base, projection) = parse_slot_projection(name);
@@ -1967,6 +2036,27 @@ enum SpecialSlot<'a> {
     /// strings. This is what lets a hoisted helper (emitted into one region) and
     /// its inline reference (emitted elsewhere) share one name.
     FreshName { prefix: &'a str, key: &'a str },
+    /// `{require_import(<directive>)}` — a def realization declares that it needs
+    /// the native import `<directive>` (the verbatim import line, e.g.
+    /// `from dataclasses import dataclass`). The directive is routed into the
+    /// conventional imports region (`IMPORTS_REGION`), deduplicated against both other
+    /// requirements and the author's `Item::Import`s, and the helper renders the
+    /// EMPTY string inline — so the realization's own output is unchanged and
+    /// only the imports region gains the line. The argument is a single literal
+    /// string (it MAY contain commas, as in `from enum import Enum, auto`), so it
+    /// is taken verbatim rather than split.
+    RequireImport(&'a str),
+    /// `{require_once(<region>, <text>)}` — a def realization declares that the
+    /// verbatim `<text>` must appear EXACTLY ONCE in the named output `<region>`
+    /// (deduplicated by `(region, text)`), rendering the EMPTY string inline.
+    /// This is the file-level-wrapper seam: a target whose single-file output
+    /// needs a once-only frame the per-item render cannot express — Go's
+    /// `package main`, Java's enclosing `public class … {` / `}` — seeds that
+    /// frame into a dedicated region (positioned by the def's `layout`) once,
+    /// regardless of how many items render. The FIRST argument (up to the first
+    /// comma) is the region name; everything after it is the verbatim text (so
+    /// the text MAY itself contain commas).
+    RequireOnce { region: &'a str, text: &'a str },
 }
 
 /// Parses a slot `name` as a [`SpecialSlot`], or `None` if it is an ordinary
@@ -2023,6 +2113,29 @@ fn parse_special_slot(name: &str) -> Option<SpecialSlot<'_>> {
         let key = parts.next().map(str::trim).unwrap_or("");
         if !prefix.is_empty() && !key.is_empty() {
             return Some(SpecialSlot::FreshName { prefix, key });
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("require_import(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let directive = inner.trim();
+        if !directive.is_empty() {
+            return Some(SpecialSlot::RequireImport(directive));
+        }
+        return None;
+    }
+    if let Some(inner) = name
+        .strip_prefix("require_once(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        if let Some((region, text)) = inner.split_once(',') {
+            let region = region.trim();
+            let text = text.trim();
+            if !region.is_empty() && !text.is_empty() {
+                return Some(SpecialSlot::RequireOnce { region, text });
+            }
         }
         return None;
     }
@@ -2440,7 +2553,19 @@ impl<'a> ExprResolver<'a> {
             Expr::StructLit { type_name, .. } => Some(type_name.clone()),
             Expr::Ref(name) => match self.index.item(name) {
                 Some(crate::ast::Item::Const { ty, .. }) => type_of_type_name(ty),
-                _ => None,
+                // Beyond a top-level const, a bare reference may name a
+                // locally-typed binding (a function parameter or a
+                // type-annotated `let`), tracked in the lexical value-type
+                // scope. Resolving it here lets `type_of(<arg>)` answer for a
+                // local the engine can be certain of (e.g. a `str`-typed
+                // parameter/binding), which the Rust def uses to decide whether
+                // a call argument needs a borrow (`&s`) to match an `&str`
+                // parameter. A name the engine cannot resolve stays `None` — it
+                // never guesses.
+                _ => self
+                    .index
+                    .value_type(name)
+                    .and_then(|ty| type_of_type_name(&ty)),
             },
             _ => None,
         }
@@ -3264,6 +3389,14 @@ impl<'a> ExprResolver<'a> {
             SpecialSlot::FreshName { prefix, key } => {
                 Ok(Rendered::text(self.index.fresh_name(prefix, key)))
             }
+            SpecialSlot::RequireImport(directive) => {
+                self.index.require_import(directive);
+                Ok(Rendered::empty())
+            }
+            SpecialSlot::RequireOnce { region, text } => {
+                self.index.require_once(region, text);
+                Ok(Rendered::empty())
+            }
         }
     }
 
@@ -3628,6 +3761,14 @@ impl<'a> SlotResolver for TypeResolver<'a> {
             }
             Some(SpecialSlot::FreshName { prefix, key }) => {
                 return Ok(Rendered::text(self.index.fresh_name(prefix, key)))
+            }
+            Some(SpecialSlot::RequireImport(directive)) => {
+                self.index.require_import(directive);
+                return Ok(Rendered::empty());
+            }
+            Some(SpecialSlot::RequireOnce { region, text }) => {
+                self.index.require_once(region, text);
+                return Ok(Rendered::empty());
             }
             _ => {}
         }

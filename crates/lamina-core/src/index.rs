@@ -303,6 +303,56 @@ impl<'a> UnitIndex<'a> {
         self.state.borrow_mut().seen_imports.insert(key.to_string())
     }
 
+    /// Routes a **def-realization-declared** import `directive` into the
+    /// conventional imports region (`emitter::IMPORTS_REGION`), emitting
+    /// it exactly ONCE per unit (deduplicated by its verbatim text, sharing the
+    /// same `seen_imports` set as the author's `Item::Import` dedup).
+    ///
+    /// This backs the `{require_import(<directive>)}` render helper: a
+    /// realization that *uses* a target library (a Python `@dataclass` needing
+    /// `from dataclasses import dataclass`, a Go `String()` needing
+    /// `import "fmt"`) declares its own dependency, which lands in the imports
+    /// region alongside the author's imports and dedupes against them. The
+    /// helper renders the empty string inline, so the realization's own output
+    /// is unchanged — only the imports region gains the line.
+    ///
+    /// A trailing newline is appended so each directive is its own line,
+    /// matching the `## Import` section's `"…\n"` rows. Deduplication keys on the
+    /// directive text WITHOUT the newline, so repeated requirements of the same
+    /// directive collapse to one line.
+    pub fn require_import(&self, directive: &str) {
+        self.require_once(crate::emitter::IMPORTS_REGION, directive);
+    }
+
+    /// Routes a **def-realization-declared** verbatim `text` into the named
+    /// output `region`, emitting it EXACTLY ONCE per unit (deduplicated by
+    /// `(region, text)`). A trailing newline is appended so each entry is its
+    /// own line.
+    ///
+    /// This backs the `{require_once(<region>, <text>)}` render helper — the
+    /// file-level-wrapper seam. A target whose single-file output needs a
+    /// once-only frame the per-item render cannot express (Go's `package main`,
+    /// Java's enclosing `public class … {` / matching `}`) seeds that frame into
+    /// a dedicated region once; the helper renders the empty string inline, so
+    /// the realization's own output is unchanged. The region's position in the
+    /// final file is the def's `layout` concern; the engine only accumulates and
+    /// deduplicates. Dedup keys on `(region, text)` WITHOUT the newline, so
+    /// repeated requirements of the same framing line collapse to one.
+    pub fn require_once(&self, region: &str, text: &str) {
+        // A helper argument carries escaped literal braces as `{{`/`}}` (so a
+        // wrapper line like `public class C {` is written `… C {{` in the
+        // `.mdl`); unescape them to their single-brace literal here, mirroring
+        // the template literal-brace rule.
+        let text = text.replace("{{", "{").replace("}}", "}");
+        let mut state = self.state.borrow_mut();
+        let key = format!("{region}\u{0}{text}");
+        if state.seen_imports.insert(key) {
+            let buf = state.regions.entry(region.to_string()).or_default();
+            buf.push_str(&text);
+            buf.push('\n');
+        }
+    }
+
     /// Consumes and returns the accumulated region buffers (draining the map),
     /// for final assembly by the multi-pass driver.
     pub fn take_regions(&self) -> BTreeMap<String, String> {
@@ -1210,6 +1260,47 @@ mod tests {
         assert_ne!(bare, def_name);
         assert_ne!(bare, other);
         assert_eq!(idx.fresh_name("lam", "x"), bare, "bare allocation memoizes");
+    }
+
+    #[test]
+    fn require_import_dedups_into_imports_region() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        // The same directive declared repeatedly lands ONCE in the imports
+        // region, newline-terminated.
+        idx.require_import("from dataclasses import dataclass");
+        idx.require_import("from dataclasses import dataclass");
+        idx.require_import("from enum import Enum, auto");
+        let regions = idx.take_regions();
+        assert_eq!(
+            regions
+                .get(crate::emitter::IMPORTS_REGION)
+                .map(String::as_str),
+            Some("from dataclasses import dataclass\nfrom enum import Enum, auto\n"),
+            "a realization-declared import dedups and is newline-terminated"
+        );
+    }
+
+    #[test]
+    fn require_once_dedups_per_region_and_unescapes_braces() {
+        let file = File { items: vec![] };
+        let idx = UnitIndex::build(&file);
+        // A once-only file-wrapper line per region, deduped by (region, text),
+        // with `{{`/`}}` unescaped to literal braces.
+        idx.require_once("open", "public class Calc {{");
+        idx.require_once("open", "public class Calc {{");
+        idx.require_once("close", "}}");
+        let regions = idx.take_regions();
+        assert_eq!(
+            regions.get("open").map(String::as_str),
+            Some("public class Calc {\n"),
+            "require_once dedups and unescapes the open brace"
+        );
+        assert_eq!(
+            regions.get("close").map(String::as_str),
+            Some("}\n"),
+            "require_once unescapes the close brace"
+        );
     }
 
     #[test]

@@ -503,6 +503,28 @@ fn capture_slot_body(
     loop {
         match chars.next() {
             None => return Err(TemplateError::UnclosedSlot),
+            // A doubled brace inside a slot body's PARENTHESIZED tail (a helper
+            // call / argument list, which is the only place `(...)` appears in a
+            // slot body) is an ESCAPED literal brace: `{{` → a literal `{`, `}}`
+            // → a literal `}`, captured verbatim as the doubled form (the helper
+            // unescapes it) WITHOUT changing `brace_depth`. This lets a helper
+            // argument carry an unbalanced literal brace — e.g.
+            // `{require_once(w, class C {{)}` passes the text `class C {`.
+            //
+            // Scoping the escape to `paren_depth > 0` keeps it from touching a
+            // bare projection such as `{coll:item}` followed by a literal `}}`
+            // (`… {coll:item}}}`), whose `}}` is OUTSIDE any paren group and must
+            // still close the slot then emit a literal brace, byte-identically to
+            // before. No existing slot body contains a doubled brace inside its
+            // `(...)` tail, so this is backward-compatible.
+            Some('{') if paren_depth > 0 && matches!(chars.peek(), Some('{')) => {
+                chars.next();
+                body.push_str("{{");
+            }
+            Some('}') if paren_depth > 0 && matches!(chars.peek(), Some('}')) => {
+                chars.next();
+                body.push_str("}}");
+            }
             Some('}') if brace_depth == 0 => return Ok(body),
             Some('}') => {
                 brace_depth -= 1;
